@@ -2,6 +2,7 @@ PG_MAJOR ?= 17
 DEV_IMAGE  = pg_cocoon-dev:pg$(PG_MAJOR)
 IMAGE      = pg_cocoon:pg$(PG_MAJOR)
 TARGET_VOL = pg_cocoon_target_pg$(PG_MAJOR)
+CARGO_VOL  = pg_cocoon_cargo
 
 .PHONY: dev-image image test build clippy run psql cargo clean
 
@@ -12,19 +13,19 @@ dev-image:
 # Generic: run any cargo command. Usage: make cargo CMD="check"
 cargo: dev-image
 	docker run --rm -v $(CURDIR):/build/pg_cocoon -v $(TARGET_VOL):/build/pg_cocoon/target \
-		$(DEV_IMAGE) cargo $(CMD)
+		-v $(CARGO_VOL):/usr/local/cargo/registry $(DEV_IMAGE) cargo $(CMD)
 
 test: dev-image
 	docker run --rm -v $(CURDIR):/build/pg_cocoon -v $(TARGET_VOL):/build/pg_cocoon/target \
-		$(DEV_IMAGE) sh -c "cargo pgrx test pg$(PG_MAJOR)"
+		-v $(CARGO_VOL):/usr/local/cargo/registry $(DEV_IMAGE) sh -c "cargo pgrx test pg$(PG_MAJOR)"
 
 build: dev-image
 	docker run --rm -v $(CURDIR):/build/pg_cocoon -v $(TARGET_VOL):/build/pg_cocoon/target \
-		$(DEV_IMAGE) cargo build --features pg$(PG_MAJOR) --no-default-features
+		-v $(CARGO_VOL):/usr/local/cargo/registry $(DEV_IMAGE) cargo build --features pg$(PG_MAJOR) --no-default-features
 
 clippy: dev-image
 	docker run --rm -v $(CURDIR):/build/pg_cocoon -v $(TARGET_VOL):/build/pg_cocoon/target \
-		$(DEV_IMAGE) cargo clippy --features pg$(PG_MAJOR) --no-default-features
+		-v $(CARGO_VOL):/usr/local/cargo/registry $(DEV_IMAGE) cargo clippy --features pg$(PG_MAJOR) --no-default-features
 
 # Build the runtime image (production-like, no build tools)
 image:
@@ -39,3 +40,4 @@ psql:
 
 clean:
 	docker volume rm $(TARGET_VOL) 2>/dev/null || true
+	docker volume rm $(CARGO_VOL) 2>/dev/null || true

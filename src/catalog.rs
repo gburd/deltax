@@ -13,6 +13,7 @@ pub struct HypertableInfo {
 
 /// Metadata for a single partition.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct PartitionInfo {
     pub id: i32,
     pub hypertable_id: i32,
@@ -40,7 +41,7 @@ pub fn register_hypertable(
             schema_name.into(),
             table_name.into(),
             time_column.into(),
-            partition_interval.clone().into(),
+            (*partition_interval).into(),
         ],
     )?;
     Ok(result.first().get_one::<i32>()?.unwrap())
@@ -96,7 +97,7 @@ pub fn get_hypertable(
     };
 
     // Re-query to get all fields since first() consumed the table
-    let result2 = client.select(
+    let mut result2 = client.select(
         "SELECT id, schema_name, table_name, time_column, partition_interval
          FROM cocoon_hypertable
          WHERE id = $1",
@@ -104,7 +105,7 @@ pub fn get_hypertable(
         &[id.into()],
     )?;
 
-    for row in result2 {
+    if let Some(row) = result2.next() {
         let ht_id: i32 = row.get_datum_by_ordinal(1)?.value::<i32>()?.unwrap();
         let s: String = row.get_datum_by_ordinal(2)?.value::<String>()?.unwrap();
         let t: String = row.get_datum_by_ordinal(3)?.value::<String>()?.unwrap();

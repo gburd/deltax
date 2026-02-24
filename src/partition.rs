@@ -346,7 +346,7 @@ fn validate_time_column(_client: &SpiClient, schema: &str, table: &str, time_col
 }
 
 /// Check if a table is already partitioned.
-fn check_partitioned(client: &SpiClient, schema: &str, table: &str) -> bool {
+fn check_partitioned(_client: &SpiClient, schema: &str, table: &str) -> bool {
     Spi::get_one_with_args::<bool>(
         "SELECT c.relkind = 'p'
          FROM pg_class c
