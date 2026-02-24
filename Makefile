@@ -4,7 +4,10 @@ IMAGE      = pg_cocoon:pg$(PG_MAJOR)
 TARGET_VOL = pg_cocoon_target_pg$(PG_MAJOR)
 CARGO_VOL  = pg_cocoon_cargo
 
-.PHONY: dev-image image test build clippy run psql cargo clean
+PG_VERSIONS ?= 17 18
+VENV         = .venv
+
+.PHONY: dev-image image test build clippy run psql cargo clean integration-test
 
 # Build the dev toolchain image (rebuilds only when Dockerfile.dev changes)
 dev-image:
@@ -37,6 +40,18 @@ run: image
 
 psql:
 	docker exec -it pg_cocoon psql -U postgres
+
+$(VENV)/.stamp: tests/requirements.txt
+	python3 -m venv $(VENV)
+	$(VENV)/bin/pip install -q -r tests/requirements.txt
+	@touch $@
+
+integration-test: $(VENV)/.stamp
+	@for v in $(PG_VERSIONS); do \
+		echo "=== Integration tests: PG $$v ==="; \
+		$(MAKE) image PG_MAJOR=$$v; \
+		PG_COCOON_IMAGE=pg_cocoon:pg$$v $(VENV)/bin/pytest tests/ -v; \
+	done
 
 clean:
 	docker volume rm $(TARGET_VOL) 2>/dev/null || true

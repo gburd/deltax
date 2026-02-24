@@ -1,4 +1,6 @@
 /target
+/.venv
+tests/__pycache__/
 *.swp
 *.swo
 *~

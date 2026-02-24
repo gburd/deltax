@@ -27,6 +27,15 @@ make run    # start postgres with the extension (port 5432)
 make psql   # connect to the running instance
 ```
 
+## Integration tests
+
+```sh
+make integration-test                   # runs against PG 17 and 18
+make integration-test PG_VERSIONS=17    # single version
+```
+
+A Python virtualenv (`.venv/`) is created automatically on first run.
+
 ## Build runtime image
 
 ```sh
