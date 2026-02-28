@@ -80,8 +80,38 @@ pub unsafe extern "C-unwind" fn plan_custom_path(
         let final_clauses = pg_sys::extract_actual_clauses(clauses, false);
         (*cscan).scan.plan.qual = final_clauses;
 
-        // Copy custom_private from path to plan (contains companion OID)
-        (*cscan).custom_private = (*best_path).custom_private;
+        // Build custom_private: [companion_oid_as_int, -1 (sentinel), col0, col1, ...]
+        let companion_oid = pg_sys::list_nth_oid((*best_path).custom_private, 0);
+        let mut private_list =
+            pg_sys::lappend_int(std::ptr::null_mut(), u32::from(companion_oid) as i32);
+
+        // Extract needed column attribute numbers from tlist + quals
+        let varno = (*rel).relid;
+        let mut needed_attrs: *mut pg_sys::Bitmapset = std::ptr::null_mut();
+        pg_sys::pull_varattnos(tlist as *mut pg_sys::Node, varno, &mut needed_attrs);
+        pg_sys::pull_varattnos(
+            final_clauses as *mut pg_sys::Node,
+            varno,
+            &mut needed_attrs,
+        );
+
+        // Append sentinel, then 0-based column indices
+        private_list = pg_sys::lappend_int(private_list, -1);
+        let offset = pg_sys::FirstLowInvalidHeapAttributeNumber;
+        let mut x: i32 = -1;
+        loop {
+            x = pg_sys::bms_next_member(needed_attrs, x);
+            if x < 0 {
+                break;
+            }
+            let attno = x + offset;
+            if attno > 0 {
+                // Convert 1-based attno to 0-based column index
+                private_list = pg_sys::lappend_int(private_list, attno - 1);
+            }
+        }
+
+        (*cscan).custom_private = private_list;
         (*cscan).custom_scan_tlist = std::ptr::null_mut();
         (*cscan).custom_plans = std::ptr::null_mut();
         (*cscan).custom_relids = std::ptr::null_mut();

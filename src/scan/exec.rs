@@ -47,6 +47,11 @@ pub(crate) struct DecompressState {
     segment_index: usize,
     /// Pre-loaded segments data from the companion table.
     segments_data: Vec<SegmentData>,
+    /// 0-based column indices that the query needs. true = needed.
+    /// Empty means decompress all (safety fallback).
+    needed_cols: Vec<bool>,
+    /// Per-segment memory context (child of es_query_cxt, reset per segment).
+    segment_mcxt: pg_sys::MemoryContext,
 }
 
 struct SegmentData {
@@ -82,13 +87,29 @@ pub unsafe extern "C-unwind" fn begin_custom_scan(
     _eflags: i32,
 ) {
     unsafe {
-        // Get companion OID from custom_private (stored as OID list)
+        // Get custom_private (stored as IntList: [oid, -1, col0, col1, ...])
         let custom_private = (*node).custom_ps;
         if custom_private.is_null() {
             pgrx::error!("pg_cocoon: missing companion table OID in custom scan state");
         }
 
-        let companion_oid = pg_sys::list_nth_oid(custom_private, 0);
+        let companion_oid =
+            pg_sys::Oid::from(pg_sys::list_nth_int(custom_private, 0) as u32);
+
+        // Parse needed column indices from custom_private (after sentinel -1)
+        let list_len = (*custom_private).length as i32;
+        let mut needed_indices: Vec<usize> = Vec::new();
+        let mut found_sentinel = false;
+        for i in 1..list_len {
+            let val = pg_sys::list_nth_int(custom_private, i);
+            if val == -1 {
+                found_sentinel = true;
+                continue;
+            }
+            if found_sentinel {
+                needed_indices.push(val as usize);
+            }
+        }
 
         // Get companion table name
         let companion_name = {
@@ -104,10 +125,20 @@ pub unsafe extern "C-unwind" fn begin_custom_scan(
                 .into_owned()
         };
 
-        // Load all data via SPI
-        let state = Spi::connect(|client| {
-            load_decompress_state(client, &companion_name)
+        // Load data via SPI, passing needed columns so we skip unneeded blobs
+        let mut state = Spi::connect(|client| {
+            load_decompress_state(client, &companion_name, &needed_indices)
         });
+
+        // Create per-segment memory context
+        let query_ctx = (*(*node).ss.ps.state).es_query_cxt;
+        state.segment_mcxt = pg_sys::AllocSetContextCreateInternal(
+            query_ctx,
+            c"CocoonSegment".as_ptr(),
+            pg_sys::ALLOCSET_DEFAULT_MINSIZE as usize,
+            pg_sys::ALLOCSET_DEFAULT_INITSIZE as usize,
+            pg_sys::ALLOCSET_DEFAULT_MAXSIZE as usize,
+        );
 
         // Box and store as raw pointer in custom_ps
         let state_box = Box::new(state);
@@ -117,9 +148,15 @@ pub unsafe extern "C-unwind" fn begin_custom_scan(
 }
 
 /// Load decompression state from the companion table via SPI.
+///
+/// `needed_indices` contains 0-based column indices the query needs.
+/// If empty, all columns are loaded (safety fallback).
+/// Only compressed blobs for needed columns are loaded from the companion table;
+/// unneeded columns get empty placeholder blobs to keep index mapping correct.
 fn load_decompress_state(
     client: &pgrx::spi::SpiClient<'_>,
     companion_name: &str,
+    needed_indices: &[usize],
 ) -> DecompressState {
     // Get the partition's hypertable info
     let mut ht_result = client
@@ -193,7 +230,20 @@ fn load_decompress_state(
         col_typmods.push(typmod);
     }
 
-    // Build SELECT columns for companion table
+    // Build needed_cols from needed_indices.
+    // Empty means no columns needed (e.g. COUNT(*)) — skip all decompression.
+    let num_cols = col_names.len();
+    let needed_cols = {
+        let mut nc = vec![false; num_cols];
+        for &idx in needed_indices {
+            if idx < num_cols {
+                nc[idx] = true;
+            }
+        }
+        nc
+    };
+
+    // Build SELECT columns for companion table — only include needed compressed columns
     let companion_fqn = format!("\"_cocoon_compressed\".\"{}\"", companion_name);
     let mut select_cols = Vec::new();
     for name in &col_names {
@@ -201,8 +251,8 @@ fn load_decompress_state(
             select_cols.push(format!("\"{}\"::text", name));
         }
     }
-    for name in &col_names {
-        if !segment_by.contains(name) {
+    for (idx, name) in col_names.iter().enumerate() {
+        if !segment_by.contains(name) && needed_cols[idx] {
             select_cols.push(format!("\"_{}_compressed\"", name));
         }
     }
@@ -233,15 +283,20 @@ fn load_decompress_state(
                 ordinal += 1;
             }
         }
-        for name in &col_names {
+        for (idx, name) in col_names.iter().enumerate() {
             if !segment_by.contains(name) {
-                let blob: Option<Vec<u8>> = row
-                    .get_datum_by_ordinal(ordinal)
-                    .unwrap()
-                    .value::<Vec<u8>>()
-                    .unwrap();
-                compressed_blobs.push(blob.unwrap_or_default());
-                ordinal += 1;
+                if needed_cols[idx] {
+                    let blob: Option<Vec<u8>> = row
+                        .get_datum_by_ordinal(ordinal)
+                        .unwrap()
+                        .value::<Vec<u8>>()
+                        .unwrap();
+                    compressed_blobs.push(blob.unwrap_or_default());
+                    ordinal += 1;
+                } else {
+                    // Unneeded column — empty placeholder to keep blob_idx mapping
+                    compressed_blobs.push(Vec::new());
+                }
             }
         }
 
@@ -273,6 +328,8 @@ fn load_decompress_state(
         row_cursor: 0,
         segment_index: 0,
         segments_data,
+        needed_cols,
+        segment_mcxt: std::ptr::null_mut(),
     }
 }
 
@@ -331,17 +388,31 @@ pub unsafe extern "C-unwind" fn exec_custom_scan(
                 continue;
             }
 
-            // Switch to query context so pass-by-ref datums (TEXT) survive
-            let query_ctx = (*(*node).ss.ps.state).es_query_cxt;
-            let old_ctx = pg_sys::MemoryContextSwitchTo(query_ctx);
+            // Reset segment memory context — frees all varlena from previous segment
+            pg_sys::MemoryContextReset(state.segment_mcxt);
+            let old_ctx = pg_sys::MemoryContextSwitchTo(state.segment_mcxt);
 
-            // Decompress all columns directly to datums
+            // Decompress needed columns directly to datums
             let mut decompressed: Vec<Vec<(pg_sys::Datum, bool)>> = Vec::new();
             let mut blob_idx = 0;
             let mut seg_val_idx = 0;
 
             for (col_idx, col_name) in state.col_names.iter().enumerate() {
                 let type_oid = state.col_types[col_idx];
+
+                if !state.needed_cols[col_idx] {
+                    // Column not needed — push null placeholders and advance index
+                    if state.segment_by.contains(col_name) {
+                        seg_val_idx += 1;
+                    } else {
+                        blob_idx += 1;
+                    }
+                    let dummy: Vec<(pg_sys::Datum, bool)> =
+                        (0..seg.row_count).map(|_| (pg_sys::Datum::from(0), true)).collect();
+                    decompressed.push(dummy);
+                    continue;
+                }
+
                 if state.segment_by.contains(col_name) {
                     let val = &seg.segment_values[seg_val_idx];
                     let (datum, is_null) = match val {
@@ -378,7 +449,10 @@ pub unsafe extern "C-unwind" fn end_custom_scan(
     unsafe {
         let state_ptr = (*node).custom_ps as *mut DecompressState;
         if !state_ptr.is_null() {
-            let _ = Box::from_raw(state_ptr);
+            let state = Box::from_raw(state_ptr);
+            if !state.segment_mcxt.is_null() {
+                pg_sys::MemoryContextDelete(state.segment_mcxt);
+            }
             (*node).custom_ps = std::ptr::null_mut();
         }
     }
@@ -464,6 +538,10 @@ unsafe fn fill_slot(
 
         let ncols = state.col_names.len();
         for col_idx in 0..ncols {
+            if !state.needed_cols[col_idx] {
+                (*slot).tts_isnull.add(col_idx).write(true);
+                continue;
+            }
             let (datum, is_null) = state.current_segment[col_idx][state.row_cursor];
             (*slot).tts_isnull.add(col_idx).write(is_null);
             (*slot).tts_values.add(col_idx).write(datum);

@@ -82,7 +82,7 @@ QUERIES = [
         "Q25",
         "ORDER BY EventTime",
         "SELECT SearchPhrase FROM hits WHERE SearchPhrase <> '' "
-        "ORDER BY EventTime LIMIT 10",
+        "ORDER BY EventTime, SearchPhrase LIMIT 10",
     ),
     # Q34: Top URLs — heavy GROUP BY text
     (
