@@ -21,6 +21,12 @@ make integration-test PG_VERSIONS=17  # Integration tests for specific PG versio
 make run                              # Start PostgreSQL with extension on port 5432
 make psql                             # Connect to running instance
 make image                            # Build production runtime Docker image
+make image-fresh                      # Rebuild runtime image with --no-cache (use after source changes)
+make run-sql SQL="SELECT 1"           # Build, run SQL, show output + server logs, teardown
+make run-sql-file FILE="test.sql"     # Same as run-sql but reads SQL from a file
+make logs                             # Show pg_cocoon log lines from running container
+make logs-all                         # Show all logs from running container
+make logs-follow                      # Follow logs in real-time
 make cargo CMD="<cmd>"                # Run arbitrary cargo command in dev container
 make clean                            # Clean Docker volumes
 ```

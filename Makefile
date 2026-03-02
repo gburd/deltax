@@ -1,14 +1,16 @@
 PG_MAJOR ?= 17
 DEV_IMAGE  = pg_cocoon-dev:pg$(PG_MAJOR)
 IMAGE      = pg_cocoon:pg$(PG_MAJOR)
-TARGET_VOL = pg_cocoon_target_pg$(PG_MAJOR)
-CARGO_VOL  = pg_cocoon_cargo
+TARGET_VOL      = pg_cocoon_target_pg$(PG_MAJOR)
+CARGO_VOL       = pg_cocoon_cargo
+QUERY_CONTAINER = pg_cocoon_query
 
 PG_VERSIONS ?= 17 18
 VENV         = .venv
 
-.PHONY: dev-image image test build clippy run psql cargo clean integration-test \
-       bench-clickbench bench-timescaledb-tsl bench-timescaledb-oss bench-timescaledb bench-compare bench-all
+.PHONY: dev-image image image-fresh test build clippy run psql cargo clean integration-test \
+       bench-clickbench bench-timescaledb-tsl bench-timescaledb-oss bench-timescaledb bench-compare bench-all \
+       run-sql run-sql-file logs logs-all logs-follow
 
 # Build the dev toolchain image (rebuilds only when Dockerfile.dev changes)
 dev-image:
@@ -35,12 +37,69 @@ clippy: dev-image
 image: dev-image
 	docker build -f docker/Dockerfile --build-arg PG_MAJOR=$(PG_MAJOR) -t $(IMAGE) .
 
+# Force-rebuild the runtime image (no Docker cache)
+image-fresh: dev-image
+	docker build --no-cache -f docker/Dockerfile --build-arg PG_MAJOR=$(PG_MAJOR) -t $(IMAGE) .
+
 # Run postgres with the extension for manual testing
 run: image
-	docker run --rm --name pg_cocoon -p 5432:5432 -e POSTGRES_PASSWORD=postgres $(IMAGE)
+	docker run --rm --name pg_cocoon -p 5432:5432 -e POSTGRES_PASSWORD=postgres $(IMAGE) \
+		-c shared_preload_libraries=pg_cocoon \
+		-c log_min_messages=log
 
 psql:
 	docker exec -it pg_cocoon psql -U postgres
+
+# Build, start PG, run SQL, show logs, stop. Usage: make run-sql SQL="SELECT 1"
+run-sql: image
+	@docker rm -f $(QUERY_CONTAINER) 2>/dev/null || true
+	@docker run -d --name $(QUERY_CONTAINER) \
+		-e POSTGRES_PASSWORD=postgres \
+		$(IMAGE) \
+		-c shared_preload_libraries=pg_cocoon \
+		-c log_min_messages=log >/dev/null
+	@echo "Waiting for PostgreSQL..."
+	@for i in $$(seq 1 30); do \
+		docker exec $(QUERY_CONTAINER) pg_isready -U postgres -q 2>/dev/null && break; \
+		sleep 0.3; \
+	done
+	@echo "--- Query Output ---"
+	@docker exec $(QUERY_CONTAINER) psql -U postgres -c "$(SQL)"
+	@echo ""
+	@echo "--- Server Logs (LOG level) ---"
+	@docker logs $(QUERY_CONTAINER) 2>&1 | grep -E 'pg_cocoon|LOG:' || true
+	@docker rm -f $(QUERY_CONTAINER) >/dev/null
+
+# Same as run-sql but reads SQL from a file. Usage: make run-sql-file FILE="test.sql"
+run-sql-file: image
+	@docker rm -f $(QUERY_CONTAINER) 2>/dev/null || true
+	@docker run -d --name $(QUERY_CONTAINER) \
+		-e POSTGRES_PASSWORD=postgres \
+		-v $(CURDIR)/$(FILE):/tmp/query.sql:ro \
+		$(IMAGE) \
+		-c shared_preload_libraries=pg_cocoon \
+		-c log_min_messages=log >/dev/null
+	@echo "Waiting for PostgreSQL..."
+	@for i in $$(seq 1 30); do \
+		docker exec $(QUERY_CONTAINER) pg_isready -U postgres -q 2>/dev/null && break; \
+		sleep 0.3; \
+	done
+	@echo "--- Query Output ---"
+	@docker exec $(QUERY_CONTAINER) psql -U postgres -f /tmp/query.sql
+	@echo ""
+	@echo "--- Server Logs (LOG level) ---"
+	@docker logs $(QUERY_CONTAINER) 2>&1 | grep -E 'pg_cocoon|LOG:' || true
+	@docker rm -f $(QUERY_CONTAINER) >/dev/null
+
+# Show pg_cocoon log lines from the running container
+logs:
+	@docker logs pg_cocoon 2>&1 | grep -E 'pg_cocoon' || true
+
+logs-all:
+	@docker logs pg_cocoon 2>&1
+
+logs-follow:
+	@docker logs -f pg_cocoon 2>&1
 
 $(VENV)/.stamp: tests/requirements.txt
 	python3 -m venv $(VENV)
