@@ -86,7 +86,16 @@ const PG_EPOCH_OFFSET_USEC: i64 = 946_684_800_000_000;
 const PG_EPOCH_OFFSET_DAYS: i32 = 10_957;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum BatchCompareOp { Eq, Ne, Lt, Le, Gt, Ge }
+enum BatchCompareOp { Eq, Ne, Lt, Le, Gt, Ge, Like, NotLike }
+
+#[derive(Debug, Clone)]
+enum LikeStrategy {
+    Contains(String),    // %foo%  → str::contains
+    StartsWith(String),  // foo%   → str::starts_with
+    EndsWith(String),    // %foo   → str::ends_with
+    Exact(String),       // foo    → ==
+    General(String),     // patterns with _, \, or multiple % segments
+}
 
 #[derive(Debug, Clone)]
 struct BatchQual {
@@ -94,6 +103,7 @@ struct BatchQual {
     op: BatchCompareOp,          // comparison operator
     const_datum: pg_sys::Datum,  // constant value
     type_oid: pg_sys::Oid,       // column type OID
+    like_strategy: Option<LikeStrategy>, // pre-compiled LIKE pattern
 }
 
 /// Decompression state stored as a raw pointer in the CustomScanState.
@@ -1255,6 +1265,7 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
             let mut decompressed: Vec<Vec<(pg_sys::Datum, bool)>> = Vec::new();
             let mut blob_idx = 0;
             let mut seg_val_idx = 0;
+            let mut pre_selection: Vec<bool> = Vec::new();
 
             for (col_idx, col_name) in meta.col_names.iter().enumerate() {
                 let type_oid = meta.col_types[col_idx];
@@ -1281,10 +1292,33 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
                     seg_val_idx += 1;
                 } else {
                     let blob = &seg.compressed_blobs[blob_idx];
-                    let type_name = pg_type_name(type_oid);
                     let typmod = meta.col_typmods[col_idx];
-                    let datums = decompress_blob_to_datums(blob, &type_name, type_oid, typmod);
-                    decompressed.push(datums);
+
+                    // Check if this text column has a LIKE batch qual
+                    let like_qual = batch_quals.iter().find(|bq| {
+                        bq.col_idx == col_idx
+                            && matches!(bq.op, BatchCompareOp::Like | BatchCompareOp::NotLike)
+                    });
+
+                    if let Some(bq) = like_qual {
+                        let strat = bq.like_strategy.as_ref().unwrap();
+                        let neg = bq.op == BatchCompareOp::NotLike;
+                        let (datums, like_sel) =
+                            decompress_text_blob_with_like_filter(blob, type_oid, typmod, strat, neg);
+                        decompressed.push(datums);
+                        // AND the like_sel into pre_selection
+                        if pre_selection.is_empty() {
+                            pre_selection = like_sel;
+                        } else {
+                            for (ps, ls) in pre_selection.iter_mut().zip(like_sel.iter()) {
+                                *ps = *ps && *ls;
+                            }
+                        }
+                    } else {
+                        let type_name = pg_type_name(type_oid);
+                        let datums = decompress_blob_to_datums(blob, &type_name, type_oid, typmod);
+                        decompressed.push(datums);
+                    }
                     blob_idx += 1;
                 }
             }
@@ -1294,8 +1328,11 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
 
             let row_count = seg.row_count as usize;
 
-            // Evaluate batch quals (WHERE) if any
-            let selection = evaluate_batch_quals(&decompressed, row_count, &batch_quals);
+            // Evaluate batch quals (WHERE) if any.
+            // pre_selection seeds the selection vector so that rows already
+            // filtered by LIKE during decompression are skipped (their dummy
+            // datums are never dereferenced).
+            let selection = evaluate_batch_quals(&decompressed, row_count, &batch_quals, pre_selection);
 
             // Aggregate loop
             for row in 0..row_count {
@@ -2229,6 +2266,8 @@ fn flip_compare_op(op: BatchCompareOp) -> BatchCompareOp {
         BatchCompareOp::Le => BatchCompareOp::Ge,
         BatchCompareOp::Gt => BatchCompareOp::Lt,
         BatchCompareOp::Ge => BatchCompareOp::Le,
+        BatchCompareOp::Like => BatchCompareOp::Like,
+        BatchCompareOp::NotLike => BatchCompareOp::NotLike,
     }
 }
 
@@ -2265,6 +2304,7 @@ fn apply_batch_filter_i64(
             BatchCompareOp::Le => v <= constant,
             BatchCompareOp::Gt => v > constant,
             BatchCompareOp::Ge => v >= constant,
+            BatchCompareOp::Like | BatchCompareOp::NotLike => unreachable!(),
         };
     }
 }
@@ -2286,6 +2326,7 @@ fn apply_batch_filter_i32(
             BatchCompareOp::Le => v <= constant,
             BatchCompareOp::Gt => v > constant,
             BatchCompareOp::Ge => v >= constant,
+            BatchCompareOp::Like | BatchCompareOp::NotLike => unreachable!(),
         };
     }
 }
@@ -2307,6 +2348,7 @@ fn apply_batch_filter_i16(
             BatchCompareOp::Le => v <= constant,
             BatchCompareOp::Gt => v > constant,
             BatchCompareOp::Ge => v >= constant,
+            BatchCompareOp::Like | BatchCompareOp::NotLike => unreachable!(),
         };
     }
 }
@@ -2328,6 +2370,7 @@ fn apply_batch_filter_f64(
             BatchCompareOp::Le => v <= constant,
             BatchCompareOp::Gt => v > constant,
             BatchCompareOp::Ge => v >= constant,
+            BatchCompareOp::Like | BatchCompareOp::NotLike => unreachable!(),
         };
     }
 }
@@ -2349,6 +2392,7 @@ fn apply_batch_filter_f32(
             BatchCompareOp::Le => v <= constant,
             BatchCompareOp::Gt => v > constant,
             BatchCompareOp::Ge => v >= constant,
+            BatchCompareOp::Like | BatchCompareOp::NotLike => unreachable!(),
         };
     }
 }
@@ -2366,8 +2410,130 @@ fn apply_batch_filter_bool(
         sel[i] = match op {
             BatchCompareOp::Eq => v == constant,
             BatchCompareOp::Ne => v != constant,
+            BatchCompareOp::Like | BatchCompareOp::NotLike => unreachable!(),
             _ => v == constant, // bool only supports = / <>
         };
+    }
+}
+
+fn compile_like_pattern(pattern: &str) -> LikeStrategy {
+    // If pattern contains _ or backslash escape, use general matcher
+    if pattern.contains('_') || pattern.contains('\\') {
+        return LikeStrategy::General(pattern.to_string());
+    }
+    // Count % occurrences and their positions
+    let percent_positions: Vec<usize> = pattern.match_indices('%').map(|(i, _)| i).collect();
+    match percent_positions.len() {
+        0 => LikeStrategy::Exact(pattern.to_string()),
+        1 => {
+            let pos = percent_positions[0];
+            if pos == 0 && pattern.len() == 1 {
+                // Just "%" — matches everything
+                LikeStrategy::Contains(String::new())
+            } else if pos == 0 {
+                LikeStrategy::EndsWith(pattern[1..].to_string())
+            } else if pos == pattern.len() - 1 {
+                LikeStrategy::StartsWith(pattern[..pos].to_string())
+            } else {
+                LikeStrategy::General(pattern.to_string())
+            }
+        }
+        2 => {
+            let first = percent_positions[0];
+            let second = percent_positions[1];
+            if first == 0 && second == pattern.len() - 1 {
+                LikeStrategy::Contains(pattern[1..second].to_string())
+            } else {
+                LikeStrategy::General(pattern.to_string())
+            }
+        }
+        _ => LikeStrategy::General(pattern.to_string()),
+    }
+}
+
+fn sql_like_match(text: &str, pattern: &str) -> bool {
+    let t = text.as_bytes();
+    let p = pattern.as_bytes();
+    sql_like_match_inner(t, p)
+}
+
+fn sql_like_match_inner(text: &[u8], pattern: &[u8]) -> bool {
+    let mut ti = 0;
+    let mut pi = 0;
+    let mut star_pi = usize::MAX;
+    let mut star_ti = 0;
+
+    while ti < text.len() {
+        if pi < pattern.len() && pattern[pi] == b'\\' {
+            // Escaped character: match literally
+            pi += 1;
+            if pi < pattern.len() && text[ti] == pattern[pi] {
+                ti += 1;
+                pi += 1;
+                continue;
+            }
+            // No match after escape
+            if star_pi != usize::MAX {
+                pi = star_pi + 1;
+                star_ti += 1;
+                ti = star_ti;
+                continue;
+            }
+            return false;
+        }
+        if pi < pattern.len() && pattern[pi] == b'_' {
+            // _ matches any single character
+            ti += 1;
+            pi += 1;
+            continue;
+        }
+        if pi < pattern.len() && pattern[pi] == b'%' {
+            star_pi = pi;
+            star_ti = ti;
+            pi += 1;
+            continue;
+        }
+        if pi < pattern.len() && text[ti] == pattern[pi] {
+            ti += 1;
+            pi += 1;
+            continue;
+        }
+        if star_pi != usize::MAX {
+            pi = star_pi + 1;
+            star_ti += 1;
+            ti = star_ti;
+            continue;
+        }
+        return false;
+    }
+    // Consume trailing %
+    while pi < pattern.len() && pattern[pi] == b'%' {
+        pi += 1;
+    }
+    pi == pattern.len()
+}
+
+unsafe fn apply_batch_filter_like(
+    col: &[(pg_sys::Datum, bool)],
+    sel: &mut [bool],
+    strategy: &LikeStrategy,
+    negate: bool,
+) {
+    for (i, &(datum, is_null)) in col.iter().enumerate() {
+        if !sel[i] { continue; }
+        if is_null { sel[i] = false; continue; }
+        let varlena_ptr = datum.cast_mut_ptr::<pg_sys::varlena>();
+        let len = unsafe { pgrx::varsize_any_exhdr(varlena_ptr) };
+        let data = unsafe { pgrx::vardata_any(varlena_ptr) };
+        let text = unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(data, len)) };
+        let matched = match strategy {
+            LikeStrategy::Contains(s) => text.contains(s.as_str()),
+            LikeStrategy::StartsWith(s) => text.starts_with(s.as_str()),
+            LikeStrategy::EndsWith(s) => text.ends_with(s.as_str()),
+            LikeStrategy::Exact(s) => text == s.as_str(),
+            LikeStrategy::General(p) => sql_like_match(text, p),
+        };
+        sel[i] = if negate { !matched } else { matched };
     }
 }
 
@@ -2377,12 +2543,17 @@ fn evaluate_batch_quals(
     current_segment: &[Vec<(pg_sys::Datum, bool)>],
     row_count: usize,
     batch_quals: &[BatchQual],
+    pre_selection: Vec<bool>,
 ) -> Vec<bool> {
-    if batch_quals.is_empty() {
+    if batch_quals.is_empty() && pre_selection.is_empty() {
         return Vec::new();
     }
 
-    let mut sel = vec![true; row_count];
+    let mut sel = if pre_selection.is_empty() {
+        vec![true; row_count]
+    } else {
+        pre_selection
+    };
 
     for bq in batch_quals {
         let col = &current_segment[bq.col_idx];
@@ -2411,6 +2582,12 @@ fn evaluate_batch_quals(
             pg_sys::BOOLOID => {
                 let c = bq.const_datum.value() != 0;
                 apply_batch_filter_bool(col, &mut sel, bq.op, c);
+            }
+            pg_sys::TEXTOID | pg_sys::VARCHAROID | pg_sys::BPCHAROID => {
+                if let Some(ref strategy) = bq.like_strategy {
+                    let negate = bq.op == BatchCompareOp::NotLike;
+                    unsafe { apply_batch_filter_like(col, &mut sel, strategy, negate); }
+                }
             }
             _ => {} // unsupported type, skip
         }
@@ -2463,10 +2640,20 @@ unsafe fn extract_batch_quals(
                 .to_str()
                 .unwrap_or("");
 
-            let cmp_op = match parse_compare_op(opname) {
-                Some(op) => op,
-                None => {
-                    continue;
+            // Recognize LIKE/NOT LIKE operators before comparison ops
+            let is_like = opname == "~~";
+            let is_not_like = opname == "!~~";
+
+            let cmp_op = if is_like {
+                BatchCompareOp::Like
+            } else if is_not_like {
+                BatchCompareOp::NotLike
+            } else {
+                match parse_compare_op(opname) {
+                    Some(op) => op,
+                    None => {
+                        continue;
+                    }
                 }
             };
 
@@ -2515,18 +2702,47 @@ unsafe fn extract_batch_quals(
             let col_idx = (varattno - 1) as usize;
             let type_oid = col_types[col_idx];
 
-            if !is_batch_comparable_type(type_oid) {
-                continue;
+            if is_like || is_not_like {
+                // LIKE is not symmetric: column must be on the left
+                if !var_on_left {
+                    continue;
+                }
+                // Only text-like types
+                if !matches!(type_oid, pg_sys::TEXTOID | pg_sys::VARCHAROID | pg_sys::BPCHAROID) {
+                    continue;
+                }
+                // Extract pattern string from constant datum
+                let varlena_ptr = (*const_node).constvalue.cast_mut_ptr::<pg_sys::varlena>();
+                let len = pgrx::varsize_any_exhdr(varlena_ptr);
+                let data = pgrx::vardata_any(varlena_ptr);
+                let pattern_bytes = std::slice::from_raw_parts(data, len);
+                let pattern = match std::str::from_utf8(pattern_bytes) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let strategy = compile_like_pattern(pattern);
+                batch_quals.push(BatchQual {
+                    col_idx,
+                    op: cmp_op,
+                    const_datum: (*const_node).constvalue,
+                    type_oid,
+                    like_strategy: Some(strategy),
+                });
+            } else {
+                if !is_batch_comparable_type(type_oid) {
+                    continue;
+                }
+
+                let op = if var_on_left { cmp_op } else { flip_compare_op(cmp_op) };
+
+                batch_quals.push(BatchQual {
+                    col_idx,
+                    op,
+                    const_datum: (*const_node).constvalue,
+                    type_oid,
+                    like_strategy: None,
+                });
             }
-
-            let op = if var_on_left { cmp_op } else { flip_compare_op(cmp_op) };
-
-            batch_quals.push(BatchQual {
-                col_idx,
-                op,
-                const_datum: (*const_node).constvalue,
-                type_oid,
-            });
         }
     }
 
@@ -2656,6 +2872,7 @@ pub unsafe extern "C-unwind" fn exec_custom_scan(
             let mut decompressed: Vec<Vec<(pg_sys::Datum, bool)>> = Vec::new();
             let mut blob_idx = 0;
             let mut seg_val_idx = 0;
+            let mut pre_selection: Vec<bool> = Vec::new();
 
             for (col_idx, col_name) in state.col_names.iter().enumerate() {
                 let type_oid = state.col_types[col_idx];
@@ -2683,10 +2900,33 @@ pub unsafe extern "C-unwind" fn exec_custom_scan(
                     seg_val_idx += 1;
                 } else {
                     let blob = &seg.compressed_blobs[blob_idx];
-                    let type_name = pg_type_name(type_oid);
                     let typmod = state.col_typmods[col_idx];
-                    let datums = decompress_blob_to_datums(blob, &type_name, type_oid, typmod);
-                    decompressed.push(datums);
+
+                    // Check if this text column has a LIKE batch qual
+                    let like_qual = state.batch_quals.iter().find(|bq| {
+                        bq.col_idx == col_idx
+                            && matches!(bq.op, BatchCompareOp::Like | BatchCompareOp::NotLike)
+                    });
+
+                    if let Some(bq) = like_qual {
+                        let strat = bq.like_strategy.as_ref().unwrap();
+                        let neg = bq.op == BatchCompareOp::NotLike;
+                        let (datums, like_sel) =
+                            decompress_text_blob_with_like_filter(blob, type_oid, typmod, strat, neg);
+                        decompressed.push(datums);
+                        // AND the like_sel into pre_selection
+                        if pre_selection.is_empty() {
+                            pre_selection = like_sel;
+                        } else {
+                            for (ps, ls) in pre_selection.iter_mut().zip(like_sel.iter()) {
+                                *ps = *ps && *ls;
+                            }
+                        }
+                    } else {
+                        let type_name = pg_type_name(type_oid);
+                        let datums = decompress_blob_to_datums(blob, &type_name, type_oid, typmod);
+                        decompressed.push(datums);
+                    }
                     blob_idx += 1;
                 }
             }
@@ -2702,13 +2942,16 @@ pub unsafe extern "C-unwind" fn exec_custom_scan(
             state.current_row_count = seg.row_count as usize;
             state.row_cursor = 0;
 
-            // Evaluate batch quals on the decompressed segment
-            if !state.batch_quals.is_empty() {
+            // Evaluate batch quals on the decompressed segment.
+            // pre_selection seeds the selection vector so that rows already
+            // filtered by LIKE during decompression are skipped.
+            if !state.batch_quals.is_empty() || !pre_selection.is_empty() {
                 let t_batch = if instrument { Some(Instant::now()) } else { None };
                 state.selection_vector = evaluate_batch_quals(
                     &state.current_segment,
                     state.current_row_count,
                     &state.batch_quals,
+                    pre_selection,
                 );
                 if let Some(t) = t_batch {
                     state.timing.batch_eval_us += t.elapsed().as_micros() as u64;
@@ -3064,6 +3307,126 @@ unsafe fn decompress_blob_to_datums(
     };
 
     reinsert_nulls_datum(&datums, cc.null_bitmap, total_count)
+}
+
+/// Decompress a text column blob with LIKE filtering pushed into decompression.
+///
+/// Instead of allocating a PG varlena datum for every row and then filtering,
+/// this matches the LIKE pattern against raw `&str` slices (zero-copy) and only
+/// calls `str_to_text_datum()` for rows that match. Non-matching rows get a
+/// dummy datum that will never be read (the returned selection vector marks them
+/// as filtered out).
+///
+/// Returns `(datums, like_selection)` where:
+/// - `datums`: Full-length datum array with nulls reinserted. Matching rows have
+///   real varlena datums; non-matching rows have `(Datum(0), false)`.
+/// - `like_selection`: Per-row bool vector (true = matched LIKE).
+unsafe fn decompress_text_blob_with_like_filter(
+    blob: &[u8],
+    type_oid: pg_sys::Oid,
+    typmod: i32,
+    strategy: &LikeStrategy,
+    negate: bool,
+) -> (Vec<(pg_sys::Datum, bool)>, Vec<bool>) {
+    if blob.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+
+    let cc = CompressedColumnRef::from_bytes(blob);
+    let total_count = cc.row_count as usize;
+    let non_null_count = count_non_null(cc.null_bitmap, total_count);
+
+    // Match a &str against the LikeStrategy, applying negation.
+    let matches_like = |text: &str| -> bool {
+        let matched = match strategy {
+            LikeStrategy::Contains(s) => text.contains(s.as_str()),
+            LikeStrategy::StartsWith(s) => text.starts_with(s.as_str()),
+            LikeStrategy::EndsWith(s) => text.ends_with(s.as_str()),
+            LikeStrategy::Exact(s) => text == s.as_str(),
+            LikeStrategy::General(p) => sql_like_match(text, p),
+        };
+        if negate { !matched } else { matched }
+    };
+
+    // Build (non-null datums, non-null selection) — only non-null values
+    let (nn_datums, nn_sel): (Vec<pg_sys::Datum>, Vec<bool>) = match cc.type_tag {
+        CompressionType::Dictionary => {
+            let (dict_entries, indices) =
+                compression::dictionary::decode_dict_and_indices(cc.data, non_null_count);
+
+            // Pre-match each dictionary entry (tiny vec, e.g. a few thousand)
+            let dict_matches: Vec<bool> = dict_entries.iter().map(|s| matches_like(s)).collect();
+
+            let mut datums = Vec::with_capacity(non_null_count);
+            let mut sel = Vec::with_capacity(non_null_count);
+            for &idx in &indices {
+                let pass = dict_matches[idx as usize];
+                sel.push(pass);
+                if pass {
+                    datums.push(unsafe { str_to_text_datum(dict_entries[idx as usize], type_oid, typmod) });
+                } else {
+                    datums.push(pg_sys::Datum::from(0));
+                }
+            }
+            (datums, sel)
+        }
+        CompressionType::Lz4 => {
+            let (buf, ranges) =
+                compression::lz4::decode_to_ranges(cc.data, non_null_count);
+
+            let mut datums = Vec::with_capacity(non_null_count);
+            let mut sel = Vec::with_capacity(non_null_count);
+            for &(off, len) in &ranges {
+                let s = std::str::from_utf8(&buf[off..off + len])
+                    .expect("invalid UTF-8 in LZ4 data");
+                let pass = matches_like(s);
+                sel.push(pass);
+                if pass {
+                    datums.push(unsafe { str_to_text_datum(s, type_oid, typmod) });
+                } else {
+                    datums.push(pg_sys::Datum::from(0));
+                }
+            }
+            (datums, sel)
+        }
+        _ => {
+            // Unexpected compression type for text — fall back to full decompression
+            return {
+                let full = unsafe { decompress_blob_to_datums(
+                    blob,
+                    &pg_type_name(type_oid),
+                    type_oid,
+                    typmod,
+                ) };
+                let sel = vec![true; full.len()];
+                (full, sel)
+            };
+        }
+    };
+
+    // Reinsert nulls into both datums and selection vectors
+    let null_bitmap = cc.null_bitmap;
+    if null_bitmap.is_empty() {
+        // No nulls — pair up directly
+        let datums: Vec<(pg_sys::Datum, bool)> = nn_datums.into_iter().map(|d| (d, false)).collect();
+        (datums, nn_sel)
+    } else {
+        let mut datums = Vec::with_capacity(total_count);
+        let mut sel = Vec::with_capacity(total_count);
+        let mut val_idx = 0;
+        for i in 0..total_count {
+            let is_null = (null_bitmap[i / 8] >> (i % 8)) & 1 == 1;
+            if is_null {
+                datums.push((pg_sys::Datum::from(0), true));
+                sel.push(false); // NULLs don't match LIKE
+            } else {
+                datums.push((nn_datums[val_idx], false));
+                sel.push(nn_sel[val_idx]);
+                val_idx += 1;
+            }
+        }
+        (datums, sel)
+    }
 }
 
 /// Create a text/varchar/bpchar datum from a Rust string.

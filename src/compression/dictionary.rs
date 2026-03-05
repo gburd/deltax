@@ -123,6 +123,38 @@ pub fn decode_to_slices(data: &[u8], count: usize) -> Vec<&str> {
     values
 }
 
+/// Decode dictionary-encoded data, returning the dictionary entries and per-row indices separately.
+/// This allows matching against only the dictionary entries (e.g. for LIKE filtering)
+/// instead of resolving every row.
+pub fn decode_dict_and_indices(data: &[u8], count: usize) -> (Vec<&str>, Vec<u32>) {
+    if count == 0 {
+        return (Vec::new(), Vec::new());
+    }
+
+    let mut offset = 0;
+    let dict_size = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+    offset += 4;
+
+    let mut dict: Vec<&str> = Vec::with_capacity(dict_size);
+    for _ in 0..dict_size {
+        let str_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+        offset += 4;
+        let s = std::str::from_utf8(&data[offset..offset + str_len])
+            .expect("invalid UTF-8 in dictionary");
+        offset += str_len;
+        dict.push(s);
+    }
+
+    let mut indices = Vec::with_capacity(count);
+    for _ in 0..count {
+        let (idx, consumed) = read_varint(&data[offset..]);
+        offset += consumed;
+        indices.push(idx);
+    }
+
+    (dict, indices)
+}
+
 pub fn decode(data: &[u8], count: usize) -> Vec<String> {
     if count == 0 {
         return Vec::new();
