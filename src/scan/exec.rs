@@ -142,7 +142,7 @@ pub(super) struct DecompressState {
     instrument: Option<bool>,
 
     /// Time column name (from hypertable metadata).
-    time_column: String,
+    _time_column: String,
 
     // Segment pruning filters extracted from plan qual
     /// (index into segment_values, value to match) for segment_by equality filters.
@@ -584,7 +584,7 @@ pub unsafe extern "C-unwind" fn begin_cocoon_append(
                 segments_skipped: total_skipped,
             },
             instrument: None,
-            time_column: meta.time_column,
+            _time_column: meta.time_column,
             segment_by_filters: seg_filters,
             time_min: t_min,
             time_max: t_max,
@@ -2122,7 +2122,7 @@ fn load_decompress_state(
             segments_skipped,
         },
         instrument: None,
-        time_column: meta.time_column,
+        _time_column: meta.time_column,
         segment_by_filters: seg_filters,
         time_min: t_min,
         time_max: t_max,

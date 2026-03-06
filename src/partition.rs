@@ -477,3 +477,112 @@ fn cocoon_hypertable_info(
 
     TableIterator::new(rows)
 }
+
+/// Set a retention policy on a hypertable.
+#[pg_extern]
+fn cocoon_set_retention(relation: &str, drop_after: pgrx::datum::Interval) -> String {
+    Spi::connect_mut(|client| {
+        let (schema, table) = resolve_relation(client, relation);
+        let ht = catalog::get_hypertable(client, &schema, &table)
+            .expect("failed to query hypertable")
+            .unwrap_or_else(|| {
+                pgrx::error!("pg_cocoon: table {}.{} is not a cocoon table", schema, table)
+            });
+
+        catalog::set_drop_after(client, ht.id, &drop_after)
+            .expect("failed to set retention policy");
+
+        format!(
+            "Retention policy set on {}.{}: drop_after = {}",
+            schema, table, drop_after
+        )
+    })
+}
+
+/// Remove the retention policy from a hypertable.
+#[pg_extern]
+fn cocoon_remove_retention(relation: &str) -> String {
+    Spi::connect_mut(|client| {
+        let (schema, table) = resolve_relation(client, relation);
+        let ht = catalog::get_hypertable(client, &schema, &table)
+            .expect("failed to query hypertable")
+            .unwrap_or_else(|| {
+                pgrx::error!("pg_cocoon: table {}.{} is not a cocoon table", schema, table)
+            });
+
+        catalog::clear_drop_after(client, ht.id)
+            .expect("failed to remove retention policy");
+
+        format!("Retention policy removed from {}.{}", schema, table)
+    })
+}
+
+/// Drop partitions whose range_end is older than now() - drop_after.
+/// Called by the background worker. Returns the number of partitions dropped.
+pub fn auto_drop_partitions(client: &mut SpiClient, ht: &catalog::HypertableInfo) -> i32 {
+    let drop_after = match &ht.drop_after {
+        Some(interval) => interval,
+        None => return 0,
+    };
+
+    // Compute cutoff using mock-aware now_usec() so the background worker
+    // respects pg_cocoon.mock_now (important for tests and deterministic behaviour).
+    let now = usec_to_tstz(now_usec());
+
+    // Find partitions eligible for dropping: range_end < now() - drop_after
+    let eligible = client
+        .select(
+            "SELECT schema_name, table_name, is_compressed FROM cocoon_partition
+             WHERE hypertable_id = $1 AND range_end < $2::timestamptz - $3::interval",
+            None,
+            &[ht.id.into(), now.into(), (*drop_after).into()],
+        )
+        .expect("failed to query eligible partitions for retention");
+
+    let mut partitions: Vec<(String, String, bool)> = Vec::new();
+    for row in eligible {
+        let schema: String = row.get_datum_by_ordinal(1).unwrap().value::<String>().unwrap().unwrap();
+        let name: String = row.get_datum_by_ordinal(2).unwrap().value::<String>().unwrap().unwrap();
+        let is_compressed: bool = row.get_datum_by_ordinal(3).unwrap().value::<bool>().unwrap().unwrap_or(false);
+        partitions.push((schema, name, is_compressed));
+    }
+
+    let parent_fqn = fqn(&ht.schema_name, &ht.table_name);
+
+    for (schema, name, is_compressed) in &partitions {
+        // If compressed, drop the companion table
+        if *is_compressed {
+            let companion = format!("\"_cocoon_compressed\".\"{}\"", name);
+            client
+                .update(&format!("DROP TABLE IF EXISTS {}", companion), None, &[])
+                .expect("failed to drop compressed companion table");
+        }
+
+        let part_fqn = fqn(schema, name);
+
+        // Detach partition from parent
+        client
+            .update(
+                &format!("ALTER TABLE {} DETACH PARTITION {}", parent_fqn, part_fqn),
+                None,
+                &[],
+            )
+            .expect("failed to detach partition");
+
+        // Drop the partition table
+        client
+            .update(&format!("DROP TABLE {}", part_fqn), None, &[])
+            .expect("failed to drop partition table");
+
+        // Remove from catalog
+        client
+            .update(
+                "DELETE FROM cocoon_partition WHERE schema_name = $1 AND table_name = $2",
+                None,
+                &[schema.as_str().into(), name.as_str().into()],
+            )
+            .expect("failed to remove partition from catalog");
+    }
+
+    partitions.len() as i32
+}

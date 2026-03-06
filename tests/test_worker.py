@@ -157,3 +157,90 @@ def test_worker_drains_default_partition(postgres_db):
 
     finally:
         _cleanup(db, table)
+
+
+def test_worker_retention_drops_old_partitions(postgres_db):
+    """Retention policy causes the worker to drop partitions older than drop_after."""
+    db = postgres_db
+    table = _unique_table()
+
+    try:
+        # Pin "now" to a known time
+        db.execute("SET pg_cocoon.mock_now = '2025-06-15 00:00:00+00'")
+        db.execute(
+            f'CREATE TABLE "{table}" (ts TIMESTAMPTZ NOT NULL, val FLOAT8)'
+        )
+        db.commit()
+
+        # premake=2 → 4 partitions:
+        #   [June 14-15), [June 15-16), [June 16-17), [June 17-18)
+        db.execute(
+            f"SELECT cocoon_create_table('{table}', 'ts', '1 day', 2)"
+        )
+        db.commit()
+
+        # Insert data into the earliest partition (June 14)
+        db.execute(
+            f"INSERT INTO \"{table}\" VALUES ('2025-06-14 12:00:00+00', 1.0)"
+        )
+        # Insert data into current partition (June 15)
+        db.execute(
+            f"INSERT INTO \"{table}\" VALUES ('2025-06-15 12:00:00+00', 2.0)"
+        )
+        db.commit()
+
+        # Record the original partition names
+        initial_partitions = {
+            row[0]
+            for row in db.execute(
+                f"SELECT partition_name FROM cocoon_partition_info('{table}')"
+            ).fetchall()
+        }
+        assert len(initial_partitions) == 4
+
+        # Set retention policy: drop partitions older than 3 days
+        db.execute(
+            f"SELECT cocoon_set_retention('{table}', '3 days')"
+        )
+        db.commit()
+
+        # Jump time forward to June 20. Now June 14 partition (range_end June 15)
+        # is 5 days old, which exceeds the 3-day retention → should be dropped.
+        # June 15 partition (range_end June 16) is 4 days old → also dropped.
+        # June 16 partition (range_end June 17) is 3 days old → exactly at boundary, kept.
+        # Note: the worker also creates new future partitions, so we check by
+        # partition name rather than total count.
+        _alter_system(
+            "ALTER SYSTEM SET pg_cocoon.mock_now = '2025-06-20 00:00:00+00'"
+        )
+
+        # Poll until the worker drops the old partitions
+        deadline = time.time() + 90
+        dropped = False
+        while time.time() < deadline:
+            time.sleep(5)
+            current_partitions = {
+                row[0]
+                for row in db.execute(
+                    f"SELECT partition_name FROM cocoon_partition_info('{table}')"
+                ).fetchall()
+            }
+            db.commit()
+            # Check that at least some original partitions are gone
+            if not initial_partitions.issubset(current_partitions):
+                dropped = True
+                break
+
+        assert dropped, (
+            f"Expected worker to drop old partitions, but original partitions "
+            f"are still present: {initial_partitions}"
+        )
+
+        # Verify the old data is gone — the partitions that held it were dropped
+        old_rows = db.execute(
+            f"SELECT count(*) FROM \"{table}\" WHERE ts < '2025-06-16 00:00:00+00'"
+        ).fetchone()[0]
+        assert old_rows == 0, "Old data should have been dropped"
+
+    finally:
+        _cleanup(db, table)

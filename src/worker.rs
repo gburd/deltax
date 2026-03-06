@@ -119,6 +119,17 @@ pub extern "C-unwind" fn cocoon_worker_main(_arg: pg_sys::Datum) {
                             ht.table_name
                         );
                     }
+
+                    // Auto-drop expired partitions (retention policy)
+                    let dropped = partition::auto_drop_partitions(client, ht);
+                    if dropped > 0 {
+                        log!(
+                            "pg_cocoon: dropped {} expired partitions for {}.{}",
+                            dropped,
+                            ht.schema_name,
+                            ht.table_name
+                        );
+                    }
                 }
             })
         });

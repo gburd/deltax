@@ -12,6 +12,7 @@ pub struct HypertableInfo {
     pub segment_by: Vec<String>,
     pub order_by: Vec<String>,
     pub compress_after: Option<pgrx::datum::Interval>,
+    pub drop_after: Option<pgrx::datum::Interval>,
 }
 
 /// Metadata for a single partition.
@@ -109,7 +110,7 @@ pub fn get_hypertable_by_id(
 ) -> spi::SpiResult<Option<HypertableInfo>> {
     let mut result = client.select(
         "SELECT id, schema_name, table_name, time_column, partition_interval,
-                segment_by, order_by, compress_after
+                segment_by, order_by, compress_after, drop_after
          FROM cocoon_hypertable
          WHERE id = $1",
         None,
@@ -132,6 +133,8 @@ pub fn get_hypertable_by_id(
             .unwrap_or_default();
         let compress_after: Option<pgrx::datum::Interval> =
             row.get_datum_by_ordinal(8)?.value::<pgrx::datum::Interval>()?;
+        let drop_after: Option<pgrx::datum::Interval> =
+            row.get_datum_by_ordinal(9)?.value::<pgrx::datum::Interval>()?;
         return Ok(Some(HypertableInfo {
             id: ht_id,
             schema_name: s,
@@ -141,6 +144,7 @@ pub fn get_hypertable_by_id(
             segment_by,
             order_by,
             compress_after,
+            drop_after,
         }));
     }
 
@@ -153,7 +157,7 @@ pub fn get_all_hypertables(
 ) -> spi::SpiResult<Vec<HypertableInfo>> {
     let result = client.select(
         "SELECT id, schema_name, table_name, time_column, partition_interval,
-                segment_by, order_by, compress_after
+                segment_by, order_by, compress_after, drop_after
          FROM cocoon_hypertable",
         None,
         &[],
@@ -170,6 +174,7 @@ pub fn get_all_hypertables(
             segment_by: row.get_datum_by_ordinal(6)?.value::<Vec<String>>()?.unwrap_or_default(),
             order_by: row.get_datum_by_ordinal(7)?.value::<Vec<String>>()?.unwrap_or_default(),
             compress_after: row.get_datum_by_ordinal(8)?.value::<pgrx::datum::Interval>()?,
+            drop_after: row.get_datum_by_ordinal(9)?.value::<pgrx::datum::Interval>()?,
         });
     }
     Ok(hypertables)
@@ -233,6 +238,33 @@ pub fn set_compress_after(
         "UPDATE cocoon_hypertable SET compress_after = $1 WHERE id = $2",
         None,
         &[(*compress_after).into(), hypertable_id.into()],
+    )?;
+    Ok(())
+}
+
+/// Set the drop_after interval for a hypertable (retention policy).
+pub fn set_drop_after(
+    client: &mut SpiClient,
+    hypertable_id: i32,
+    drop_after: &pgrx::datum::Interval,
+) -> spi::SpiResult<()> {
+    client.update(
+        "UPDATE cocoon_hypertable SET drop_after = $1 WHERE id = $2",
+        None,
+        &[(*drop_after).into(), hypertable_id.into()],
+    )?;
+    Ok(())
+}
+
+/// Clear the drop_after interval for a hypertable (remove retention policy).
+pub fn clear_drop_after(
+    client: &mut SpiClient,
+    hypertable_id: i32,
+) -> spi::SpiResult<()> {
+    client.update(
+        "UPDATE cocoon_hypertable SET drop_after = NULL WHERE id = $1",
+        None,
+        &[hypertable_id.into()],
     )?;
     Ok(())
 }
