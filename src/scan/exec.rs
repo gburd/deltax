@@ -104,6 +104,7 @@ struct BatchQual {
     const_datum: pg_sys::Datum,  // constant value
     type_oid: pg_sys::Oid,       // column type OID
     like_strategy: Option<LikeStrategy>, // pre-compiled LIKE pattern
+    text_const: Option<String>,  // text constant for Eq/Ne pushdown
 }
 
 /// Decompression state stored as a raw pointer in the CustomScanState.
@@ -2733,6 +2734,32 @@ unsafe fn extract_batch_quals(
                     const_datum: (*const_node).constvalue,
                     type_oid,
                     like_strategy: Some(strategy),
+                    text_const: None,
+                });
+            } else if matches!(type_oid, pg_sys::TEXTOID | pg_sys::VARCHAROID)
+                && matches!(cmp_op, BatchCompareOp::Eq | BatchCompareOp::Ne)
+            {
+                // Text equality/inequality: extract the constant string for
+                // dictionary-based pushdown during decompression.
+                if !var_on_left {
+                    continue;
+                }
+                let varlena_ptr = (*const_node).constvalue.cast_mut_ptr::<pg_sys::varlena>();
+                let len = pgrx::varsize_any_exhdr(varlena_ptr);
+                let data = pgrx::vardata_any(varlena_ptr);
+                let const_bytes = std::slice::from_raw_parts(data, len);
+                let const_str = match std::str::from_utf8(const_bytes) {
+                    Ok(s) => s.to_string(),
+                    Err(_) => continue,
+                };
+
+                batch_quals.push(BatchQual {
+                    col_idx,
+                    op: cmp_op,
+                    const_datum: (*const_node).constvalue,
+                    type_oid,
+                    like_strategy: None,
+                    text_const: Some(const_str),
                 });
             } else {
                 if !is_batch_comparable_type(type_oid) {
@@ -2747,6 +2774,7 @@ unsafe fn extract_batch_quals(
                     const_datum: (*const_node).constvalue,
                     type_oid,
                     like_strategy: None,
+                    text_const: None,
                 });
             }
         }
@@ -2908,10 +2936,15 @@ pub unsafe extern "C-unwind" fn exec_custom_scan(
                     let blob = &seg.compressed_blobs[blob_idx];
                     let typmod = state.col_typmods[col_idx];
 
-                    // Check if this text column has a LIKE batch qual
+                    // Check if this text column has a LIKE or Eq/Ne batch qual
                     let like_qual = state.batch_quals.iter().find(|bq| {
                         bq.col_idx == col_idx
                             && matches!(bq.op, BatchCompareOp::Like | BatchCompareOp::NotLike)
+                    });
+                    let text_eq_qual = state.batch_quals.iter().find(|bq| {
+                        bq.col_idx == col_idx
+                            && bq.text_const.is_some()
+                            && matches!(bq.op, BatchCompareOp::Eq | BatchCompareOp::Ne)
                     });
 
                     if let Some(bq) = like_qual {
@@ -2926,6 +2959,20 @@ pub unsafe extern "C-unwind" fn exec_custom_scan(
                         } else {
                             for (ps, ls) in pre_selection.iter_mut().zip(like_sel.iter()) {
                                 *ps = *ps && *ls;
+                            }
+                        }
+                    } else if let Some(bq) = text_eq_qual {
+                        let const_str = bq.text_const.as_ref().unwrap();
+                        let is_ne = bq.op == BatchCompareOp::Ne;
+                        let (datums, eq_sel) = decompress_text_blob_with_eq_filter(
+                            blob, type_oid, typmod, const_str, is_ne,
+                        );
+                        decompressed.push(datums);
+                        if pre_selection.is_empty() {
+                            pre_selection = eq_sel;
+                        } else {
+                            for (ps, es) in pre_selection.iter_mut().zip(eq_sel.iter()) {
+                                *ps = *ps && *es;
                             }
                         }
                     } else {
@@ -3283,25 +3330,18 @@ unsafe fn decompress_blob_to_datums(
         }
         CompressionType::Dictionary => {
             let slices = compression::dictionary::decode_to_slices(cc.data, non_null_count);
-            unsafe {
-                slices
-                    .iter()
-                    .map(|s| str_to_text_datum(s, type_oid, typmod))
-                    .collect()
-            }
+            unsafe { str_slices_to_text_datums_arena(&slices, type_oid, typmod) }
         }
         CompressionType::Lz4 => {
             let (buf, ranges) = compression::lz4::decode_to_ranges(cc.data, non_null_count);
-            unsafe {
-                ranges
-                    .iter()
-                    .map(|&(off, len)| {
-                        let s = std::str::from_utf8(&buf[off..off + len])
-                            .expect("invalid UTF-8 in LZ4 data");
-                        str_to_text_datum(s, type_oid, typmod)
-                    })
-                    .collect()
-            }
+            let slices: Vec<&str> = ranges
+                .iter()
+                .map(|&(off, len)| {
+                    std::str::from_utf8(&buf[off..off + len])
+                        .expect("invalid UTF-8 in LZ4 data")
+                })
+                .collect();
+            unsafe { str_slices_to_text_datums_arena(&slices, type_oid, typmod) }
         }
         CompressionType::BooleanBitmap => {
             let bools = compression::boolean::decode(cc.data, non_null_count);
@@ -3363,13 +3403,25 @@ unsafe fn decompress_text_blob_with_like_filter(
             // Pre-match each dictionary entry (tiny vec, e.g. a few thousand)
             let dict_matches: Vec<bool> = dict_entries.iter().map(|s| matches_like(s)).collect();
 
+            // Collect matched slices for arena allocation
+            let sel: Vec<bool> = indices.iter().map(|&idx| dict_matches[idx as usize]).collect();
+            let matched_slices: Vec<&str> = indices
+                .iter()
+                .zip(sel.iter())
+                .filter(|&(_, &pass)| pass)
+                .map(|(&idx, _)| dict_entries[idx as usize])
+                .collect();
+            let matched_datums = unsafe {
+                str_slices_to_text_datums_arena(&matched_slices, type_oid, typmod)
+            };
+
+            // Merge matched datums back with dummy datums for non-matching rows
             let mut datums = Vec::with_capacity(non_null_count);
-            let mut sel = Vec::with_capacity(non_null_count);
-            for &idx in &indices {
-                let pass = dict_matches[idx as usize];
-                sel.push(pass);
+            let mut match_idx = 0;
+            for &pass in &sel {
                 if pass {
-                    datums.push(unsafe { str_to_text_datum(dict_entries[idx as usize], type_oid, typmod) });
+                    datums.push(matched_datums[match_idx]);
+                    match_idx += 1;
                 } else {
                     datums.push(pg_sys::Datum::from(0));
                 }
@@ -3380,15 +3432,34 @@ unsafe fn decompress_text_blob_with_like_filter(
             let (buf, ranges) =
                 compression::lz4::decode_to_ranges(cc.data, non_null_count);
 
+            // First pass: determine which rows match
+            let slices: Vec<&str> = ranges
+                .iter()
+                .map(|&(off, len)| {
+                    std::str::from_utf8(&buf[off..off + len])
+                        .expect("invalid UTF-8 in LZ4 data")
+                })
+                .collect();
+            let sel: Vec<bool> = slices.iter().map(|s| matches_like(s)).collect();
+
+            // Collect matched slices for arena allocation
+            let matched_slices: Vec<&str> = slices
+                .iter()
+                .zip(sel.iter())
+                .filter(|&(_, &pass)| pass)
+                .map(|(&s, _)| s)
+                .collect();
+            let matched_datums = unsafe {
+                str_slices_to_text_datums_arena(&matched_slices, type_oid, typmod)
+            };
+
+            // Merge matched datums back
             let mut datums = Vec::with_capacity(non_null_count);
-            let mut sel = Vec::with_capacity(non_null_count);
-            for &(off, len) in &ranges {
-                let s = std::str::from_utf8(&buf[off..off + len])
-                    .expect("invalid UTF-8 in LZ4 data");
-                let pass = matches_like(s);
-                sel.push(pass);
+            let mut match_idx = 0;
+            for &pass in &sel {
                 if pass {
-                    datums.push(unsafe { str_to_text_datum(s, type_oid, typmod) });
+                    datums.push(matched_datums[match_idx]);
+                    match_idx += 1;
                 } else {
                     datums.push(pg_sys::Datum::from(0));
                 }
@@ -3435,6 +3506,141 @@ unsafe fn decompress_text_blob_with_like_filter(
     }
 }
 
+/// Decompress a text column blob with equality/inequality filtering pushed into decompression.
+///
+/// Similar to `decompress_text_blob_with_like_filter`, but matches against a constant
+/// string using `==` (or `!=` when `is_ne` is true). For dictionary-compressed data,
+/// this checks each dictionary entry once and uses the indices to build the selection
+/// vector — O(dict_size) comparisons instead of O(row_count).
+///
+/// Returns `(datums, eq_selection)` where:
+/// - `datums`: Full-length datum array with nulls reinserted.
+/// - `eq_selection`: Per-row bool vector (true = matched equality/inequality).
+unsafe fn decompress_text_blob_with_eq_filter(
+    blob: &[u8],
+    type_oid: pg_sys::Oid,
+    typmod: i32,
+    const_str: &str,
+    is_ne: bool,
+) -> (Vec<(pg_sys::Datum, bool)>, Vec<bool>) {
+    if blob.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+
+    let cc = CompressedColumnRef::from_bytes(blob);
+    let total_count = cc.row_count as usize;
+    let non_null_count = count_non_null(cc.null_bitmap, total_count);
+
+    let matches_eq = |text: &str| -> bool {
+        let eq = text == const_str;
+        if is_ne { !eq } else { eq }
+    };
+
+    let (nn_datums, nn_sel): (Vec<pg_sys::Datum>, Vec<bool>) = match cc.type_tag {
+        CompressionType::Dictionary => {
+            let (dict_entries, indices) =
+                compression::dictionary::decode_dict_and_indices(cc.data, non_null_count);
+
+            // Check each dictionary entry once — O(dict_size) instead of O(row_count)
+            let dict_matches: Vec<bool> = dict_entries.iter().map(|s| matches_eq(s)).collect();
+
+            let sel: Vec<bool> = indices.iter().map(|&idx| dict_matches[idx as usize]).collect();
+            let matched_slices: Vec<&str> = indices
+                .iter()
+                .zip(sel.iter())
+                .filter(|&(_, &pass)| pass)
+                .map(|(&idx, _)| dict_entries[idx as usize])
+                .collect();
+            let matched_datums = unsafe {
+                str_slices_to_text_datums_arena(&matched_slices, type_oid, typmod)
+            };
+
+            let mut datums = Vec::with_capacity(non_null_count);
+            let mut match_idx = 0;
+            for &pass in &sel {
+                if pass {
+                    datums.push(matched_datums[match_idx]);
+                    match_idx += 1;
+                } else {
+                    datums.push(pg_sys::Datum::from(0));
+                }
+            }
+            (datums, sel)
+        }
+        CompressionType::Lz4 => {
+            let (buf, ranges) =
+                compression::lz4::decode_to_ranges(cc.data, non_null_count);
+
+            let slices: Vec<&str> = ranges
+                .iter()
+                .map(|&(off, len)| {
+                    std::str::from_utf8(&buf[off..off + len])
+                        .expect("invalid UTF-8 in LZ4 data")
+                })
+                .collect();
+            let sel: Vec<bool> = slices.iter().map(|s| matches_eq(s)).collect();
+
+            let matched_slices: Vec<&str> = slices
+                .iter()
+                .zip(sel.iter())
+                .filter(|&(_, &pass)| pass)
+                .map(|(&s, _)| s)
+                .collect();
+            let matched_datums = unsafe {
+                str_slices_to_text_datums_arena(&matched_slices, type_oid, typmod)
+            };
+
+            let mut datums = Vec::with_capacity(non_null_count);
+            let mut match_idx = 0;
+            for &pass in &sel {
+                if pass {
+                    datums.push(matched_datums[match_idx]);
+                    match_idx += 1;
+                } else {
+                    datums.push(pg_sys::Datum::from(0));
+                }
+            }
+            (datums, sel)
+        }
+        _ => {
+            // Unexpected compression type — fall back to full decompression
+            return {
+                let full = unsafe { decompress_blob_to_datums(
+                    blob,
+                    &pg_type_name(type_oid),
+                    type_oid,
+                    typmod,
+                ) };
+                let sel = vec![true; full.len()];
+                (full, sel)
+            };
+        }
+    };
+
+    // Reinsert nulls into both datums and selection vectors
+    let null_bitmap = cc.null_bitmap;
+    if null_bitmap.is_empty() {
+        let datums: Vec<(pg_sys::Datum, bool)> = nn_datums.into_iter().map(|d| (d, false)).collect();
+        (datums, nn_sel)
+    } else {
+        let mut datums = Vec::with_capacity(total_count);
+        let mut sel = Vec::with_capacity(total_count);
+        let mut val_idx = 0;
+        for i in 0..total_count {
+            let is_null = (null_bitmap[i / 8] >> (i % 8)) & 1 == 1;
+            if is_null {
+                datums.push((pg_sys::Datum::from(0), true));
+                sel.push(false); // NULLs don't match equality
+            } else {
+                datums.push((nn_datums[val_idx], false));
+                sel.push(nn_sel[val_idx]);
+                val_idx += 1;
+            }
+        }
+        (datums, sel)
+    }
+}
+
 /// Create a text/varchar/bpchar datum from a Rust string.
 /// Allocates in the current memory context.
 unsafe fn str_to_text_datum(s: &str, type_oid: pg_sys::Oid, typmod: i32) -> pg_sys::Datum {
@@ -3451,6 +3657,67 @@ unsafe fn str_to_text_datum(s: &str, type_oid: pg_sys::Oid, typmod: i32) -> pg_s
             let text = pg_sys::cstring_to_text_with_len(s.as_ptr() as *const _, s.len() as i32);
             pg_sys::Datum::from(text as usize)
         }
+    }
+}
+
+/// Allocate text/varchar datums from string slices using a single contiguous allocation.
+///
+/// Instead of N individual palloc calls (one per string), this allocates one
+/// large block and packs all varlena headers + string data sequentially.
+/// This dramatically improves cache locality during the per-row emit loop.
+///
+/// For bpchar, falls back to per-string allocation (needs type input function for padding).
+unsafe fn str_slices_to_text_datums_arena(
+    slices: &[&str],
+    type_oid: pg_sys::Oid,
+    typmod: i32,
+) -> Vec<pg_sys::Datum> {
+    if slices.is_empty() {
+        return Vec::new();
+    }
+
+    // bpchar needs the type input function for padding — can't arena-allocate
+    if type_oid == pg_sys::BPCHAROID {
+        return unsafe {
+            slices
+                .iter()
+                .map(|s| str_to_text_datum(s, type_oid, typmod))
+                .collect()
+        };
+    }
+
+    unsafe {
+        const VARHDRSZ: usize = pg_sys::VARHDRSZ;
+        const MAXALIGN: usize = 8; // 64-bit alignment
+
+        // Calculate total arena size
+        let total_size: usize = slices
+            .iter()
+            .map(|s| {
+                let varlena_size = VARHDRSZ + s.len();
+                // Align each varlena to MAXALIGN for safe pointer access
+                (varlena_size + MAXALIGN - 1) & !(MAXALIGN - 1)
+            })
+            .sum();
+
+        let arena = pg_sys::palloc(total_size) as *mut u8;
+        let mut datums = Vec::with_capacity(slices.len());
+        let mut offset = 0;
+
+        for s in slices {
+            let varlena_ptr = arena.add(offset) as *mut pg_sys::varlena;
+            let total_len = (VARHDRSZ + s.len()) as i32;
+            pgrx::set_varsize_4b(varlena_ptr, total_len);
+            std::ptr::copy_nonoverlapping(
+                s.as_ptr(),
+                (varlena_ptr as *mut u8).add(VARHDRSZ),
+                s.len(),
+            );
+            datums.push(pg_sys::Datum::from(varlena_ptr as usize));
+            offset += ((total_len as usize) + MAXALIGN - 1) & !(MAXALIGN - 1);
+        }
+
+        datums
     }
 }
 

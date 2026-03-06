@@ -1,9 +1,29 @@
 # Performance Improvements Roadmap
 
 Tracking the gap between pg_cocoon and TimescaleDB on ClickBench queries.
-Current geometric mean: **pg_cocoon 21.1ms vs TimescaleDB 20.2ms (0.96x, essentially on par)**.
+Current geometric mean: **pg_cocoon 18.1ms vs TimescaleDB 17.7ms (0.98x, essentially on par)**.
 
-## Current Benchmark (2026-03-05, LIKE filter pushdown + agg pushdown + batch quals)
+## Current Benchmark (2026-03-06, sorted scan + arena alloc + text eq/ne pushdown)
+
+| Query | Description | Cocoon (ms) | TSDB (ms) | Gap |
+|-------|-------------|-------------|-----------|-----|
+| Q1 | COUNT(*) | 0.7 | 3.3 | 0.2x |
+| Q2 | COUNT WHERE AdvEngineID | 5.1 | 4.5 | 1.1x |
+| Q3 | SUM/AVG full scan | 12.5 | 6.1 | 2.0x |
+| Q5 | COUNT DISTINCT UserID | 20.8 | 102.8 | 0.2x |
+| Q7 | MIN/MAX EventDate | 0.8 | 4.7 | 0.2x |
+| Q8 | GROUP BY AdvEngineID | 5.0 | 4.8 | 1.0x |
+| Q9 | GROUP BY RegionID | 72.9 | 204.6 | 0.4x |
+| Q13 | Top SearchPhrase | 19.9 | 14.1 | 1.4x |
+| Q20 | Point lookup UserID | 8.7 | 4.8 | 1.8x |
+| Q21 | URL LIKE google | 66.2 | 34.7 | 1.9x |
+| Q25 | ORDER BY EventTime | 10.9 | 2.2 | 5.0x |
+| Q34 | Top URLs | 286.7 | 229.2 | 1.2x |
+| Q37 | CounterID=62 URLs | 146.1 | 107.7 | 1.4x |
+| Q38 | CounterID=62 Titles | 83.3 | 36.0 | 2.3x |
+| Q43 | CounterID=62 by minute | 62.1 | 26.4 | 2.4x |
+
+## Previous Benchmark (2026-03-05, LIKE filter pushdown + agg pushdown + batch quals)
 
 | Query | Description | Cocoon (ms) | TSDB (ms) | Gap |
 |-------|-------------|-------------|-----------|-----|
@@ -186,23 +206,71 @@ where X is outside `[_min_UserID, _max_UserID]`.
 **Files:** `src/compress.rs` (companion table schema, compression logic),
 `src/scan/exec.rs` (load_segments_heap, segment pruning)
 
-### 8. Sorted/ordered scan for ORDER BY time
+### 8. Sorted/ordered scan for ORDER BY time [DONE]
 
-**Impact: Q25 144ms -> ~10ms**
+**Impact: Q25 64ms -> 10.9ms (achieved)**
 **Complexity: High**
 
-Q25 has `ORDER BY EventTime LIMIT 10`. Currently we decompress all segments,
-emit all rows, and let PG sort. Since segments have `_min_time`/`_max_time`, we
-know their time ordering. If segments are scanned in time order and the time
-column is sorted within each segment (which it is — it's the partition key), we
-can emit rows in order and stop after LIMIT rows.
+Segments are now sorted by `min_time` during execution, and CocoonDecompress
+paths advertise pathkeys matching the time column when the query has
+`ORDER BY time_col ASC`. PG's planner sees the sorted children and creates a
+MergeAppend → Incremental Sort → Limit plan, short-circuiting after just a
+few rows from the first segment instead of decompressing everything.
 
-This requires the planner to detect ORDER BY + LIMIT patterns and produce a
-pathkey-aware custom path so PG knows the output is pre-sorted.
+Key details:
+- `find_parent_oid()` resolves the parent hypertable for child partitions
+  during planning to look up the time column.
+- Pathkeys are set on individual CocoonDecompress paths (not CocoonAppend),
+  so PG's `generate_orderedappend_paths` creates MergeAppend naturally.
+- Only ASC ordering is advertised for now; DESC can be added later.
+- PG18 compatibility: uses `pk_cmptype` instead of `pk_strategy`.
 
-**Files:** `src/scan/hook.rs`, `src/scan/plan.rs`, `src/scan/exec.rs`
+**Files:** `src/scan/hook.rs` (find_parent_oid, pathkey detection),
+`src/scan/path.rs` (pathkeys param), `src/scan/exec.rs` (segment sorting)
 
-### 9. Bloom filters for text column pruning
+### 9. Arena allocation for text varlena [DONE]
+
+**Impact: Q25 15ms -> 10.9ms, general improvement on text-heavy queries**
+**Complexity: Low**
+
+Instead of N individual `palloc` calls (one per string via `cstring_to_text_with_len`),
+all text varlena for a segment are packed into a single contiguous allocation.
+This dramatically improves L2/L3 cache locality during the per-row emit loop,
+where PG accesses each datum for slot filling and qual evaluation.
+
+`str_slices_to_text_datums_arena()` calculates total size, does one `palloc`,
+then packs MAXALIGN'd varlena headers + string data sequentially. Used by both
+Dictionary and LZ4 decompression paths, and the LIKE/equality filter paths
+(for matched rows only).
+
+Falls back to per-string allocation for `bpchar` (needs type input function
+for padding).
+
+**Files:** `src/scan/exec.rs` (str_slices_to_text_datums_arena, decompress_blob_to_datums)
+
+### 10. Text equality/inequality pushdown into decompression [DONE]
+
+**Impact: Q13 59ms -> 19.9ms (3x faster)**
+**Complexity: Medium**
+
+For text columns with `=` or `<>` quals (e.g. `WHERE SearchPhrase <> ''`),
+the comparison is pushed into decompression — evaluated on raw `&str` slices
+before any PG varlena allocation. Only matching rows get datums allocated
+(via arena); non-matching rows get dummy datums and are excluded via
+pre-selection vector.
+
+For dictionary-compressed columns, each dictionary entry is compared once
+(O(dict_size), typically a few thousand), then per-row index lookups determine
+pass/fail — no per-row string comparison at all. For Q13, this eliminates
+~93% of rows (only 69K of 1M have non-empty SearchPhrase) at dictionary level.
+
+The text constant is extracted during batch qual detection in `extract_batch_quals`
+and stored as `BatchQual.text_const`. At decompression time,
+`decompress_text_blob_with_eq_filter` handles both Dictionary and LZ4 paths.
+
+**Files:** `src/scan/exec.rs` (decompress_text_blob_with_eq_filter, extract_batch_quals)
+
+### 11. Bloom filters for text column pruning
 
 **Impact: Q21 (URL LIKE) segment pruning**
 **Complexity: High**
@@ -228,5 +296,7 @@ The items are roughly ordered by impact/effort ratio:
 5. **Lazy decompression with predicate pushdown** — amplifies #4
 6. ~~**LIKE filter pushdown**~~ [DONE]
 7. ~~**Per-column min/max**~~ [DONE]
-8. **Sorted scan for ORDER BY** — dramatic impact on Q25, complex planner work
-9. **Bloom filters** — niche but powerful for text filtering
+8. ~~**Sorted scan for ORDER BY**~~ [DONE]
+9. ~~**Arena allocation for text varlena**~~ [DONE]
+10. ~~**Text equality/inequality pushdown**~~ [DONE]
+11. **Bloom filters** — niche but powerful for text filtering
