@@ -10,6 +10,7 @@ CONTAINER_NAME = "pg_seaturtle_inttest"
 HOST_PORT = 15432
 PG_PASSWORD = "postgres"
 PG_USER = "postgres"
+BENCH_VOLUME = "pg_seaturtle_bench_pgdata"
 
 
 @pytest.fixture(scope="session")
@@ -26,16 +27,17 @@ def pg_container():
     )
 
     # Start container with shared_preload_libraries so the background worker runs
-    subprocess.check_call(
-        [
-            "docker", "run", "-d",
-            "--name", CONTAINER_NAME,
-            "-p", f"{HOST_PORT}:5432",
-            "-e", f"POSTGRES_PASSWORD={PG_PASSWORD}",
-            image,
-            "-c", "shared_preload_libraries=pg_seaturtle",
-        ]
-    )
+    persist = os.environ.get("BENCH_PERSIST")
+    cmd = [
+        "docker", "run", "-d",
+        "--name", CONTAINER_NAME,
+        "-p", f"{HOST_PORT}:5432",
+        "-e", f"POSTGRES_PASSWORD={PG_PASSWORD}",
+    ]
+    if persist:
+        cmd += ["-v", f"{BENCH_VOLUME}:/var/lib/postgresql/data"]
+    cmd += [image, "-c", "shared_preload_libraries=pg_seaturtle"]
+    subprocess.check_call(cmd)
 
     # Wait for readiness
     _wait_for_pg()
@@ -50,6 +52,12 @@ def pg_container():
         print(f"  Remove with: docker rm -f {CONTAINER_NAME}")
     else:
         subprocess.run(["docker", "rm", "-f", CONTAINER_NAME], capture_output=True)
+        # Remove the bench volume unless persisting for reruns
+        if not persist:
+            subprocess.run(
+                ["docker", "volume", "rm", BENCH_VOLUME],
+                capture_output=True,
+            )
 
 
 def _wait_for_pg(timeout: int = 30):

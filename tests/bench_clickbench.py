@@ -178,23 +178,34 @@ def print_query_results(uncompr_results, compr_results, profile_results=None):
     """Print markdown table of query performance.
 
     Accepts results in the format {qid: (median_ms, rows)}.
+    If uncompr_results is empty, prints compressed-only table.
     If profile_results is provided, also prints SeaTurtle timing breakdown.
     """
     print("\n### Query Performance")
     print()
-    print(f"| {'Query':<6} | {'Description':<25} | {'Uncompr (ms)':>13} | {'Compr (ms)':>11} | {'Ratio':>6} |")
-    print(f"|{'-'*8}|{'-'*27}|{'-'*15}|{'-'*13}|{'-'*8}|")
 
-    for qid, desc, _ in QUERIES:
-        u = uncompr_results.get(qid, (float("inf"), None))[0]
-        c = compr_results.get(qid, (float("inf"), None))[0]
-        if u != float("inf") and c != float("inf") and c > 0:
-            ratio = f"{u / c:.2f}x"
-        else:
-            ratio = "N/A"
-        u_str = f"{u:.1f}" if u != float("inf") else "ERR"
-        c_str = f"{c:.1f}" if c != float("inf") else "ERR"
-        print(f"| {qid:<6} | {desc:<25} | {u_str:>13} | {c_str:>11} | {ratio:>6} |")
+    if uncompr_results:
+        print(f"| {'Query':<6} | {'Description':<25} | {'Uncompr (ms)':>13} | {'Compr (ms)':>11} | {'Ratio':>6} |")
+        print(f"|{'-'*8}|{'-'*27}|{'-'*15}|{'-'*13}|{'-'*8}|")
+
+        for qid, desc, _ in QUERIES:
+            u = uncompr_results.get(qid, (float("inf"), None))[0]
+            c = compr_results.get(qid, (float("inf"), None))[0]
+            if u != float("inf") and c != float("inf") and c > 0:
+                ratio = f"{u / c:.2f}x"
+            else:
+                ratio = "N/A"
+            u_str = f"{u:.1f}" if u != float("inf") else "ERR"
+            c_str = f"{c:.1f}" if c != float("inf") else "ERR"
+            print(f"| {qid:<6} | {desc:<25} | {u_str:>13} | {c_str:>11} | {ratio:>6} |")
+    else:
+        print(f"| {'Query':<6} | {'Description':<25} | {'Compr (ms)':>11} |")
+        print(f"|{'-'*8}|{'-'*27}|{'-'*13}|")
+
+        for qid, desc, _ in QUERIES:
+            c = compr_results.get(qid, (float("inf"), None))[0]
+            c_str = f"{c:.1f}" if c != float("inf") else "ERR"
+            print(f"| {qid:<6} | {desc:<25} | {c_str:>11} |")
 
     if profile_results:
         print("\n### SeaTurtle Scan Timing Breakdown (EXPLAIN ANALYZE)")
@@ -264,21 +275,66 @@ def print_compression_stats(conn):
 # Pytest fixtures & test class
 # ---------------------------------------------------------------------------
 
+SKIP_LOAD = os.environ.get("SKIP_LOAD")
+SKIP_UNCOMPR = os.environ.get("SKIP_UNCOMPR")
+SKIP_COMPRESS = os.environ.get("SKIP_COMPRESS")
+FIXED_DB_NAME = "bench_clickbench"
+
+
+def _db_exists(admin_conn, db_name: str) -> bool:
+    """Check if a database exists."""
+    row = admin_conn.execute(
+        "SELECT 1 FROM pg_database WHERE datname = %s", (db_name,)
+    ).fetchone()
+    return row is not None
+
+
 @pytest.fixture(scope="class")
 def clickbench_db(pg_container):
     """Create a database, load ClickBench data, enable compression.
 
     Scoped to class so data is loaded once for all benchmark tests.
-    """
-    import uuid
 
+    When SKIP_LOAD is set, reuses the existing FIXED_DB_NAME database
+    (requires a prior run with BENCH_PERSIST).
+    When BENCH_PERSIST is set (without SKIP_LOAD), uses FIXED_DB_NAME
+    for stable naming so future reruns can reuse it.
+    """
     from conftest import HOST_PORT, PG_PASSWORD, PG_USER, _admin_conn
 
-    db_name = "bench_clickbench_" + uuid.uuid4().hex[:8]
+    persist = os.environ.get("BENCH_PERSIST")
+    reuse_db = False
 
-    admin = _admin_conn()
-    admin.execute(f'CREATE DATABASE "{db_name}"')
-    admin.close()
+    if SKIP_LOAD:
+        # Reuse mode: try to connect to existing database
+        db_name = FIXED_DB_NAME
+        admin = _admin_conn()
+        if not _db_exists(admin, db_name):
+            admin.close()
+            pytest.fail(
+                f"SKIP_LOAD is set but database '{db_name}' does not exist. "
+                f"Run 'make bench-clickbench-persist' first to create it."
+            )
+        admin.close()
+        reuse_db = True
+        print(f"\n  Reusing existing database: {db_name}")
+    elif persist:
+        # Persist mode: use fixed name for future reuse
+        db_name = FIXED_DB_NAME
+        admin = _admin_conn()
+        if _db_exists(admin, db_name):
+            # DB already exists from a previous persist run — drop and recreate
+            # to ensure clean state with new extension version
+            admin.execute(f'DROP DATABASE "{db_name}"')
+        admin.execute(f'CREATE DATABASE "{db_name}"')
+        admin.close()
+    else:
+        # Normal mode: unique name
+        import uuid
+        db_name = "bench_clickbench_" + uuid.uuid4().hex[:8]
+        admin = _admin_conn()
+        admin.execute(f'CREATE DATABASE "{db_name}"')
+        admin.close()
 
     conn = psycopg.connect(
         host="localhost",
@@ -287,59 +343,77 @@ def clickbench_db(pg_container):
         password=PG_PASSWORD,
         dbname=db_name,
     )
-    conn.execute("CREATE EXTENSION pg_seaturtle")
     conn.execute("SET jit = off")
     conn.commit()
 
-    # Setup: create table, partition, load data
-    row_count = setup_clickbench(conn, NUM_FILES)
-    enable_compression(conn)
+    if not reuse_db:
+        conn.execute("CREATE EXTENSION pg_seaturtle")
+        conn.commit()
+        # Setup: create table, partition, load data
+        setup_clickbench(conn, NUM_FILES)
+        enable_compression(conn)
 
     yield conn
 
     conn.close()
-    if not os.environ.get("KEEP_CONTAINER"):
+    if persist or os.environ.get("KEEP_CONTAINER"):
+        print(f"\n  Keeping database {db_name} for reuse")
+    else:
         admin = _admin_conn()
         admin.execute(f'DROP DATABASE "{db_name}"')
         admin.close()
-    else:
-        print(f"\n  KEEP_CONTAINER set — keeping database {db_name}")
 
 
 class TestClickBench:
     """ClickBench real-world benchmark for pg_seaturtle compression."""
 
     def test_benchmark(self, clickbench_db):
-        """Run full benchmark: uncompressed queries, compress, compressed queries."""
+        """Run full benchmark: uncompressed queries, compress, compressed queries.
+
+        Phases can be skipped via env vars for fast iteration:
+          SKIP_UNCOMPR=1  — skip uncompressed queries (Phase 1)
+          SKIP_COMPRESS=1 — skip compression (Phase 2)
+          SKIP_LOAD=1     — skip data loading (handled in fixture)
+        """
         conn = clickbench_db
 
+        uncompr_results = {}
+        total_compress_time = 0.0
+        compress_timings = []
+
         # Phase 1: Query uncompressed data
-        print("\n\n=== Phase 1: Uncompressed Queries ===")
-        uncompr_results = run_queries(conn, QUERIES, label="uncompr")
+        if SKIP_UNCOMPR:
+            print("\n\n=== Phase 1: Uncompressed Queries (SKIPPED) ===")
+        else:
+            print("\n\n=== Phase 1: Uncompressed Queries ===")
+            uncompr_results = run_queries(conn, QUERIES, label="uncompr")
 
         # Phase 2: Compress all partitions
-        print("\n=== Phase 2: Compressing Partitions ===")
-        compress_timings = compress_all_partitions(conn)
-        total_compress_time = sum(t for _, t in compress_timings)
-        print(f"\n  Total compression time: {total_compress_time:.1f}s "
-              f"({len(compress_timings)} partitions)")
+        if SKIP_COMPRESS:
+            print("\n=== Phase 2: Compressing Partitions (SKIPPED) ===")
+        else:
+            print("\n=== Phase 2: Compressing Partitions ===")
+            compress_timings = compress_all_partitions(conn)
+            total_compress_time = sum(t for _, t in compress_timings)
+            print(f"\n  Total compression time: {total_compress_time:.1f}s "
+                  f"({len(compress_timings)} partitions)")
 
-        # Diagnostic: verify basic query works after compression
-        print("\n=== Diagnostic: Post-compression check ===")
-        try:
-            count = conn.execute("SELECT count(*) FROM hits").fetchone()[0]
-            print(f"  count(*) = {count}")
-        except Exception as e:
-            print(f"  count(*) FAILED: {e}")
-            conn.rollback()
+            # Diagnostic: verify basic query works after compression
+            print("\n=== Diagnostic: Post-compression check ===")
+            try:
+                count = conn.execute("SELECT count(*) FROM hits").fetchone()[0]
+                print(f"  count(*) = {count}")
+            except Exception as e:
+                print(f"  count(*) FAILED: {e}")
+                conn.rollback()
 
-        try:
-            plan = conn.execute("EXPLAIN SELECT count(*) FROM hits").fetchall()
-            for row in plan:
-                print(f"  {row[0]}")
-        except Exception as e:
-            print(f"  EXPLAIN FAILED: {e}")
-            conn.rollback()
+            try:
+                plan = conn.execute("EXPLAIN SELECT count(*) FROM hits").fetchall()
+                for row in plan:
+                    print(f"  {row[0]}")
+            except Exception as e:
+                print(f"  EXPLAIN FAILED: {e}")
+                conn.rollback()
 
         # Phase 3: Query compressed data
         print("\n=== Phase 3: Compressed Queries ===")
@@ -359,40 +433,43 @@ class TestClickBench:
                 print(f"  {qid}: (no compressed scan)")
 
         # Phase 5: Validate compressed results match uncompressed
-        #
-        # Non-deterministic queries (ties in ORDER BY + LIMIT/OFFSET) are
-        # validated by row count only.  Deterministic queries use sorted
-        # comparison so scan-order differences don't cause false positives.
-        print("\n=== Phase 5: Validating Results ===")
-        mismatches = []
-        for qid, desc, _ in QUERIES:
-            u_timing, u_rows = uncompr_results.get(qid, (float("inf"), None))
-            c_timing, c_rows = compr_results.get(qid, (float("inf"), None))
+        if not uncompr_results:
+            print("\n=== Phase 5: Validating Results (SKIPPED — no uncompressed results) ===")
+            mismatches = []
+        else:
+            # Non-deterministic queries (ties in ORDER BY + LIMIT/OFFSET) are
+            # validated by row count only.  Deterministic queries use sorted
+            # comparison so scan-order differences don't cause false positives.
+            print("\n=== Phase 5: Validating Results ===")
+            mismatches = []
+            for qid, desc, _ in QUERIES:
+                u_timing, u_rows = uncompr_results.get(qid, (float("inf"), None))
+                c_timing, c_rows = compr_results.get(qid, (float("inf"), None))
 
-            if u_rows is None or c_rows is None:
-                print(f"  {qid}: SKIP (query errored)")
-                continue
+                if u_rows is None or c_rows is None:
+                    print(f"  {qid}: SKIP (query errored)")
+                    continue
 
-            if qid in NONDETERMINISTIC_QUERIES:
-                if len(u_rows) != len(c_rows):
-                    mismatches.append(qid)
-                    print(f"  {qid}: MISMATCH (row count: uncompr={len(u_rows)}, compr={len(c_rows)})")
-                else:
-                    ok, detail = validate_nondet_query(
-                        qid, u_rows, c_rows, NONDET_SORT_INFO.get(qid)
-                    )
-                    if ok:
-                        print(f"  {qid}: OK ({detail})")
-                    else:
+                if qid in NONDETERMINISTIC_QUERIES:
+                    if len(u_rows) != len(c_rows):
                         mismatches.append(qid)
-                        print(f"  {qid}: MISMATCH ({detail})")
-            elif sorted(u_rows) == sorted(c_rows):
-                print(f"  {qid}: OK ({len(u_rows)} rows match)")
-            else:
-                mismatches.append(qid)
-                print(f"  {qid}: MISMATCH!")
-                print(f"    uncompressed: {len(u_rows)} rows, first={u_rows[:2]}")
-                print(f"    compressed:   {len(c_rows)} rows, first={c_rows[:2]}")
+                        print(f"  {qid}: MISMATCH (row count: uncompr={len(u_rows)}, compr={len(c_rows)})")
+                    else:
+                        ok, detail = validate_nondet_query(
+                            qid, u_rows, c_rows, NONDET_SORT_INFO.get(qid)
+                        )
+                        if ok:
+                            print(f"  {qid}: OK ({detail})")
+                        else:
+                            mismatches.append(qid)
+                            print(f"  {qid}: MISMATCH ({detail})")
+                elif sorted(u_rows) == sorted(c_rows):
+                    print(f"  {qid}: OK ({len(u_rows)} rows match)")
+                else:
+                    mismatches.append(qid)
+                    print(f"  {qid}: MISMATCH!")
+                    print(f"    uncompressed: {len(u_rows)} rows, first={u_rows[:2]}")
+                    print(f"    compressed:   {len(c_rows)} rows, first={c_rows[:2]}")
 
         # Phase 6: Print results
         print("\n\n" + "=" * 72)
@@ -412,7 +489,7 @@ class TestClickBench:
         raw_bytes = int(totals[0] or 0)
         compressed_bytes = int(totals[1] or 0)
         save_bench_results("pg_seaturtle", {
-            "uncompressed_queries": query_results_to_dict(uncompr_results),
+            "uncompressed_queries": query_results_to_dict(uncompr_results) if uncompr_results else {},
             "compressed_queries": query_results_to_dict(compr_results),
             "raw_bytes": raw_bytes,
             "compressed_bytes": compressed_bytes,

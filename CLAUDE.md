@@ -31,6 +31,9 @@ make cargo CMD="<cmd>"                # Run arbitrary cargo command in dev conta
 make clean                            # Clean Docker volumes
 make bench-clickbench                 # Run Clickbench benchmark
 make bench-clickbench-keep            # Run Clickbench benchmark, and keep the image for troubleshooting
+make bench-clickbench-persist         # Full benchmark with persistent data volume for reruns
+make bench-clickbench-rerun           # Quick rerun: reuse data, compressed queries only (~3-4 min)
+make bench-clean                      # Remove persisted benchmark data volume
 make bench-all                        # Compare benchmarks with timescale
 ```
 
