@@ -1159,6 +1159,59 @@ class TestTransparentQuery:
         finally:
             conn2.close()
 
+    def test_transparent_query_date_trunc_group_by(self, db):
+        """GROUP BY DATE_TRUNC('minute', ts) + COUNT(*) + WHERE filter.
+
+        Exercises the DateTrunc GROUP BY pushdown into SeaTurtleAgg.
+        Verifies results match before/after compression.
+        """
+        db.execute(f"SET pg_seaturtle.mock_now = '{MOCK_NOW}'")
+        db.execute("""
+            CREATE TABLE dt_trunc_gb (
+                ts TIMESTAMPTZ NOT NULL,
+                counter_id INT NOT NULL,
+                value FLOAT8 NOT NULL
+            )
+        """)
+        db.execute("SELECT seaturtle_create_table('dt_trunc_gb', 'ts', '1 day'::interval)")
+        db.commit()
+
+        # Insert rows spanning multiple minutes
+        values = []
+        for i in range(200):
+            ts = f"'2025-01-14 10:00:00+00'::timestamptz + interval '{i * 7} seconds'"
+            cid = 62 if i % 3 != 0 else 99
+            values.append(f"({ts}, {cid}, {float(i)})")
+        for j in range(0, len(values), 100):
+            batch = values[j:j + 100]
+            db.execute(
+                f"INSERT INTO dt_trunc_gb (ts, counter_id, value) VALUES {','.join(batch)}"
+            )
+        db.commit()
+
+        q = (
+            "SELECT DATE_TRUNC('minute', ts) AS m, COUNT(*) "
+            "FROM dt_trunc_gb WHERE counter_id = 62 "
+            "GROUP BY DATE_TRUNC('minute', ts) ORDER BY m"
+        )
+        before = db.execute(q).fetchall()
+        assert len(before) > 0
+
+        # Compress
+        db.execute(
+            "SELECT seaturtle_enable_compression('dt_trunc_gb', "
+            "order_by => ARRAY['ts'])"
+        )
+        db.commit()
+        _compress_all_partitions(db, "dt_trunc_gb")
+
+        after = db.execute(q).fetchall()
+        assert after == before, (
+            f"DATE_TRUNC GROUP BY mismatch:\n"
+            f"  before: {before}\n"
+            f"  after:  {after}"
+        )
+
     def test_transparent_query_no_segment_by(self, db):
         """Same validation without segment_by columns."""
         setup_metrics_table(db)

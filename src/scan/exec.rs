@@ -443,6 +443,22 @@ pub(super) enum GroupByExpr {
     Column,
     /// regexp_replace(col, pattern, replacement): GROUP BY regexp_replace(col, ...)
     RegexpReplace { pattern: String, replacement: String, func_oid: u32, collation: u32 },
+    /// date_trunc(unit, timestamp_col): GROUP BY date_trunc('minute', ts)
+    DateTrunc { unit: String, unit_usecs: i64, func_oid: u32 },
+}
+
+/// Convert a date_trunc unit string to microseconds.
+/// Only sub-day units are supported (integer arithmetic is exact).
+pub(super) fn date_trunc_unit_to_usecs(unit: &str) -> i64 {
+    match unit {
+        "microsecond" | "microseconds" | "us" => 1,
+        "millisecond" | "milliseconds" | "ms" => 1_000,
+        "second" | "seconds" => 1_000_000,
+        "minute" | "minutes" => 60_000_000,
+        "hour" | "hours" => 3_600_000_000,
+        "day" | "days" => 86_400_000_000,
+        _ => 1, // fallback — should not happen (validated in hook)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1400,6 +1416,20 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
                     }
                     let replacement = String::from_utf8_lossy(&replacement_bytes).into_owned();
                     GroupByExpr::RegexpReplace { pattern, replacement, func_oid, collation }
+                } else if expr_tag == 2 {
+                    // DateTrunc: func_oid, unit_len, unit_bytes...
+                    let func_oid = pg_sys::list_nth_int(custom_private, idx) as u32;
+                    idx += 1;
+                    let unit_len = pg_sys::list_nth_int(custom_private, idx) as usize;
+                    idx += 1;
+                    let mut unit_bytes = Vec::with_capacity(unit_len);
+                    for _ in 0..unit_len {
+                        unit_bytes.push(pg_sys::list_nth_int(custom_private, idx) as u8);
+                        idx += 1;
+                    }
+                    let unit = String::from_utf8_lossy(&unit_bytes).into_owned();
+                    let unit_usecs = date_trunc_unit_to_usecs(&unit);
+                    GroupByExpr::DateTrunc { unit, unit_usecs, func_oid }
                 } else {
                     GroupByExpr::Column
                 };
@@ -1845,6 +1875,11 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
                                     } else {
                                         key.push(GroupKeyVal::Null);
                                     }
+                                }
+                                GroupByExpr::DateTrunc { unit_usecs, .. } => {
+                                    let pg_usec = col[row].0.value() as i64;
+                                    let truncated = pg_usec.div_euclid(*unit_usecs) * *unit_usecs;
+                                    key.push(GroupKeyVal::Int(truncated));
                                 }
                                 GroupByExpr::Column => {
                                     let datum = col[row].0;

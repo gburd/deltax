@@ -644,6 +644,14 @@ pub unsafe fn add_agg_path(
                         private_list = pg_sys::lappend_int(private_list, b as i32);
                     }
                 }
+                super::exec::GroupByExpr::DateTrunc { unit, func_oid, .. } => {
+                    private_list = pg_sys::lappend_int(private_list, 2); // expr_tag=2
+                    private_list = pg_sys::lappend_int(private_list, *func_oid as i32);
+                    private_list = pg_sys::lappend_int(private_list, unit.len() as i32);
+                    for &b in unit.as_bytes() {
+                        private_list = pg_sys::lappend_int(private_list, b as i32);
+                    }
+                }
             }
         }
         // Store HAVING filters for thread-local passing to plan_agg_path
@@ -726,6 +734,7 @@ pub unsafe extern "C-unwind" fn plan_agg_path(
         enum ParsedGroupExpr {
             Column,
             RegexpReplace { func_oid: u32, collation: u32, pattern: String, replacement: String },
+            DateTrunc { func_oid: u32, unit: String },
         }
         #[derive(Clone)]
         struct ParsedGroup {
@@ -791,6 +800,18 @@ pub unsafe extern "C-unwind" fn plan_agg_path(
                     }
                     let replacement = String::from_utf8_lossy(&replacement_bytes).into_owned();
                     ParsedGroupExpr::RegexpReplace { func_oid, collation, pattern, replacement }
+                } else if expr_tag == 2 {
+                    let func_oid = pg_sys::list_nth_int(path_private, idx) as u32;
+                    idx += 1;
+                    let unit_len = pg_sys::list_nth_int(path_private, idx) as usize;
+                    idx += 1;
+                    let mut unit_bytes = Vec::with_capacity(unit_len);
+                    for _ in 0..unit_len {
+                        unit_bytes.push(pg_sys::list_nth_int(path_private, idx) as u8);
+                        idx += 1;
+                    }
+                    let unit = String::from_utf8_lossy(&unit_bytes).into_owned();
+                    ParsedGroupExpr::DateTrunc { func_oid, unit }
                 } else {
                     ParsedGroupExpr::Column
                 };
@@ -833,22 +854,29 @@ pub unsafe extern "C-unwind" fn plan_agg_path(
                         .unwrap_or(0) as i32;
                     output_map.push((1, group_idx));
                 } else if (*expr).type_ == pg_sys::NodeTag::T_FuncExpr {
-                    // FuncExpr in target list — find matching GROUP BY spec
+                    // FuncExpr in target list — find matching GROUP BY spec.
+                    // Var position varies: regexp_replace(Var, ...) vs date_trunc(Const, Var).
                     let funcexpr = expr as *const pg_sys::FuncExpr;
                     let funcid = u32::from((*funcexpr).funcid);
                     let fn_args = (*funcexpr).args;
-                    let col_idx = if !fn_args.is_null() && (*fn_args).length >= 1 {
-                        let arg0 = (*(*fn_args).elements.add(0)).ptr_value as *const pg_sys::Node;
-                        if !arg0.is_null() && (*arg0).type_ == pg_sys::NodeTag::T_Var {
-                            (*( arg0 as *const pg_sys::Var)).varattno as i32 - 1
-                        } else {
-                            -1
+                    let mut col_idx = -1_i32;
+                    if !fn_args.is_null() {
+                        let nargs = (*fn_args).length;
+                        for ai in 0..nargs {
+                            let arg = (*(*fn_args).elements.add(ai as usize)).ptr_value as *const pg_sys::Node;
+                            if !arg.is_null() && (*arg).type_ == pg_sys::NodeTag::T_Var {
+                                col_idx = (*(arg as *const pg_sys::Var)).varattno as i32 - 1;
+                                break;
+                            }
                         }
-                    } else {
-                        -1
-                    };
+                    }
                     let group_idx = parsed_groups.iter().position(|g| {
-                        g.col_idx == col_idx && matches!(&g.expr, ParsedGroupExpr::RegexpReplace { func_oid, .. } if *func_oid == funcid)
+                        if g.col_idx != col_idx { return false; }
+                        match &g.expr {
+                            ParsedGroupExpr::RegexpReplace { func_oid, .. } => *func_oid == funcid,
+                            ParsedGroupExpr::DateTrunc { func_oid, .. } => *func_oid == funcid,
+                            _ => false,
+                        }
                     }).unwrap_or(0) as i32;
                     output_map.push((1, group_idx));
                 }
@@ -889,6 +917,14 @@ pub unsafe extern "C-unwind" fn plan_agg_path(
                     }
                     private_list = pg_sys::lappend_int(private_list, replacement.len() as i32);
                     for &b in replacement.as_bytes() {
+                        private_list = pg_sys::lappend_int(private_list, b as i32);
+                    }
+                }
+                ParsedGroupExpr::DateTrunc { func_oid, unit } => {
+                    private_list = pg_sys::lappend_int(private_list, 2);
+                    private_list = pg_sys::lappend_int(private_list, *func_oid as i32);
+                    private_list = pg_sys::lappend_int(private_list, unit.len() as i32);
+                    for &b in unit.as_bytes() {
                         private_list = pg_sys::lappend_int(private_list, b as i32);
                     }
                 }

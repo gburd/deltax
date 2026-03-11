@@ -1178,8 +1178,67 @@ pub unsafe extern "C-unwind" fn seaturtle_create_upper_paths(
                             type_oid: pg_sys::TEXTOID,
                             expr: GroupByExpr::RegexpReplace { pattern, replacement, func_oid, collation },
                         });
+                    } else if fn_name == "date_trunc" {
+                        // Validate: date_trunc(Const, Var)
+                        let fn_args = (*funcexpr).args;
+                        if fn_args.is_null() || (*fn_args).length != 2 {
+                            return;
+                        }
+                        let arg0 = (*(*fn_args).elements.add(0)).ptr_value as *const pg_sys::Node;
+                        let arg1 = (*(*fn_args).elements.add(1)).ptr_value as *const pg_sys::Node;
+
+                        if arg0.is_null() || (*arg0).type_ != pg_sys::NodeTag::T_Const {
+                            return;
+                        }
+                        if arg1.is_null() || (*arg1).type_ != pg_sys::NodeTag::T_Var {
+                            return;
+                        }
+
+                        let var_node = arg1 as *const pg_sys::Var;
+                        let col_idx = (*var_node).varattno as i32 - 1;
+
+                        // Get column type — must be timestamp or timestamptz
+                        let rte = *(*root).simple_rte_array.add((*var_node).varno as usize);
+                        if rte.is_null() {
+                            return;
+                        }
+                        let mut type_oid = pg_sys::InvalidOid;
+                        let mut typmod: i32 = -1;
+                        let mut collation: pg_sys::Oid = pg_sys::InvalidOid;
+                        pg_sys::get_atttypetypmodcoll((*rte).relid, (*var_node).varattno, &mut type_oid, &mut typmod, &mut collation);
+                        if type_oid != pg_sys::TIMESTAMPOID && type_oid != pg_sys::TIMESTAMPTZOID {
+                            return;
+                        }
+
+                        // Extract unit string from Const
+                        let unit_const = arg0 as *const pg_sys::Const;
+                        if (*unit_const).constisnull {
+                            return;
+                        }
+                        let unit_cstr = pg_sys::text_to_cstring((*unit_const).constvalue.cast_mut_ptr());
+                        let unit = std::ffi::CStr::from_ptr(unit_cstr).to_string_lossy().into_owned();
+                        pg_sys::pfree(unit_cstr as *mut _);
+
+                        // Only accept sub-day units where integer arithmetic is correct
+                        let unit_usecs = match unit.as_str() {
+                            "microsecond" | "microseconds" | "us" => 1_i64,
+                            "millisecond" | "milliseconds" | "ms" => 1_000,
+                            "second" | "seconds" => 1_000_000,
+                            "minute" | "minutes" => 60_000_000,
+                            "hour" | "hours" => 3_600_000_000,
+                            "day" | "days" => 86_400_000_000,
+                            _ => return, // week/month/quarter/year need calendar math
+                        };
+
+                        let func_oid = u32::from((*funcexpr).funcid);
+
+                        group_specs.push(super::exec::GroupByColSpec {
+                            col_idx,
+                            type_oid,
+                            expr: GroupByExpr::DateTrunc { unit, unit_usecs, func_oid },
+                        });
                     } else {
-                        return; // Only regexp_replace is supported
+                        return; // Unsupported function in GROUP BY
                     }
                 } else {
                     return; // Unsupported GROUP BY expression type
@@ -1187,23 +1246,37 @@ pub unsafe extern "C-unwind" fn seaturtle_create_upper_paths(
             }
 
 
-            // Validate that each non_agg_func_exprs entry matches a GROUP BY spec
+            // Validate that each non_agg_func_exprs entry matches a GROUP BY spec.
+            // Var position varies: regexp_replace(Var, ...) vs date_trunc(Const, Var).
             for &(_tlist_idx, funcexpr) in &non_agg_func_exprs {
                 let funcid = (*funcexpr).funcid;
                 let fn_args = (*funcexpr).args;
                 if fn_args.is_null() || (*fn_args).length < 1 {
                     return;
                 }
-                let arg0 = (*(*fn_args).elements.add(0)).ptr_value as *const pg_sys::Node;
-                if arg0.is_null() || (*arg0).type_ != pg_sys::NodeTag::T_Var {
+                // Find the Var in any arg position
+                let mut col_idx = -1_i32;
+                let nargs = (*fn_args).length;
+                for ai in 0..nargs {
+                    let arg = (*(*fn_args).elements.add(ai as usize)).ptr_value as *const pg_sys::Node;
+                    if !arg.is_null() && (*arg).type_ == pg_sys::NodeTag::T_Var {
+                        let var_node = arg as *const pg_sys::Var;
+                        col_idx = (*var_node).varattno as i32 - 1;
+                        break;
+                    }
+                }
+                if col_idx < 0 {
                     return;
                 }
-                let var_node = arg0 as *const pg_sys::Var;
-                let col_idx = (*var_node).varattno as i32 - 1;
 
                 let matched = group_specs.iter().any(|gs| {
-                    if let GroupByExpr::RegexpReplace { func_oid, .. } = &gs.expr {
-                        gs.col_idx == col_idx && *func_oid == u32::from(funcid)
+                    let spec_func_oid = match &gs.expr {
+                        GroupByExpr::RegexpReplace { func_oid, .. } => Some(*func_oid),
+                        GroupByExpr::DateTrunc { func_oid, .. } => Some(*func_oid),
+                        _ => None,
+                    };
+                    if let Some(foid) = spec_func_oid {
+                        gs.col_idx == col_idx && foid == u32::from(funcid)
                     } else {
                         false
                     }
