@@ -27,7 +27,7 @@ from clickbench_data import (
     save_bench_results,
     validate_nondet_query,
 )
-from clickbench_queries import NONDETERMINISTIC_QUERIES, NONDET_SORT_INFO, QUERIES
+from clickbench_queries import NONDETERMINISTIC_QUERIES, NONDET_SORT_INFO, LIMIT_TIE_QUERIES, QUERIES
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -298,6 +298,28 @@ def validate_results(label_a, results_a, label_b, results_b):
                 else:
                     mismatches.append(qid)
                     print(f"  {qid}: MISMATCH ({detail})")
+        elif qid in LIMIT_TIE_QUERIES:
+            sk = LIMIT_TIE_QUERIES[qid]
+            if len(rows_a) != len(rows_b):
+                mismatches.append(qid)
+                print(f"  {qid}: MISMATCH row count ({label_a}={len(rows_a)}, {label_b}={len(rows_b)})")
+            elif len(rows_a) == 0:
+                print(f"  {qid}: OK (0 rows)")
+            else:
+                a_tail, b_tail = rows_a[-1][sk], rows_b[-1][sk]
+                a_head, b_head = rows_a[0][sk], rows_b[0][sk]
+                a_stable = [r for r in rows_a if r[sk] != a_tail]
+                b_stable = [r for r in rows_b if r[sk] != b_tail]
+                a_stable = sorted([r for r in a_stable if r[sk] != a_head])
+                b_stable = sorted([r for r in b_stable if r[sk] != b_head])
+                if a_stable == b_stable:
+                    n_tied = len(rows_a) - len(a_stable)
+                    print(f"  {qid}: OK ({len(a_stable)} exact + {n_tied} tied rows)")
+                else:
+                    mismatches.append(qid)
+                    print(f"  {qid}: MISMATCH (non-tied rows differ)!")
+                    print(f"    {label_a} stable: {len(a_stable)} rows, first={a_stable[:2]}")
+                    print(f"    {label_b} stable: {len(b_stable)} rows, first={b_stable[:2]}")
         elif sorted(rows_a) == sorted(rows_b):
             print(f"  {qid}: OK ({len(rows_a)} rows match)")
         else:

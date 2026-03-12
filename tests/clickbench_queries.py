@@ -11,44 +11,36 @@ EventTime is TIMESTAMPTZ in our schema; queries referencing it work unchanged.
 # with LIMIT/OFFSET, or no ORDER BY at all.  Content comparison between
 # compressed and uncompressed scans is not meaningful for these.
 NONDETERMINISTIC_QUERIES = {
-    "Q10",  # ORDER BY c DESC LIMIT — count ties
     "Q18",  # GROUP BY + LIMIT, no ORDER BY
-    "Q19",  # ORDER BY COUNT(*) DESC LIMIT — ties
-    "Q24",  # ORDER BY EventTime LIMIT — timestamp ties (SELECT *)
-    "Q25",  # ORDER BY EventTime LIMIT — timestamp ties (single sort key)
-    "Q27",  # ORDER BY EventTime, SearchPhrase LIMIT — timestamp+phrase ties
-    "Q31",  # ORDER BY c DESC LIMIT — count ties
-    "Q32",  # ORDER BY c DESC LIMIT — count ties (high-cardinality WatchID)
-    "Q33",  # ORDER BY c DESC LIMIT — count ties (high-cardinality WatchID)
-    "Q39",  # ORDER BY PageViews DESC + OFFSET 1000 — ties
-    "Q40",  # ORDER BY PageViews DESC + OFFSET 1000 — ties
-    "Q41",  # ORDER BY PageViews DESC + OFFSET 100 — ties
+    "Q25",  # ORDER BY EventTime LIMIT — timestamp ties (single sort key not in SELECT)
+    "Q27",  # ORDER BY EventTime, SearchPhrase LIMIT — primary sort key not in SELECT
 }
 
 # Validation hints for non-deterministic queries.
 # Maps qid → (sort_key_col_index, "ASC"|"DESC", has_offset).
 # None means no ORDER BY (only row count can be validated).
 NONDET_SORT_INFO = {
-    "Q10": (2, "DESC", False),   # COUNT(*) AS c
     "Q18": None,                 # no ORDER BY
-    "Q19": (3, "DESC", False),   # COUNT(*)
-    "Q24": (4, "ASC",  False),   # EventTime (col 4 in SELECT *)
     "Q25": None,                 # ORDER BY EventTime, but not in SELECT list
     "Q27": None,                 # ORDER BY EventTime, SearchPhrase — not all sort cols in SELECT
-    "Q31": (2, "DESC", False),   # COUNT(*) AS c
-    "Q32": (2, "DESC", False),   # COUNT(*) AS c
-    "Q33": (2, "DESC", False),   # COUNT(*) AS c
-    "Q39": (1, "DESC", True),    # PageViews, OFFSET 1000
-    "Q40": (5, "DESC", True),    # PageViews, OFFSET 1000
-    "Q41": (2, "DESC", True),    # PageViews, OFFSET 100
 }
 
 # Queries where ORDER BY ... LIMIT can have ties at the boundary.
 # Maps qid → 0-based column index of the sort key.
 # Validation: strip rows sharing the last-row's sort key, then exact-match the rest.
+# For OFFSET queries, ties at both ends of the window are stripped.
 LIMIT_TIE_QUERIES = {
-    "Q12": 2,  # COUNT(DISTINCT UserID) AS u  (3rd column, 0-based index 2)
-    "Q23": 3,  # COUNT(*) AS c  (4th column, 0-based index 3)
+    "Q10": 2,  # COUNT(*) AS c
+    "Q12": 2,  # COUNT(DISTINCT UserID) AS u
+    "Q19": 3,  # COUNT(*)
+    "Q23": 3,  # COUNT(*) AS c
+    "Q24": 4,  # EventTime (col 4 in SELECT *)
+    "Q31": 2,  # COUNT(*) AS c
+    "Q32": 2,  # COUNT(*) AS c
+    "Q33": 2,  # COUNT(*) AS c
+    "Q39": 1,  # PageViews (OFFSET 1000)
+    "Q40": 5,  # PageViews (OFFSET 1000)
+    "Q41": 2,  # PageViews (OFFSET 100)
 }
 
 QUERIES = [

@@ -490,8 +490,9 @@ class TestClickBench:
                             mismatches.append(qid)
                             print(f"  {qid}: MISMATCH ({detail})")
                 elif qid in LIMIT_TIE_QUERIES:
-                    # Tie-tolerant: strip rows at the tail sharing the last
-                    # row's sort key, then exact-match the non-tied prefix.
+                    # Tie-tolerant: strip rows at the tail (and head for OFFSET
+                    # queries) that share a sort-key value with the boundary row,
+                    # then exact-match the stable interior.
                     sk = LIMIT_TIE_QUERIES[qid]
                     if len(u_rows) != len(c_rows):
                         mismatches.append(qid)
@@ -499,11 +500,16 @@ class TestClickBench:
                     elif len(u_rows) == 0:
                         print(f"  {qid}: OK (0 rows)")
                     else:
-                        # Find the boundary sort-key value (last row)
-                        u_boundary = u_rows[-1][sk]
-                        c_boundary = c_rows[-1][sk]
-                        u_stable = sorted([r for r in u_rows if r[sk] != u_boundary])
-                        c_stable = sorted([r for r in c_rows if r[sk] != c_boundary])
+                        # Strip tail ties (LIMIT boundary)
+                        u_tail = u_rows[-1][sk]
+                        c_tail = c_rows[-1][sk]
+                        u_stable = [r for r in u_rows if r[sk] != u_tail]
+                        c_stable = [r for r in c_rows if r[sk] != c_tail]
+                        # Strip head ties too (OFFSET boundary)
+                        u_head = u_rows[0][sk]
+                        c_head = c_rows[0][sk]
+                        u_stable = sorted([r for r in u_stable if r[sk] != u_head])
+                        c_stable = sorted([r for r in c_stable if r[sk] != c_head])
                         if u_stable == c_stable:
                             n_tied = len(u_rows) - len(u_stable)
                             print(f"  {qid}: OK ({len(u_stable)} exact + {n_tied} tied rows)")
