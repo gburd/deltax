@@ -71,6 +71,34 @@ pub(super) unsafe fn get_relpages(rel_oid: pg_sys::Oid) -> i32 {
     }
 }
 
+/// Get per-column ndistinct from seaturtle_partition catalog for a companion OID.
+/// Returns a map from column name to ndistinct count, or empty if unavailable.
+pub(super) fn get_column_ndistinct(companion_oid: pg_sys::Oid) -> std::collections::HashMap<String, i64> {
+    let name = unsafe {
+        let name_ptr = pg_sys::get_rel_name(companion_oid);
+        if name_ptr.is_null() {
+            return std::collections::HashMap::new();
+        }
+        std::ffi::CStr::from_ptr(name_ptr)
+            .to_string_lossy()
+            .into_owned()
+    };
+
+    let result = Spi::get_one_with_args::<pgrx::JsonB>(
+        "SELECT column_ndistinct FROM seaturtle_partition WHERE table_name = $1 AND is_compressed = true",
+        &[name.as_str().into()],
+    );
+
+    match result {
+        Ok(Some(jsonb)) => {
+            // Parse the JSON value into a HashMap
+            serde_json::from_value::<std::collections::HashMap<String, i64>>(jsonb.0)
+                .unwrap_or_default()
+        }
+        _ => std::collections::HashMap::new(),
+    }
+}
+
 /// Get reltuples from pg_class for a relation OID.
 pub(super) unsafe fn get_reltuples(rel_oid: pg_sys::Oid) -> f64 {
     unsafe {

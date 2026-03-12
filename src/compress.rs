@@ -1,5 +1,6 @@
 use pgrx::prelude::*;
 use pgrx::spi::SpiClient;
+use std::collections::HashMap;
 
 use crate::catalog;
 use crate::compression::{self, CompressionType, CompressedColumn};
@@ -217,6 +218,56 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
         return format!("Partition {}.{} has no rows to compress", schema, part_table);
     }
 
+    // 4b. Compute per-column ndistinct (used for GROUP BY cardinality estimation)
+    let non_seg_cols: Vec<&ColumnMeta> = columns.iter().filter(|c| !c.is_segment_by).collect();
+    let ndistinct_json = if !non_seg_cols.is_empty() {
+        let count_exprs: String = non_seg_cols
+            .iter()
+            .map(|c| format!("COUNT(DISTINCT \"{}\")::int8", c.name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let nd_query = format!("SELECT {} FROM {}", count_exprs, part_fqn);
+        let nd_result = client
+            .select(&nd_query, None, &[])
+            .expect("failed to compute ndistinct");
+        let mut nd_map: HashMap<String, i64> = HashMap::new();
+        if let Some(row) = nd_result.into_iter().next() {
+            for (i, col) in non_seg_cols.iter().enumerate() {
+                if let Some(nd) = row
+                    .get_datum_by_ordinal(i + 1)
+                    .unwrap()
+                    .value::<i64>()
+                    .unwrap()
+                {
+                    nd_map.insert(col.name.clone(), nd);
+                }
+            }
+        }
+        // Also add segment_by columns: ndistinct = number of distinct segment values
+        for col in columns.iter().filter(|c| c.is_segment_by) {
+            let sq = format!(
+                "SELECT COUNT(DISTINCT \"{}\")::int8 FROM {}",
+                col.name, part_fqn
+            );
+            if let Some(nd) = client
+                .select(&sq, None, &[])
+                .expect("failed to compute segment_by ndistinct")
+                .first()
+                .get_one::<i64>()
+                .unwrap()
+            {
+                nd_map.insert(col.name.clone(), nd);
+            }
+        }
+        let entries: Vec<String> = nd_map
+            .iter()
+            .map(|(k, v)| format!("\"{}\":{}", k, v))
+            .collect();
+        format!("{{{}}}", entries.join(","))
+    } else {
+        "{}".to_string()
+    };
+
     // 5. Build companion table DDL
     let companion_schema = "_seaturtle_compressed";
     let companion_fqn = format!("\"{}\".\"{}\"", companion_schema, part_table);
@@ -307,6 +358,7 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
         total_compressed_size,
         raw_size,
         row_count,
+        &ndistinct_json,
     )
     .expect("failed to update catalog");
 

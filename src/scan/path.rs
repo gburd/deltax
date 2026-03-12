@@ -587,6 +587,7 @@ pub unsafe fn add_agg_path(
     agg_specs: &[AggSpec],
     group_specs: &[super::exec::GroupByColSpec],
     having_filters: &[super::exec::HavingFilter],
+    pg_estimated_groups: f64,
 ) {
     unsafe {
         let cpath =
@@ -597,8 +598,14 @@ pub unsafe fn add_agg_path(
         (*cpath).path.parent = output_rel;
         (*cpath).path.pathtarget = (*output_rel).reltarget;
 
-        // Cost: cheaper than full scan + PG aggregation
-        let estimated_rows = if group_specs.is_empty() { 1.0 } else { 100.0 };
+        // Use PG's group count estimate for row estimate
+        let estimated_rows = if group_specs.is_empty() {
+            1.0
+        } else if pg_estimated_groups > 0.0 {
+            pg_estimated_groups
+        } else {
+            100.0
+        };
         (*cpath).path.rows = estimated_rows;
         (*cpath).path.startup_cost = 10.0;
         (*cpath).path.total_cost = 20.0;

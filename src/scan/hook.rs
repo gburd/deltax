@@ -1127,6 +1127,7 @@ pub unsafe extern "C-unwind" fn seaturtle_create_upper_paths(
         // Parse GROUP BY columns
         use super::exec::GroupByExpr;
         let mut group_specs: Vec<super::exec::GroupByColSpec> = Vec::new();
+        let mut group_by_relid: pg_sys::Oid = pg_sys::InvalidOid;
         if has_group_by {
             let group_clause = (*parse).groupClause;
             let ngroups = (*group_clause).length;
@@ -1162,6 +1163,9 @@ pub unsafe extern "C-unwind" fn seaturtle_create_upper_paths(
                         return;
                     }
                     let relid = (*rte).relid;
+                    if group_by_relid == pg_sys::InvalidOid {
+                        group_by_relid = relid;
+                    }
                     let mut type_oid = pg_sys::InvalidOid;
                     let mut typmod: i32 = -1;
                     let mut collation: pg_sys::Oid = pg_sys::InvalidOid;
@@ -1494,6 +1498,68 @@ pub unsafe extern "C-unwind" fn seaturtle_create_upper_paths(
             }
         }
 
+        // Compute actual uncompressed row count from our catalog metadata.
+        let total_uncompressed_rows: f64 = companion_oids.iter()
+            .map(|&oid| { let (_, _, rows) = cost::estimate_cost(oid); rows })
+            .sum();
+
+        // Skip AggScan when any GROUP BY column has high cardinality (near-unique).
+        // Use stored ndistinct from compression to detect this, since PG's own
+        // statistics are unavailable (original partitions are empty after compression).
+        if !group_specs.is_empty()
+            && total_uncompressed_rows > 0.0
+            && group_by_relid != pg_sys::InvalidOid
+        {
+            // Merge ndistinct across all companion partitions (sum = conservative overestimate)
+            let mut merged_ndistinct: std::collections::HashMap<String, i64> =
+                std::collections::HashMap::new();
+            for &oid in &companion_oids {
+                let nd = cost::get_column_ndistinct(oid);
+                for (col, count) in nd {
+                    *merged_ndistinct.entry(col).or_insert(0) += count;
+                }
+            }
+
+            if !merged_ndistinct.is_empty() {
+                // Check if any plain-column GROUP BY has high cardinality
+                let threshold = total_uncompressed_rows * 0.5;
+                let has_high_cardinality = group_specs.iter().any(|gs| {
+                    if !matches!(gs.expr, GroupByExpr::Column) {
+                        return false; // DateTrunc/RegexpReplace reduce cardinality
+                    }
+                    let attno = (gs.col_idx + 1) as i16;
+                    let name_ptr = pg_sys::get_attname(group_by_relid, attno, false);
+                    if name_ptr.is_null() {
+                        return false;
+                    }
+                    let col_name = std::ffi::CStr::from_ptr(name_ptr)
+                        .to_str()
+                        .unwrap_or("");
+                    merged_ndistinct
+                        .get(col_name)
+                        .map(|&nd| nd as f64 > threshold)
+                        .unwrap_or(false)
+                });
+                if has_high_cardinality {
+                    return;
+                }
+            }
+        }
+
+        // Use PG's estimated groups from its already-added paths for our row estimate.
+        let pg_estimated_groups = if !group_specs.is_empty() {
+            let pathlist = (*output_rel).pathlist;
+            if !pathlist.is_null() && (*pathlist).length > 0 {
+                let first_path =
+                    (*(*pathlist).elements.add(0)).ptr_value as *const pg_sys::Path;
+                (*first_path).rows
+            } else {
+                100.0
+            }
+        } else {
+            0.0
+        };
+
         path::add_agg_path(
             root,
             output_rel,
@@ -1501,6 +1567,7 @@ pub unsafe extern "C-unwind" fn seaturtle_create_upper_paths(
             &classified_aggs,
             &group_specs,
             &having_filters,
+            pg_estimated_groups,
         );
     }
 }
