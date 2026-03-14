@@ -332,6 +332,25 @@ Used to switch between dictionary encoding (low cardinality) and LZ4 (high
 cardinality) for text columns. Also available via `get_column_ndistinct()`
 for cost estimation.
 
+### 26. Batch LIKE eval + ExecQual removal [DONE]
+
+**Impact: Q23 0.94x → 1.10x (regression fixed), Q38 68.6ms → 59.4ms (-13%),
+Q37 145ms → 131ms (-9%), Q36 143ms → 131ms (-8%)**
+
+Three changes that eliminate redundant per-row overhead:
+
+1. **ExecQual removal:** When all plan quals are successfully extracted as
+   batch quals, `ps.qual` is set to NULL at BeginCustomScan time, skipping
+   PG's per-row `ExecQual` in the emit loop. `extract_batch_quals` now
+   returns a `handled_count` to verify full coverage before nulling.
+2. **Skip redundant text eval:** `evaluate_batch_quals` no longer re-evaluates
+   text LIKE/NotLike and Eq/Ne quals that were already applied during Phase 1
+   decompression (`decompress_text_blob_with_like_filter`).
+3. **SIMD Contains search:** For `LIKE '%needle%'` on LZ4 text columns,
+   `memchr::memmem::Finder` scans the raw decompressed buffer in a single
+   SIMD-accelerated pass instead of per-string `str::contains`. Cross-boundary
+   safety: validates the full needle fits within a single string's byte range.
+
 ---
 
 ## Regression Queries (Compressed Slower Than Uncompressed)
@@ -352,11 +371,10 @@ computed on raw `&str` slices without varlena allocation.
 **Q29 (was 0.37x):** Fixed by regex pushdown (#14). `REGEXP_REPLACE` in GROUP BY
 runs via Rust `regex` crate on raw slices with cross-segment caching.
 
-### Remaining regressions
+**Q23 (was 0.94x):** Fixed by ExecQual removal (#26). Eliminating redundant
+per-row PG qual evaluation brought ratio to 1.10x.
 
-**Q23 (0.94x):** `Title LIKE '%Google%' AND URL NOT LIKE '%.google.%'`. LIKE
-on LZ4 text columns (Title, URL) goes through PG per-row eval, not batch.
-Decompress=67.7ms dominates. See planned #26.
+### Remaining regressions
 
 **Q24 (0.71x):** `SELECT * WHERE URL LIKE '%google%' ORDER BY EventTime LIMIT 10`.
 Decompresses all columns for all matching segments. Decompress=67.4ms,
@@ -421,37 +439,6 @@ columns where the dictionary approach doesn't apply.
 
 **Files:** `src/compress.rs` (bloom filter in companion table schema),
 `src/scan/exec.rs` (bloom filter test in segment loading)
-
-### 26. Batch LIKE evaluation on LZ4 text columns
-
-**Target: Q21 59.6ms -> ~20ms, Q22 63.8ms -> ~25ms, Q23 132.7ms -> ~50ms, Q24 127ms -> ~50ms**
-**Complexity: Medium**
-
-Currently `batch_eval=0` for LIKE queries on text columns — the LIKE filter
-runs per-row through PG's executor, not in the vectorized Rust loop. Dictionary
-pruning (#19) skips whole segments, but for segments that *do* contain matching
-dictionary entries, every row is decompressed and evaluated one-at-a-time by PG.
-
-For LZ4 columns (URL, Title, Referer), there's no dictionary to prune against,
-so all segments are processed and every row goes through PG's per-row LIKE.
-
-**Approach:** After LZ4 decompression produces raw `&str` slices, run the LIKE
-pattern match (reuse existing `LikeStrategy` with Contains/StartsWith/EndsWith)
-as a Phase 1 batch qual over the text slices. This builds the selection vector
-*before* materializing varlena datums, skipping Phase 2 allocation for
-non-matching rows.
-
-For `Contains` patterns (the most common — `%google%`), use `memmem` or
-Aho-Corasick on the raw decompressed byte buffer for potentially SIMD-
-accelerated substring search.
-
-**Why this matters:** Q21-Q24 all have LIKE on high-cardinality LZ4 text
-columns. The timing breakdown shows decompress + PG per-row eval dominate.
-Batch eval in Rust would eliminate PG executor overhead and enable Phase 2
-skipping for non-matching rows.
-
-**Files:** `src/scan/exec.rs` (extend `BatchQual` to handle text slices from
-LZ4 decompression), `src/scan/hook.rs` (detect LIKE quals on LZ4 text columns)
 
 ### 27. Expression GROUP BY pushdown (col +/- const)
 
