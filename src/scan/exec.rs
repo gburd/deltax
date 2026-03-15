@@ -3,6 +3,7 @@ use pgrx::prelude::*;
 use pgrx::pg_guard;
 
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hash, Hasher};
 use std::time::Instant;
 
 use crate::compression::{self, CompressionType, CompressedColumnRef};
@@ -1880,7 +1881,13 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
         } else {
             None
         };
-        let mut group_map: HashMap<Vec<GroupKeyVal>, Vec<AggAccumulator>> = HashMap::new();
+        let mut group_map: GroupMap = GroupMap::with_hasher(BuildHasherDefault::default());
+        let mut string_arena = StringArena::new();
+        // Flat accumulator storage: group i's accumulators are at
+        // flat_accs[i * n_agg_specs .. (i+1) * n_agg_specs]
+        let n_agg_specs = agg_specs.len();
+        let mut flat_accs: Vec<AggAccumulator> = Vec::new();
+        let is_single_group_key = group_specs.len() == 1;
 
         // Check if any GROUP BY uses RegexpReplace — set up cross-segment caches
         let has_regexp_group = group_specs.iter().any(|gs| matches!(gs.expr, GroupByExpr::RegexpReplace { .. }));
@@ -1941,15 +1948,10 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
             }
         }
 
-        // String intern table for text GROUP BY — maps strings to u32 IDs
-        // across all segments, avoiding String cloning per row.
-        let mut intern_table = StringInternTable::new();
-
-        // Per-segment storage for text GROUP BY: Vec<u32> of interned string IDs per row.
-        // For dictionary columns: dict entries are interned once per segment.
-        // For LZ4 columns: each decompressed string is interned.
-        // u32::MAX = null sentinel.
-        let mut seg_text_groups: Vec<Option<Vec<u32>>> = Vec::new();
+        // Per-segment decoded text data for GROUP BY columns.
+        // Keeps decompressed string data alive during the row loop,
+        // providing O(1) &str access per row without interning.
+        let mut seg_text_columns: Vec<Option<SegTextColumn>> = Vec::new();
 
         let t2 = Instant::now();
         let mut total_segments: u64 = 0;
@@ -2246,22 +2248,18 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
 
             // Extract text GROUP BY info: intern strings and build per-row u32 ID vectors.
             // Handles both dictionary-encoded and LZ4-encoded text columns.
-            seg_text_groups.clear();
-            seg_text_groups.resize_with(meta.col_names.len(), || None);
+            // Build per-segment text column data for GROUP BY.
+            // Keeps decoded string data alive during the row loop for O(1) &str access.
+            seg_text_columns.clear();
+            seg_text_columns.resize_with(meta.col_names.len(), || None);
             {
                 let mut blob_idx2 = 0;
                 let mut seg_val_idx2 = 0;
                 for (col_idx, col_name) in meta.col_names.iter().enumerate() {
                     if meta.segment_by.contains(col_name) {
-                        // Intern segment_by text columns: same value for all rows
                         if needed_cols[col_idx] && text_group_cols[col_idx] {
                             let val = &seg.segment_values[seg_val_idx2];
-                            let id = match val {
-                                Some(s) => intern_table.intern(s),
-                                None => u32::MAX,
-                            };
-                            let full_ids = vec![id; row_count];
-                            seg_text_groups[col_idx] = Some(full_ids);
+                            seg_text_columns[col_idx] = Some(SegTextColumn::SegBy(val.clone()));
                         }
                         seg_val_idx2 += 1;
                         continue;
@@ -2273,8 +2271,7 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
                             let total = cc_ref.row_count as usize;
                             let nn_count = count_non_null(cc_ref.null_bitmap, total);
 
-                            // Decode strings and intern them based on compression type
-                            let nn_intern_ids: Vec<u32> = match cc_ref.type_tag {
+                            let seg_col = match cc_ref.type_tag {
                                 compression::CompressionType::Dictionary
                                 | compression::CompressionType::DictionaryLz4 => {
                                     let norm_buf;
@@ -2286,15 +2283,26 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
                                     };
                                     let (dict_entries, nn_indices) =
                                         compression::dictionary::decode_dict_and_indices(dict_data, nn_count);
+                                    let entries: Vec<String> = dict_entries.iter().map(|&s| s.to_string()).collect();
 
-                                    // Intern dict entries once per segment (typically small)
-                                    let dict_intern: Vec<u32> = dict_entries
-                                        .iter()
-                                        .map(|&s| intern_table.intern(s))
-                                        .collect();
-
-                                    // Map per-row nn_indices to intern IDs
-                                    nn_indices.iter().map(|&idx| dict_intern[idx as usize]).collect()
+                                    // Expand nn_indices to full-row indices (u32::MAX for nulls)
+                                    let row_to_entry = if cc_ref.null_bitmap.is_empty() {
+                                        nn_indices.iter().map(|&idx| idx as u32).collect()
+                                    } else {
+                                        let mut re = Vec::with_capacity(total);
+                                        let mut vi = 0;
+                                        for i in 0..total {
+                                            let is_null = (cc_ref.null_bitmap[i / 8] >> (i % 8)) & 1 == 1;
+                                            if is_null {
+                                                re.push(u32::MAX);
+                                            } else {
+                                                re.push(nn_indices[vi] as u32);
+                                                vi += 1;
+                                            }
+                                        }
+                                        re
+                                    };
+                                    SegTextColumn::Dict { entries, row_to_entry }
                                 }
                                 compression::CompressionType::Lz4 | compression::CompressionType::Lz4Blocked => {
                                     let (buf, ranges) = if cc_ref.type_tag == compression::CompressionType::Lz4 {
@@ -2302,37 +2310,33 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
                                     } else {
                                         compression::lz4::decode_to_ranges_blocked(cc_ref.data, nn_count, None)
                                     };
-                                    ranges.iter().map(|&(off, len)| {
-                                        let s = std::str::from_utf8(&buf[off..off + len]).unwrap_or("");
-                                        intern_table.intern(s)
-                                    }).collect()
+
+                                    // Expand ranges to full-row ranges (u32::MAX for nulls)
+                                    let row_to_range = if cc_ref.null_bitmap.is_empty() {
+                                        ranges.iter().map(|&(off, len)| (off as u32, len as u16)).collect()
+                                    } else {
+                                        let mut rr = Vec::with_capacity(total);
+                                        let mut vi = 0;
+                                        for i in 0..total {
+                                            let is_null = (cc_ref.null_bitmap[i / 8] >> (i % 8)) & 1 == 1;
+                                            if is_null {
+                                                rr.push((u32::MAX, 0u16));
+                                            } else {
+                                                let (off, len) = ranges[vi];
+                                                rr.push((off as u32, len as u16));
+                                                vi += 1;
+                                            }
+                                        }
+                                        rr
+                                    };
+                                    SegTextColumn::Lz4 { buf, row_to_range }
                                 }
                                 _ => {
-                                    // Unsupported compression type for text — skip
                                     blob_idx2 += 1;
                                     continue;
                                 }
                             };
-
-                            // Expand to full-row IDs (u32::MAX for nulls)
-                            let full_ids = if cc_ref.null_bitmap.is_empty() {
-                                nn_intern_ids
-                            } else {
-                                let mut fi = Vec::with_capacity(total);
-                                let mut vi = 0;
-                                for i in 0..total {
-                                    let is_null = (cc_ref.null_bitmap[i / 8] >> (i % 8)) & 1 == 1;
-                                    if is_null {
-                                        fi.push(u32::MAX);
-                                    } else {
-                                        fi.push(nn_intern_ids[vi]);
-                                        vi += 1;
-                                    }
-                                }
-                                fi
-                            };
-
-                            seg_text_groups[col_idx] = Some(full_ids);
+                            seg_text_columns[col_idx] = Some(seg_col);
                         }
                     }
                     blob_idx2 += 1;
@@ -2405,6 +2409,10 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
                 }
             }
 
+            // Reusable buffers for the aggregate loop (avoid per-row heap allocation)
+            let mut key_ref: Vec<GroupKeyRef> = Vec::with_capacity(group_specs.len());
+            let mut regex_results: Vec<Option<String>> = Vec::new();
+
             // Aggregate loop
             for row in 0..row_count {
                 if !selection.is_empty() && !selection[row] {
@@ -2414,81 +2422,117 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
                 total_rows_processed += 1;
 
                 let accumulators = if has_group_by {
-                    let mut key = Vec::with_capacity(group_specs.len());
-                    for (gi, gs) in group_specs.iter().enumerate() {
+                    // Clear key_ref first to release borrows on regex_results
+                    key_ref.clear();
+                    // Pre-compute regex results for this row (needs mutable regex_cache,
+                    // so must be done before building borrowed key_ref)
+                    regex_results.clear();
+                    if has_regexp_group {
+                        for (gi, gs) in group_specs.iter().enumerate() {
+                            if let GroupByExpr::RegexpReplace { .. } = &gs.expr {
+                                let rs = raw_strings[gs.col_idx as usize].as_ref().unwrap();
+                                if let Some(ref input_str) = rs[row] {
+                                    let rgi = regexp_group_infos.iter().find(|r| r.group_idx == gi).unwrap();
+                                    let result = regex_cache.entry(input_str.clone()).or_insert_with(|| {
+                                        regex_cache_calls += 1;
+                                        let input_datum = {
+                                            let text = pg_sys::cstring_to_text_with_len(
+                                                input_str.as_ptr() as *const _, input_str.len() as i32,
+                                            );
+                                            pg_sys::Datum::from(text as usize)
+                                        };
+                                        let result_datum = pg_sys::OidFunctionCall3Coll(
+                                            rgi.func_oid,
+                                            rgi.collation,
+                                            input_datum,
+                                            rgi.pattern_datum,
+                                            rgi.replacement_datum,
+                                        );
+                                        let cstr = pg_sys::text_to_cstring(result_datum.cast_mut_ptr());
+                                        let s = std::ffi::CStr::from_ptr(cstr).to_string_lossy().into_owned();
+                                        pg_sys::pfree(cstr as *mut _);
+                                        s
+                                    });
+                                    regex_results.push(Some(result.clone()));
+                                } else {
+                                    regex_results.push(None);
+                                }
+                            }
+                        }
+                    }
+
+                    // Build temporary borrowed key (reuse buffer, no heap alloc)
+                    let mut regex_idx = 0;
+                    for (_gi, gs) in group_specs.iter().enumerate() {
                         let col = &decompressed[gs.col_idx as usize];
                         if col.is_empty() || col[row].1 {
-                            key.push(GroupKeyVal::Null);
+                            key_ref.push(GroupKeyRef::Null);
+                            if matches!(&gs.expr, GroupByExpr::RegexpReplace { .. }) {
+                                regex_idx += 1;
+                            }
                         } else {
                             match &gs.expr {
                                 GroupByExpr::RegexpReplace { .. } => {
-                                    // Use raw string + regex cache
-                                    let rs = raw_strings[gs.col_idx as usize].as_ref().unwrap();
-                                    if let Some(ref input_str) = rs[row] {
-                                        let rgi = regexp_group_infos.iter().find(|r| r.group_idx == gi).unwrap();
-                                        let result = regex_cache.entry(input_str.clone()).or_insert_with(|| {
-                                            regex_cache_calls += 1;
-                                            // Call PG's regexp_replace(input, pattern, replacement)
-                                            let input_datum = {
-                                                let text = pg_sys::cstring_to_text_with_len(
-                                                    input_str.as_ptr() as *const _, input_str.len() as i32,
-                                                );
-                                                pg_sys::Datum::from(text as usize)
-                                            };
-                                            let result_datum = pg_sys::OidFunctionCall3Coll(
-                                                rgi.func_oid,
-                                                rgi.collation,
-                                                input_datum,
-                                                rgi.pattern_datum,
-                                                rgi.replacement_datum,
-                                            );
-                                            let cstr = pg_sys::text_to_cstring(result_datum.cast_mut_ptr());
-                                            let s = std::ffi::CStr::from_ptr(cstr).to_string_lossy().into_owned();
-                                            pg_sys::pfree(cstr as *mut _);
-                                            s
-                                        });
-                                        key.push(GroupKeyVal::Str(result.clone()));
-                                    } else {
-                                        key.push(GroupKeyVal::Null);
+                                    match &regex_results[regex_idx] {
+                                        Some(s) => key_ref.push(GroupKeyRef::from_str(s.as_str())),
+                                        None => key_ref.push(GroupKeyRef::Null),
                                     }
+                                    regex_idx += 1;
                                 }
                                 GroupByExpr::DateTrunc { unit_usecs, .. } => {
                                     let pg_usec = col[row].0.value() as i64;
                                     let truncated = pg_usec.div_euclid(*unit_usecs) * *unit_usecs;
-                                    key.push(GroupKeyVal::Int(truncated));
+                                    key_ref.push(GroupKeyRef::Int(truncated));
                                 }
                                 GroupByExpr::Extract { unit, .. } => {
                                     let pg_usec = col[row].0.value() as i64;
                                     let extracted = extract_field_from_usecs(pg_usec, unit);
-                                    key.push(GroupKeyVal::Int(extracted));
+                                    key_ref.push(GroupKeyRef::Int(extracted));
                                 }
                                 GroupByExpr::AddConst { offset, .. } => {
                                     let datum = col[row].0;
                                     let v = datum.value() as i64;
-                                    key.push(GroupKeyVal::Int(v + offset));
+                                    key_ref.push(GroupKeyRef::Int(v + offset));
                                 }
                                 GroupByExpr::Column => {
-                                    // Text GROUP BY: lookup interned string ID
-                                    if let Some(ref intern_ids) = seg_text_groups[gs.col_idx as usize] {
-                                        let id = intern_ids[row];
-                                        if id == u32::MAX {
-                                            key.push(GroupKeyVal::Null);
-                                        } else {
-                                            key.push(GroupKeyVal::InternedStr(id));
+                                    // Text GROUP BY: get &str from decoded segment data
+                                    if let Some(ref seg_text) = seg_text_columns[gs.col_idx as usize] {
+                                        match seg_text.get_str(row) {
+                                            Some(s) => key_ref.push(GroupKeyRef::from_str(s)),
+                                            None => key_ref.push(GroupKeyRef::Null),
                                         }
                                     } else {
                                         let datum = col[row].0;
-                                        key.push(GroupKeyVal::Int(datum.value() as i64));
+                                        key_ref.push(GroupKeyRef::Int(datum.value() as i64));
                                     }
                                 }
                             }
                         }
                     }
-                    group_map.entry(key).or_insert_with(|| {
-                        prototype_accumulators.iter().map(|a| a.clone_fresh()).collect()
-                    })
+
+                    // Use hashbrown raw_entry to avoid cloning the key for existing groups
+                    let h = hash_group_key_ref(&key_ref);
+                    let group_idx = match group_map.raw_entry_mut().from_hash(h, |stored| keys_match(stored, &key_ref, &string_arena)) {
+                        hashbrown::hash_map::RawEntryMut::Occupied(e) => {
+                            *e.into_mut()
+                        }
+                        hashbrown::hash_map::RawEntryMut::Vacant(e) => {
+                            let owned_key = if is_single_group_key {
+                                GroupKey::Single(key_ref[0].to_owned(&mut string_arena))
+                            } else {
+                                GroupKey::Multi(key_ref.iter().map(|r| r.to_owned(&mut string_arena)).collect())
+                            };
+                            let idx = (flat_accs.len() / n_agg_specs) as u32;
+                            for proto in &prototype_accumulators {
+                                flat_accs.push(proto.clone_fresh());
+                            }
+                            e.insert_with_hasher(h, owned_key, idx, |k| hash_group_key(k, &string_arena));
+                            idx
+                        }
+                    };
+                    &mut flat_accs[group_idx as usize * n_agg_specs .. (group_idx as usize + 1) * n_agg_specs]
                 } else {
-                    global_accumulators.as_mut().unwrap()
+                    global_accumulators.as_mut().unwrap().as_mut_slice()
                 };
 
                 for (spec_idx, spec) in agg_specs.iter().enumerate() {
@@ -2667,10 +2711,11 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
         let mut result_rows = if has_group_by {
             let mut rows = Vec::new();
             // Pre-finalize all agg results keyed by group
-            'group_loop: for (key, accumulators) in &group_map {
+            'group_loop: for (key, &group_idx) in &group_map {
+                let accs = &flat_accs[group_idx as usize * n_agg_specs .. (group_idx as usize + 1) * n_agg_specs];
                 let mut agg_results: Vec<(pg_sys::Datum, bool)> = Vec::new();
                 for (spec_idx, spec) in agg_specs.iter().enumerate() {
-                    agg_results.push(finalize_accumulator(&accumulators[spec_idx], spec));
+                    agg_results.push(finalize_accumulator(&accs[spec_idx], spec));
                 }
 
                 // Apply HAVING filters on finalized aggregate values
@@ -2693,6 +2738,7 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
                     }
                 }
 
+                let key_slice = key.as_slice();
                 let mut row: Vec<(pg_sys::Datum, bool)> = Vec::with_capacity(num_result_cols);
                 for entry in &output_map {
                     match entry {
@@ -2700,7 +2746,7 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
                             row.push(agg_results[*ai]);
                         }
                         OutputEntry::Group(gi) => {
-                            match &key[*gi] {
+                            match &key_slice[*gi] {
                                 GroupKeyVal::Null => {
                                     row.push((pg_sys::Datum::from(0usize), true));
                                 }
@@ -2712,12 +2758,8 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
                                         row.push((pg_sys::Datum::from(*v as usize), false));
                                     }
                                 }
-                                GroupKeyVal::Str(s) => {
-                                    let datum = string_to_datum(s, group_specs[*gi].type_oid);
-                                    row.push((datum, false));
-                                }
-                                GroupKeyVal::InternedStr(id) => {
-                                    let s = intern_table.get(*id);
+                                GroupKeyVal::Str(off, len) => {
+                                    let s = string_arena.get(*off, *len);
                                     let datum = string_to_datum(s, group_specs[*gi].type_oid);
                                     row.push((datum, false));
                                 }
@@ -2803,44 +2845,191 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
     }
 }
 
-/// Group key value for HashMap key.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// String arena: all group key strings packed into one Vec<u8>.
+/// One deallocation instead of 275K individual String deallocations.
+struct StringArena {
+    buf: Vec<u8>,
+}
+
+impl StringArena {
+    fn new() -> Self { Self { buf: Vec::new() } }
+
+    fn alloc(&mut self, s: &str) -> (u32, u32) {
+        let off = self.buf.len() as u32;
+        let len = s.len() as u32;
+        self.buf.extend_from_slice(s.as_bytes());
+        (off, len)
+    }
+
+    fn get(&self, off: u32, len: u32) -> &str {
+        std::str::from_utf8(&self.buf[off as usize..off as usize + len as usize]).unwrap_or("")
+    }
+}
+
+/// Group key value for HashMap key (owned).
+/// Str variant stores (offset, len) into a StringArena.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GroupKeyVal {
     Null,
     Int(i64),
-    Str(String),
-    InternedStr(u32),
+    Str(u32, u32), // (offset, len) into StringArena
 }
 
-/// String intern table: deduplicates strings across segments, maps to u32 IDs.
-/// Used for text GROUP BY to avoid String cloning per row in the hot loop.
-struct StringInternTable {
-    map: HashMap<String, u32>,
-    strings: Vec<String>,
+/// Group key that avoids heap allocation for the common single-column case.
+/// For high-cardinality GROUP BY (275K+ groups), eliminating per-key Vec
+/// allocation saves ~130ms of cleanup overhead when the HashMap is dropped.
+enum GroupKey {
+    Single(GroupKeyVal),
+    Multi(Box<[GroupKeyVal]>),
 }
 
-impl StringInternTable {
-    fn new() -> Self {
-        Self {
-            map: HashMap::new(),
-            strings: Vec::new(),
+impl GroupKey {
+    fn as_slice(&self) -> &[GroupKeyVal] {
+        match self {
+            GroupKey::Single(v) => std::slice::from_ref(v),
+            GroupKey::Multi(v) => v,
+        }
+    }
+}
+
+/// Borrowed version of GroupKeyVal for hash lookups without allocation.
+#[derive(Debug, Clone, Copy)]
+/// Borrowed group key component without lifetime parameter.
+/// Uses raw pointer for strings to avoid borrow-checker conflicts when reusing
+/// the key buffer across loop iterations while mutating regex_results.
+/// SAFETY: The pointed-to str data must outlive the current row iteration
+/// (guaranteed by seg_text_columns and regex_results living across the loop).
+enum GroupKeyRef {
+    Null,
+    Int(i64),
+    Str(*const str),
+}
+
+impl GroupKeyRef {
+    /// Create a Str variant from a &str. The caller must ensure the str outlives this GroupKeyRef.
+    fn from_str(s: &str) -> Self {
+        GroupKeyRef::Str(s as *const str)
+    }
+
+    fn to_owned(&self, arena: &mut StringArena) -> GroupKeyVal {
+        match self {
+            GroupKeyRef::Null => GroupKeyVal::Null,
+            GroupKeyRef::Int(v) => GroupKeyVal::Int(*v),
+            GroupKeyRef::Str(p) => {
+                // SAFETY: pointer is valid for the current row iteration
+                let s = unsafe { &**p };
+                let (off, len) = arena.alloc(s);
+                GroupKeyVal::Str(off, len)
+            }
         }
     }
 
-    fn intern(&mut self, s: &str) -> u32 {
-        if let Some(&id) = self.map.get(s) {
-            return id;
+    fn matches_owned(&self, owned: &GroupKeyVal, arena: &StringArena) -> bool {
+        match (self, owned) {
+            (GroupKeyRef::Null, GroupKeyVal::Null) => true,
+            (GroupKeyRef::Int(a), GroupKeyVal::Int(b)) => a == b,
+            (GroupKeyRef::Str(p), GroupKeyVal::Str(off, len)) => {
+                // SAFETY: pointer is valid for the current row iteration
+                let s = unsafe { &**p };
+                s == arena.get(*off, *len)
+            }
+            _ => false,
         }
-        let id = self.strings.len() as u32;
-        self.strings.push(s.to_string());
-        self.map.insert(s.to_string(), id);
-        id
-    }
-
-    fn get(&self, id: u32) -> &str {
-        &self.strings[id as usize]
     }
 }
+
+/// Hash a group key component into a Hasher with a type discriminant.
+fn hash_key_component<H: Hasher>(h: &mut H, val: &GroupKeyVal, arena: &StringArena) {
+    match val {
+        GroupKeyVal::Null => 0u8.hash(h),
+        GroupKeyVal::Int(v) => { 1u8.hash(h); v.hash(h); }
+        GroupKeyVal::Str(off, len) => { 2u8.hash(h); arena.get(*off, *len).hash(h); }
+    }
+}
+
+fn hash_ref_component<H: Hasher>(h: &mut H, val: &GroupKeyRef) {
+    match val {
+        GroupKeyRef::Null => 0u8.hash(h),
+        GroupKeyRef::Int(v) => { 1u8.hash(h); v.hash(h); }
+        GroupKeyRef::Str(p) => {
+            // SAFETY: pointer is valid for the current row iteration
+            let s = unsafe { &**p };
+            2u8.hash(h); s.hash(h);
+        }
+    }
+}
+
+/// Compute hash for an owned GroupKey (needs arena to resolve strings).
+fn hash_group_key(key: &GroupKey, arena: &StringArena) -> u64 {
+    let mut hasher = ahash::AHasher::default();
+    for val in key.as_slice() {
+        hash_key_component(&mut hasher, val, arena);
+    }
+    hasher.finish()
+}
+
+/// Compute hash for a borrowed group key slice (no allocation).
+fn hash_group_key_ref(key: &[GroupKeyRef]) -> u64 {
+    let mut hasher = ahash::AHasher::default();
+    for val in key {
+        hash_ref_component(&mut hasher, val);
+    }
+    hasher.finish()
+}
+
+/// Check if a stored owned key matches a temporary borrowed key.
+fn keys_match(stored: &GroupKey, temp: &[GroupKeyRef], arena: &StringArena) -> bool {
+    let s = stored.as_slice();
+    s.len() == temp.len()
+        && s.iter().zip(temp.iter()).all(|(s, t)| t.matches_owned(s, arena))
+}
+
+/// Per-segment decoded text data for GROUP BY columns.
+/// Keeps decompressed string data alive during the row loop,
+/// providing O(1) &str access per row without interning.
+enum SegTextColumn {
+    /// Dictionary-compressed: dict entries + per-row index (null-expanded).
+    Dict {
+        entries: Vec<String>,
+        /// Per-row index into `entries`. u32::MAX = null.
+        row_to_entry: Vec<u32>,
+    },
+    /// LZ4/LZ4Blocked: decompressed buffer + per-row range (null-expanded).
+    Lz4 {
+        buf: Vec<u8>,
+        /// Per-row (offset, len). offset == u32::MAX means null.
+        row_to_range: Vec<(u32, u16)>,
+    },
+    /// Segment-by column: same value for all rows.
+    SegBy(Option<String>),
+}
+
+impl SegTextColumn {
+    /// Get the string for a given row, or None if null.
+    fn get_str(&self, row: usize) -> Option<&str> {
+        match self {
+            SegTextColumn::Dict { entries, row_to_entry } => {
+                let idx = row_to_entry[row];
+                if idx == u32::MAX { None } else { Some(&entries[idx as usize]) }
+            }
+            SegTextColumn::Lz4 { buf, row_to_range } => {
+                let (off, len) = row_to_range[row];
+                if off == u32::MAX {
+                    None
+                } else {
+                    Some(std::str::from_utf8(&buf[off as usize..off as usize + len as usize]).unwrap_or(""))
+                }
+            }
+            SegTextColumn::SegBy(opt) => opt.as_deref(),
+        }
+    }
+}
+
+/// Type alias for the group map using hashbrown with raw_entry support.
+/// Maps group keys to indices into flat accumulator storage.
+/// Using u32 index instead of Vec<AggAccumulator> eliminates per-group heap allocation
+/// for accumulators, saving ~130ms cleanup for 275K groups.
+type GroupMap = hashbrown::HashMap<GroupKey, u32, BuildHasherDefault<ahash::AHasher>>;
 
 /// Convert a datum to i128 for SUM accumulation.
 fn datum_to_i128(datum: pg_sys::Datum, type_oid: pg_sys::Oid) -> i128 {

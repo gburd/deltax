@@ -1721,9 +1721,9 @@ pub unsafe extern "C-unwind" fn seaturtle_create_upper_paths(
                 }
 
                 // Guard: text GROUP BY columns need low cardinality
-                // (ndistinct < 30K) so the intern table stays bounded.
-                // High-cardinality text GROUP BY (e.g. URL with 275K distinct)
-                // is slower in AggScan than vanilla PG even with LIMIT.
+                // (ndistinct < 30K). High-cardinality text GROUP BY
+                // (e.g. URL with 275K distinct) is still slower in AggScan
+                // than PG's HashAgg due to aggregation + cleanup overhead.
                 let has_text_group = group_specs.iter().any(|gs| {
                     matches!(gs.expr, GroupByExpr::Column)
                         && (gs.type_oid == pg_sys::TEXTOID
@@ -1734,7 +1734,7 @@ pub unsafe extern "C-unwind" fn seaturtle_create_upper_paths(
                 if has_text_group {
                     let text_ok = group_specs.iter().all(|gs| {
                         if !matches!(gs.expr, GroupByExpr::Column) {
-                            return true; // non-Column exprs (regexp, date_trunc) are fine
+                            return true;
                         }
                         let is_text = gs.type_oid == pg_sys::TEXTOID
                             || gs.type_oid == pg_sys::VARCHAROID

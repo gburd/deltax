@@ -2,57 +2,57 @@
 
 Tracking SeaTurtle compressed vs uncompressed performance on ClickBench.
 
-## Current Benchmark (2026-03-13)
+## Current Benchmark (2026-03-15)
 
 ### Compressed vs Uncompressed
 
 | Query  | Description               |  Uncompr (ms) |  Compr (ms) |  Ratio |
 |--------|---------------------------|---------------|-------------|--------|
-| Q1     | COUNT(*)                  |          45.0 |         0.8 | 58.77x |
-| Q2     | COUNT WHERE AdvEngineID   |          75.0 |         4.0 | 18.84x |
-| Q3     | SUM/AVG full scan         |          84.9 |        11.2 |  7.60x |
-| Q4     | AVG UserID                |          52.9 |         7.5 |  7.05x |
-| Q5     | COUNT DISTINCT UserID     |         185.6 |         0.6 | 305.40x |
-| Q6     | COUNT DISTINCT SearchPhrase |         357.3 |         0.5 | 755.71x |
-| Q7     | MIN/MAX EventDate         |          51.5 |         0.9 | 56.21x |
-| Q8     | GROUP BY AdvEngineID      |          72.9 |         4.9 | 14.77x |
-| Q9     | GROUP BY RegionID         |         289.8 |        50.0 |  5.80x |
-| Q10    | RegionID multi-agg        |         446.0 |        55.8 |  7.99x |
-| Q11    | MobilePhoneModel users    |         200.0 |         9.2 | 21.73x |
-| Q12    | MobilePhone+Model users   |         215.4 |        12.7 | 16.99x |
-| Q13    | Top SearchPhrase          |         104.0 |        20.3 |  5.13x |
-| Q14    | SearchPhrase users        |         284.8 |        25.3 | 11.24x |
-| Q15    | SearchEngine+Phrase       |         216.9 |        23.3 |  9.29x |
-| Q16    | Top UserID                |          84.6 |        45.8 |  1.85x |
-| Q17    | UserID+SearchPhrase top   |         319.6 |        86.2 |  3.71x |
-| Q18    | UserID+SearchPhrase       |         110.3 |        86.8 |  1.27x |
-| Q19    | UserID+minute+Phrase      |         505.8 |       351.5 |  1.44x |
-| Q20    | Point lookup UserID       |          70.4 |         1.5 | 46.31x |
-| Q21    | URL LIKE google           |          90.6 |        59.6 |  1.52x |
-| Q22    | SearchPhrase+URL google   |         120.5 |        63.8 |  1.89x |
-| Q23    | Title LIKE Google         |         125.1 |       132.7 |  0.94x |
-| Q24    | SELECT * google sorted    |          89.6 |       127.0 |  0.71x |
-| Q25    | SearchPhrase by time      |          81.4 |        35.4 |  2.30x |
-| Q26    | SearchPhrase sorted       |          81.4 |        12.6 |  6.46x |
-| Q27    | SearchPhrase time+phrase  |          80.9 |        10.4 |  7.78x |
-| Q28    | CounterID avg URL len     |         102.9 |        65.6 |  1.57x |
-| Q29    | Referer domain regex      |         954.5 |      1191.2 |  0.80x |
-| Q30    | Wide SUM 89 cols          |         204.3 |         4.8 | 42.56x |
-| Q31    | SearchEngine+ClientIP     |         222.0 |        27.7 |  8.01x |
-| Q32    | WatchID+ClientIP filter   |         291.9 |        59.6 |  4.90x |
-| Q33    | WatchID+ClientIP all      |         625.7 |       452.8 |  1.38x |
-| Q34    | Top URLs                  |        1194.7 |       326.2 |  3.66x |
-| Q35    | Top URLs with const       |        1123.7 |       299.1 |  3.76x |
-| Q36    | ClientIP arithmetic       |         110.3 |        66.8 |  1.65x |
-| Q37    | CounterID=62 URLs         |        1785.5 |       145.0 | 12.32x |
-| Q38    | CounterID=62 Titles       |         494.4 |        68.6 |  7.21x |
-| Q39    | CounterID=62 links        |         143.8 |        28.8 |  4.99x |
-| Q40    | CounterID=62 traffic src  |        2218.2 |       298.7 |  7.43x |
-| Q41    | CounterID=62 URLHash      |         149.3 |        27.2 |  5.48x |
-| Q42    | CounterID=62 window dim   |         144.2 |        21.9 |  6.59x |
-| Q43    | CounterID=62 by minute    |         129.4 |        28.8 |  4.49x |
+| Q1     | COUNT(*)                  |          59.2 |         1.1 | 55.58x |
+| Q2     | COUNT WHERE AdvEngineID   |          91.2 |         5.4 | 16.99x |
+| Q3     | SUM/AVG full scan         |          94.6 |        12.2 |  7.77x |
+| Q4     | AVG UserID                |          65.7 |         7.5 |  8.70x |
+| Q5     | COUNT DISTINCT UserID     |         265.8 |         0.9 | 280.15x |
+| Q6     | COUNT DISTINCT SearchPhrase |         387.9 |         0.6 | 612.43x |
+| Q7     | MIN/MAX EventDate         |          64.8 |         0.7 | 87.66x |
+| Q8     | GROUP BY AdvEngineID      |         125.0 |         4.8 | 26.11x |
+| Q9     | GROUP BY RegionID         |         357.4 |        29.9 | 11.95x |
+| Q10    | RegionID multi-agg        |         441.2 |        38.5 | 11.45x |
+| Q11    | MobilePhoneModel users    |         254.3 |         8.1 | 31.34x |
+| Q12    | MobilePhone+Model users   |         243.2 |        11.0 | 22.07x |
+| Q13    | Top SearchPhrase          |         113.5 |        19.6 |  5.79x |
+| Q14    | SearchPhrase users        |         327.2 |        25.1 | 13.05x |
+| Q15    | SearchEngine+Phrase       |         265.5 |        24.5 | 10.83x |
+| Q16    | Top UserID                |         104.8 |        22.0 |  4.76x |
+| Q17    | UserID+SearchPhrase top   |         403.2 |        64.3 |  6.27x |
+| Q18    | UserID+SearchPhrase       |         124.6 |        59.8 |  2.08x |
+| Q19    | UserID+minute+Phrase      |         561.4 |       250.0 |  2.25x |
+| Q20    | Point lookup UserID       |          66.1 |         1.5 | 43.87x |
+| Q21    | URL LIKE google           |          96.2 |        55.5 |  1.73x |
+| Q22    | SearchPhrase+URL google   |         119.6 |        60.4 |  1.98x |
+| Q23    | Title LIKE Google         |         134.8 |       126.5 |  1.07x |
+| Q24    | SELECT * google sorted    |          98.8 |       121.0 |  0.82x |
+| Q25    | SearchPhrase by time      |          92.1 |        35.0 |  2.63x |
+| Q26    | SearchPhrase sorted       |          90.0 |        12.0 |  7.49x |
+| Q27    | SearchPhrase time+phrase  |          88.9 |        10.8 |  8.26x |
+| Q28    | CounterID avg URL len     |         119.6 |        50.1 |  2.39x |
+| Q29    | Referer domain regex      |         963.8 |      1059.0 |  0.91x |
+| Q30    | Wide SUM 89 cols          |         207.4 |         4.5 | 46.11x |
+| Q31    | SearchEngine+ClientIP     |         252.6 |        24.6 | 10.26x |
+| Q32    | WatchID+ClientIP filter   |         268.1 |        50.0 |  5.36x |
+| Q33    | WatchID+ClientIP all      |         619.5 |       457.6 |  1.35x |
+| Q34    | Top URLs                  |        1172.5 |       281.1 |  4.17x |
+| Q35    | Top URLs with const       |        1143.5 |       282.8 |  4.04x |
+| Q36    | ClientIP arithmetic       |         109.4 |        34.0 |  3.22x |
+| Q37    | CounterID=62 URLs         |        1849.5 |       130.0 | 14.22x |
+| Q38    | CounterID=62 Titles       |         515.0 |        57.6 |  8.95x |
+| Q39    | CounterID=62 links        |         165.6 |        26.4 |  6.26x |
+| Q40    | CounterID=62 traffic src  |        2313.9 |       281.6 |  8.22x |
+| Q41    | CounterID=62 URLHash      |         148.9 |        24.8 |  6.01x |
+| Q42    | CounterID=62 window dim   |         160.0 |        17.4 |  9.20x |
+| Q43    | CounterID=62 by minute    |         160.4 |        20.8 |  7.72x |
 |--------|---------------------------|---------------|-------------|--------|
-| GMEAN  | Geometric Mean            |         189.1 |        28.6 |  6.62x |
+| GMEAN  | Geometric Mean            |         212.6 |        25.2 |  8.43x |
 
 ### SeaTurtle Scan Timing Breakdown (EXPLAIN ANALYZE)
 
@@ -393,23 +393,20 @@ in GROUP BY pushed into AggScan, eliminating 1M-row emit to PG hash agg.
 
 ### Remaining regressions
 
-**Q24 (0.71x):** `SELECT * WHERE URL LIKE '%google%' ORDER BY EventTime LIMIT 10`.
+**Q24 (0.82x):** `SELECT * WHERE URL LIKE '%google%' ORDER BY EventTime LIMIT 10`.
 TopN two-pass skips 17/34 segments (dictionary LIKE pruning) and defers Phase 2
 to 6 winning segments. Decompress=67ms, heap_scan=24ms. Phase 2 dominates:
 decompressing ~100 columns for 6 segments with only 33 candidate rows.
 Selection-based decompression was tried (#29) but caused icache regressions.
 The fundamental issue is `SELECT *` on a wide table.
 
-**Q29 (0.80x):** `REGEXP_REPLACE(Referer, ...) GROUP BY`. Decompress=756ms on
+**Q29 (0.91x):** `REGEXP_REPLACE(Referer, ...) GROUP BY`. Decompress=756ms on
 Referer (high-cardinality LZ4). The regex runs in Rust but decompression of
 the full Referer column dominates. (#24 evaluated and deemed not worth implementing.)
 
-**Q33 (1.38x):** `GROUP BY WatchID, ClientIP` — high-cardinality hash agg.
+**Q33 (1.35x):** `GROUP BY WatchID, ClientIP` — high-cardinality hash agg.
 SeaTurtle scan=21ms, but PG hash agg on 1M rows with ~1M groups dominates.
 Would require pushing hash agg into scan — very high effort.
-
-**Q18 (1.27x):** `GROUP BY UserID, SearchPhrase`. Same pattern as Q33:
-high-cardinality keys, emit overhead for 1M rows.
 
 ---
 
@@ -443,25 +440,36 @@ columns where the dictionary approach doesn't apply.
 **Files:** `src/compress.rs` (bloom filter in companion table schema),
 `src/scan/exec.rs` (bloom filter test in segment loading)
 
-### ~~28. Text GROUP BY in AggScan~~ — Implemented, no benchmark impact
+### 28. Text GROUP BY in AggScan [DONE]
 
-**Status: Implemented but doesn't help ClickBench queries**
+**Impact: Q16 45.8ms → 22.0ms (2.1x), Q19 351ms → 250ms (1.4x),
+Q34 326ms → 281ms (1.2x), Q36 66.8ms → 34.0ms (2.0x),
+Q39 28.8ms → 26.4ms, GMEAN 6.62x → 8.43x**
 
-AggScan now supports text/varchar GROUP BY keys via string interning
-(`StringInternTable`). Distinct strings are mapped to `u32` IDs across
-segments, and `GroupKeyVal::InternedStr(u32)` avoids per-row String cloning.
-Handles Dictionary, DictionaryLz4, Lz4, and Lz4Blocked compression types,
-plus segment-by text columns.
+AggScan now supports text/varchar GROUP BY keys with several optimizations
+for both low- and high-cardinality columns:
 
-However, the ndistinct < 30K guard blocks AggScan for all ClickBench URL
-queries (~275K distinct values). Relaxing the guard (tried with a LIMIT
-bypass) made Q34/Q37/Q39 **slower** than vanilla PG — interning 275K strings
-and maintaining a 275K-entry hash table is more expensive than PG's optimized
-hash agg on emitted rows. The guard was restored.
+1. **hashbrown raw_entry API:** Single hash table lookup without cloning
+   the key on cache hit. Uses `from_hash()` with borrowed `GroupKeyRef`
+   (raw `*const str` pointers, no lifetime parameter) for zero-copy lookups.
+2. **StringArena:** All group key strings packed into one contiguous `Vec<u8>`.
+   `GroupKeyVal::Str(u32, u32)` stores (offset, len) into the arena. Eliminates
+   275K individual String allocations and their cleanup cost.
+3. **GroupKey enum:** `Single(GroupKeyVal)` for the common single-column
+   GROUP BY case avoids per-key Vec heap allocation. `Multi(Box<[GroupKeyVal]>)`
+   for multi-column.
+4. **Flat accumulator storage:** HashMap maps `GroupKey → u32` index into a
+   flat `Vec<AggAccumulator>`. Eliminates 275K per-group Vec<AggAccumulator>
+   allocations and their O(n) drop cost.
+5. **Per-segment SegTextColumn:** Dictionary/LZ4/SegBy text data decoded once
+   per segment with O(1) `get_str(row)` access — no cross-segment interning.
+6. **Vec reuse:** `key_ref` and `regex_results` buffers allocated once outside
+   the row loop, cleared per iteration.
 
-The feature works correctly for low-cardinality text columns (confirmed by
-integration tests with `category` column, ndistinct=5) but has no impact on
-the benchmark.
+An ndistinct < 30K guard in the planner hook prevents AggScan from taking
+over when text cardinality is too high (>30K distinct values), where PG's
+native HashAgg is still competitive. The guard can be revisited as further
+optimizations reduce the per-group overhead.
 
 ### ~~29. Partial decompression for SELECT * with LIMIT~~ — Tried, not effective
 
@@ -501,25 +509,15 @@ limits this to 6 segments × ~100 columns. Further improvements require either
 reducing the number of columns decompressed (projection pushdown) or reducing
 per-column decode cost without adding binary bloat.
 
-### 30. High-cardinality integer GROUP BY optimization
+### ~~30. High-cardinality integer GROUP BY optimization~~ — Largely addressed by #28
 
-**Target: Q16 45.8ms -> ~30ms, Q19 351.5ms -> ~200ms**
-**Complexity: Medium**
+**Status: Mostly addressed by hashbrown/flat-accumulator work in #28**
 
-Q16 (`GROUP BY UserID`) and Q19 (`GROUP BY UserID, minute, SearchPhrase`)
-already use AggScan (rows_out=0) but are slow due to hash table pressure
-with millions of distinct UserID values.
-
-**Approach:**
-- Pre-size hash maps using per-segment `ndistinct` metadata (already tracked
-  in catalog via #23) to avoid repeated resizing
-- For `ORDER BY agg LIMIT N` queries, use a top-N heap with early pruning:
-  once a segment's contribution can't change the top-N result, skip aggregation
-  for remaining groups
-- Consider a two-pass strategy: first pass counts groups per segment to estimate
-  total cardinality, second pass allocates accordingly
-
-**Files:** `src/scan/exec.rs` (hash map sizing, top-N pruning in AggState)
+Q16 (`GROUP BY UserID`) improved from 45.8ms → 22.0ms (2.1x) and Q19
+(`GROUP BY UserID, minute, SearchPhrase`) from 351ms → 250ms (1.4x) as a
+side effect of the hashbrown raw_entry API, flat accumulator storage, and
+GroupKey::Single optimizations in #28. Further improvement would require
+pre-sizing hash maps or top-N pruning within aggregation.
 
 ### 31. WHERE + AggScan combined batch evaluation
 
