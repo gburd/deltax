@@ -1,16 +1,16 @@
-/// Frame-of-Reference (FOR) + bit-packing and Constant encoding for integer columns.
-///
-/// ## Constant (CompressionType tag = 7)
-/// All non-null values are identical → store a single value.
-/// Format (i32): `[4B value LE]`
-/// Format (i64): `[8B value LE]`
-///
-/// ## FOR + Bit-packing (CompressionType tag = 8)
-/// Store min value, then pack `(value - min)` using minimum bits.
-/// Format (i32): `[4B min_value LE][1B bit_width][packed bits]`
-/// Format (i64): `[8B min_value LE][1B bit_width][packed bits]`
-///
-/// Packed bits are LSB-first within each byte, byte-aligned at the end.
+//! Frame-of-Reference (FOR) + bit-packing and Constant encoding for integer columns.
+//!
+//! ## Constant (CompressionType tag = 7)
+//! All non-null values are identical → store a single value.
+//! Format (i32): `[4B value LE]`
+//! Format (i64): `[8B value LE]`
+//!
+//! ## FOR + Bit-packing (CompressionType tag = 8)
+//! Store min value, then pack `(value - min)` using minimum bits.
+//! Format (i32): `[4B min_value LE][1B bit_width][packed bits]`
+//! Format (i64): `[8B min_value LE][1B bit_width][packed bits]`
+//!
+//! Packed bits are LSB-first within each byte, byte-aligned at the end.
 
 use super::CompressionType;
 

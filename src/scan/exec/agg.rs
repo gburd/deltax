@@ -696,10 +696,10 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                             }
                             AggType::Count => {
                                 let col_name = &meta.col_names[spec.col_idx as usize];
-                                if let Some(cs) = seg.col_sums.get(col_name) {
-                                    if let AggAccumulator::Count { count } = &mut accumulators[i] {
-                                        *count += cs.nonnull_count;
-                                    }
+                                if let Some(cs) = seg.col_sums.get(col_name)
+                                    && let AggAccumulator::Count { count } = &mut accumulators[i]
+                                {
+                                    *count += cs.nonnull_count;
                                 }
                             }
                             AggType::Sum | AggType::Avg => {
@@ -1478,7 +1478,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
 
                     // Build temporary borrowed key (reuse buffer, no heap alloc)
                     let mut regex_idx = 0;
-                    for (_gi, gs) in group_specs.iter().enumerate() {
+                    for gs in group_specs.iter() {
                         let col = &decompressed[gs.col_idx as usize];
                         if col.is_empty() || col[row].1 {
                             key_ref.push(GroupKeyRef::Null);
@@ -1533,9 +1533,9 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                         }
                         hashbrown::hash_map::RawEntryMut::Vacant(e) => {
                             let owned_key = if is_single_group_key {
-                                GroupKey::Single(key_ref[0].to_owned(&mut string_arena))
+                                GroupKey::Single(key_ref[0].resolve(&mut string_arena))
                             } else {
-                                GroupKey::Multi(key_ref.iter().map(|r| r.to_owned(&mut string_arena)).collect())
+                                GroupKey::Multi(key_ref.iter().map(|r| r.resolve(&mut string_arena)).collect())
                             };
                             let idx = (flat_accs.len() / n_agg_specs) as u32;
                             for proto in &prototype_accumulators {
@@ -1926,7 +1926,7 @@ impl GroupKeyRef {
         GroupKeyRef::Str(s as *const str)
     }
 
-    fn to_owned(&self, arena: &mut StringArena) -> GroupKeyVal {
+    fn resolve(&self, arena: &mut StringArena) -> GroupKeyVal {
         match self {
             GroupKeyRef::Null => GroupKeyVal::Null,
             GroupKeyRef::Int(v) => GroupKeyVal::Int(*v),
