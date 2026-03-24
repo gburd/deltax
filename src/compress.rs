@@ -1089,6 +1089,10 @@ fn compress_partition_streaming(
         if fetched == 0 {
             break;
         }
+        // Save the tuptable pointer so we can free it after consuming all rows.
+        // pgrx doesn't free SPI tuple tables until SPI_finish(), which causes
+        // unbounded memory growth when fetching millions of rows via cursor.
+        let tuptable_to_free = unsafe { pg_sys::SPI_tuptable };
 
         for row in result {
             // Check segment_by boundary
@@ -1154,6 +1158,12 @@ fn compress_partition_streaming(
                 typed_cols = init_typed_columns(columns, &kinds);
                 rows_in_segment = 0;
             }
+        }
+
+        // Free the SPI tuple table from this batch to prevent unbounded memory growth.
+        // Safe because we've fully consumed all rows and extracted values into owned Rust types.
+        if !tuptable_to_free.is_null() {
+            unsafe { pg_sys::SPI_freetuptable(tuptable_to_free) };
         }
 
         if fetched < batch_size {
