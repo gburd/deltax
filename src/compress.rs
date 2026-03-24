@@ -605,6 +605,61 @@ fn append_row_to_columns(
     }
 }
 
+/// Sort typed columns in-place by the given order_by column indices.
+/// Computes a permutation from the sort keys, then reorders all columns by that permutation.
+fn sort_typed_columns(typed_cols: &mut [TypedColumn], order_col_indices: &[usize], num_rows: usize) {
+    if order_col_indices.is_empty() || num_rows <= 1 {
+        return;
+    }
+
+    // Build sort permutation using indices
+    let mut perm: Vec<usize> = (0..num_rows).collect();
+    perm.sort_by(|&a, &b| {
+        for &col_idx in order_col_indices {
+            let cmp = match &typed_cols[col_idx] {
+                TypedColumn::Int16(v) => v[a].cmp(&v[b]),
+                TypedColumn::Int32(v) => v[a].cmp(&v[b]),
+                TypedColumn::Int64(v) => v[a].cmp(&v[b]),
+                TypedColumn::Float32(v) => {
+                    let fa = v[a].map(|f| f.to_bits());
+                    let fb = v[b].map(|f| f.to_bits());
+                    fa.cmp(&fb)
+                }
+                TypedColumn::Float64(v) => {
+                    let fa = v[a].map(|f| f.to_bits());
+                    let fb = v[b].map(|f| f.to_bits());
+                    fa.cmp(&fb)
+                }
+                TypedColumn::Bool(v) => v[a].cmp(&v[b]),
+                TypedColumn::Text(v) => v[a].cmp(&v[b]),
+            };
+            if cmp != std::cmp::Ordering::Equal {
+                return cmp;
+            }
+        }
+        std::cmp::Ordering::Equal
+    });
+
+    // Apply permutation to all columns
+    for tc in typed_cols.iter_mut() {
+        match tc {
+            TypedColumn::Int16(v) => apply_permutation(v, &perm),
+            TypedColumn::Int32(v) => apply_permutation(v, &perm),
+            TypedColumn::Int64(v) => apply_permutation(v, &perm),
+            TypedColumn::Float32(v) => apply_permutation(v, &perm),
+            TypedColumn::Float64(v) => apply_permutation(v, &perm),
+            TypedColumn::Bool(v) => apply_permutation(v, &perm),
+            TypedColumn::Text(v) => apply_permutation(v, &perm),
+        }
+    }
+}
+
+/// Reorder a Vec according to a permutation, returning a new Vec.
+fn apply_permutation<T: Clone>(v: &mut Vec<T>, perm: &[usize]) {
+    let reordered: Vec<T> = perm.iter().map(|&i| v[i].clone()).collect();
+    *v = reordered;
+}
+
 /// Compress accumulated typed column data and INSERT into companion table.
 /// Returns total compressed size in bytes.
 fn flush_segment_data(
@@ -1029,19 +1084,27 @@ fn compress_partition_streaming(
         .collect::<Vec<_>>()
         .join(", ");
 
-    // Build ORDER BY: segment_by cols first, then order_by cols
-    let mut order_parts = Vec::new();
-    for s in segment_by {
-        order_parts.push(format!("\"{}\"", s));
-    }
-    for o in order_by {
-        order_parts.push(format!("\"{}\"", o));
-    }
-    let order_clause = if order_parts.is_empty() {
-        String::new()
-    } else {
+    // Build ORDER BY: only needed when segment_by is non-empty (for boundary detection).
+    // When segment_by is empty, we skip the SQL ORDER BY to avoid a full-partition sort
+    // and instead sort each segment in Rust before flushing.
+    let order_clause = if !segment_by.is_empty() {
+        let mut order_parts = Vec::new();
+        for s in segment_by {
+            order_parts.push(format!("\"{}\"", s));
+        }
+        for o in order_by {
+            order_parts.push(format!("\"{}\"", o));
+        }
         format!(" ORDER BY {}", order_parts.join(", "))
+    } else {
+        String::new()
     };
+
+    // Resolve order_by column indices for Rust-side sorting (used when no SQL ORDER BY)
+    let order_col_indices: Vec<usize> = order_by
+        .iter()
+        .filter_map(|name| columns.iter().position(|c| c.name == *name))
+        .collect();
 
     // Segment_by column indices (for boundary detection)
     let seg_col_indices: Vec<usize> = columns
@@ -1147,6 +1210,10 @@ fn compress_partition_streaming(
 
             // Check segment_size limit
             if rows_in_segment >= segment_size {
+                // Sort in Rust when no SQL ORDER BY (non-segment_by path)
+                if seg_col_indices.is_empty() {
+                    sort_typed_columns(&mut typed_cols, &order_col_indices, rows_in_segment);
+                }
                 total_compressed_size += flush_segment_data(
                     client,
                     companion_fqn,
@@ -1173,6 +1240,9 @@ fn compress_partition_streaming(
 
     // Flush remaining
     if rows_in_segment > 0 {
+        if seg_col_indices.is_empty() {
+            sort_typed_columns(&mut typed_cols, &order_col_indices, rows_in_segment);
+        }
         total_compressed_size += flush_with_splitting(
             client,
             companion_fqn,
