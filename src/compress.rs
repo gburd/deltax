@@ -210,17 +210,28 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
         pgrx::error!("pg_deltax: no columns found for {}.{}", schema, part_table);
     }
 
-    // 4. Count rows
+    // 4. Estimate row count from pg_class stats (instant, no scan).
+    // Used for choosing array_agg vs streaming path and for skipping empty partitions.
+    // reltuples: 0 = empty (known), -1 = unknown (no ANALYZE yet), >0 = estimated count.
     let part_fqn = crate::partition::fqn(&schema, &part_table);
-    let row_count = client
-        .select(&format!("SELECT count(*)::int8 FROM {}", part_fqn), None, &[])
-        .expect("failed to count rows")
+    let reltuples = client
+        .select(
+            &format!(
+                "SELECT reltuples::int8 FROM pg_class WHERE oid = '{}'::regclass",
+                part_fqn
+            ),
+            None,
+            &[],
+        )
+        .expect("failed to get reltuples")
         .first()
         .get_one::<i64>()
         .unwrap()
-        .unwrap_or(0);
+        .unwrap_or(-1);
 
-    if row_count == 0 {
+    // reltuples = 0 means PG knows the partition is empty (e.g. freshly created).
+    // Skip compression — creating the companion table would confuse the scan hook.
+    if reltuples == 0 {
         return format!("Partition {}.{} has no rows to compress", schema, part_table);
     }
 
@@ -267,7 +278,9 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
         companion_fqn,
         create_cols.join(", ")
     );
-    client.update(&create_ddl, None, &[]).expect("failed to create companion table");
+    // NOTE: companion table creation is deferred until we confirm data exists.
+    // Creating it early would cause the scan hook to intercept queries on the partition
+    // (it checks for companion table existence, not is_compressed in the catalog).
 
     // 6. Read and compress data per segment
     let mut total_compressed_size: i64 = 0;
@@ -278,44 +291,58 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
     // Choose compression path based on partition size:
     // - array_agg: fast (bulk C-level aggregation), but hits PG's 1GB array limit on large partitions
     // - streaming: cursor-based, bounded memory, works for any size
-    // Threshold: row_count * num_columns < 200M keeps us under PG's memory limits.
+    // Threshold: row_count * num_columns < threshold keeps us under PG's memory limits.
     // E.g. 1M rows × 108 cols = 108M (array_agg), 7M rows × 108 cols = 756M (streaming).
+    let threshold = crate::ARRAY_AGG_THRESHOLD.get() as u64;
     let use_array_agg =
-        ht.segment_by.is_empty() && (row_count as u64) * (columns.len() as u64) < 200_000_000;
+        ht.segment_by.is_empty() && threshold > 0 && (reltuples.max(0) as u64) * (columns.len() as u64) < threshold;
 
     let ndistinct_json;
+    let row_count;
 
     if use_array_agg {
-        let (size, nd_map) = compress_partition_array_agg(
+        let (size, rows, nd_map) = compress_partition_array_agg(
             client,
             &part_fqn,
             &companion_fqn,
+            &create_ddl,
             &columns,
             &ht.order_by,
             segment_size,
         );
         total_compressed_size += size;
+        row_count = rows;
         let entries: Vec<String> = nd_map
             .iter()
             .map(|(k, v)| format!("\"{}\":{}", k, v))
             .collect();
         ndistinct_json = format!("{{{}}}", entries.join(","));
     } else {
-        let (size, nd_map) = compress_partition_streaming(
+        let (size, rows, nd_map) = compress_partition_streaming(
             client,
             &part_fqn,
             &companion_fqn,
+            &create_ddl,
             &columns,
             &ht.order_by,
             &ht.segment_by,
             segment_size,
         );
         total_compressed_size += size;
+        row_count = rows;
         let entries: Vec<String> = nd_map
             .iter()
             .map(|(k, v)| format!("\"{}\":{}", k, v))
             .collect();
         ndistinct_json = format!("{{{}}}", entries.join(","));
+    }
+
+    // Empty partition — clean up companion table and return
+    if row_count == 0 {
+        client
+            .update(&format!("DROP TABLE IF EXISTS {}", companion_fqn), None, &[])
+            .expect("failed to drop empty companion table");
+        return format!("Partition {}.{} has no rows to compress", schema, part_table);
     }
 
     // 8. Truncate original partition (stays attached to parent)
@@ -888,10 +915,11 @@ fn compress_partition_array_agg(
     client: &mut SpiClient,
     part_fqn: &str,
     companion_fqn: &str,
+    create_ddl: &str,
     columns: &[ColumnMeta],
     order_by: &[String],
     segment_size: usize,
-) -> (i64, HashMap<String, i64>) {
+) -> (i64, i64, HashMap<String, i64>) {
     let kinds: Vec<ColumnKind> = columns
         .iter()
         .map(|c| classify_column(&c.data_type, c.is_segment_by))
@@ -944,8 +972,11 @@ fn compress_partition_array_agg(
     let mut result_iter = result.into_iter();
     let row = match result_iter.next() {
         Some(row) => row,
-        None => return (0, HashMap::new()),
+        None => return (0, 0, HashMap::new()),
     };
+
+    // Data exists — create companion table now
+    client.update(create_ddl, None, &[]).expect("failed to create companion table");
 
     let mut typed_cols = Vec::with_capacity(columns.len());
     for (i, kind) in kinds.iter().enumerate() {
@@ -1042,24 +1073,25 @@ fn compress_partition_array_agg(
         segment_size,
     );
 
-    (compressed_size, ndistinct)
+    (compressed_size, total_rows as i64, ndistinct)
 }
 
 /// Compress a partition using cursor-based streaming.
 /// Reads native PG datums directly — no text round-trip for numeric/timestamp types.
 /// Handles both segment_by and non-segment_by partitions (boundary detection is
 /// guarded by `if !seg_col_indices.is_empty()` and naturally skipped when empty).
-/// Returns (compressed_size, ndistinct_map). ndistinct is tracked inline via HashSets;
+/// Returns (compressed_size, row_count, ndistinct_map). ndistinct is tracked inline via HashSets;
 /// columns exceeding `ndistinct_max_track` fall back to SQL COUNT(DISTINCT).
 fn compress_partition_streaming(
     client: &mut SpiClient,
     part_fqn: &str,
     companion_fqn: &str,
+    create_ddl: &str,
     columns: &[ColumnMeta],
     order_by: &[String],
     segment_by: &[String],
     segment_size: usize,
-) -> (i64, HashMap<String, i64>) {
+) -> (i64, i64, HashMap<String, i64>) {
     let batch_size = segment_size;
 
     // Classify columns for native datum extraction
@@ -1129,6 +1161,8 @@ fn compress_partition_streaming(
     let mut current_seg_values: Vec<Option<String>> = Vec::new();
     let mut rows_in_segment: usize = 0;
     let mut total_compressed_size: i64 = 0;
+    let mut total_rows: i64 = 0;
+    let mut companion_created = false;
 
     // Inline ndistinct tracking: one HashSet<u64> per column, using hashed values.
     // Columns exceeding the cap are marked with `None` and fall back to SQL later.
@@ -1175,6 +1209,10 @@ fn compress_partition_streaming(
                 } else if row_seg_values != current_seg_values {
                     // Segment boundary — flush accumulated data
                     if rows_in_segment > 0 {
+                        if !companion_created {
+                            client.update(create_ddl, None, &[]).expect("failed to create companion table");
+                            companion_created = true;
+                        }
                         total_compressed_size += flush_with_splitting(
                             client,
                             companion_fqn,
@@ -1193,6 +1231,7 @@ fn compress_partition_streaming(
 
             append_row_to_columns(&row, columns, &kinds, &mut typed_cols);
             rows_in_segment += 1;
+            total_rows += 1;
 
             // Track ndistinct: hash each non-NULL value and insert into per-column set
             for (i, kind) in kinds.iter().enumerate() {
@@ -1210,6 +1249,10 @@ fn compress_partition_streaming(
 
             // Check segment_size limit
             if rows_in_segment >= segment_size {
+                if !companion_created {
+                    client.update(create_ddl, None, &[]).expect("failed to create companion table");
+                    companion_created = true;
+                }
                 // Sort in Rust when no SQL ORDER BY (non-segment_by path)
                 if seg_col_indices.is_empty() {
                     sort_typed_columns(&mut typed_cols, &order_col_indices, rows_in_segment);
@@ -1240,6 +1283,10 @@ fn compress_partition_streaming(
 
     // Flush remaining
     if rows_in_segment > 0 {
+        if !companion_created {
+            client.update(create_ddl, None, &[]).expect("failed to create companion table");
+            companion_created = true;
+        }
         if seg_col_indices.is_empty() {
             sort_typed_columns(&mut typed_cols, &order_col_indices, rows_in_segment);
         }
@@ -1296,7 +1343,7 @@ fn compress_partition_streaming(
         }
     }
 
-    (total_compressed_size, nd_map)
+    (total_compressed_size, total_rows, nd_map)
 }
 
 /// Compress a typed column directly, bypassing string parsing.

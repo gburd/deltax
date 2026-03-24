@@ -23,6 +23,12 @@ pub(crate) static MOCK_NOW: GucSetting<Option<CString>> =
 pub(crate) static NDISTINCT_MAX_TRACK: GucSetting<i32> =
     GucSetting::<i32>::new(1_000_000);
 
+/// Threshold for choosing array_agg vs streaming compression path.
+/// If row_count * num_columns < this value AND segment_by is empty, use array_agg.
+/// Set to 0 to always use streaming. Default: 200,000,000.
+pub(crate) static ARRAY_AGG_THRESHOLD: GucSetting<i32> =
+    GucSetting::<i32>::new(200_000_000);
+
 extension_sql!(
     r#"
 CREATE SCHEMA IF NOT EXISTS _deltax_compressed;
@@ -78,6 +84,16 @@ pub extern "C-unwind" fn _PG_init() {
         &NDISTINCT_MAX_TRACK,
         0,
         100_000_000,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_int_guc(
+        c"pg_deltax.array_agg_threshold",
+        c"row_count * num_columns threshold for array_agg path (0 = always streaming)",
+        c"row_count * num_columns threshold for array_agg path (0 = always streaming)",
+        &ARRAY_AGG_THRESHOLD,
+        0,
+        2_000_000_000,
         GucContext::Suset,
         GucFlags::default(),
     );
