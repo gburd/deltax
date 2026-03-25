@@ -956,6 +956,27 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
             })
             .collect();
 
+        // Build count_distinct_only_str: text columns where ALL referencing agg specs
+        // are CountDistinct and the column is not used in GROUP BY.  These can be
+        // pre-accumulated directly from compressed data, skipping datum conversion.
+        let count_distinct_only_str: Vec<bool> = (0..num_cols)
+            .map(|col_idx| {
+                let is_text = matches!(
+                    meta.col_types[col_idx],
+                    x if x == pg_sys::TEXTOID || x == pg_sys::VARCHAROID || x == pg_sys::BPCHAROID
+                );
+                if !is_text { return false; }
+                let refs: Vec<&AggExecSpec> = agg_specs
+                    .iter()
+                    .filter(|s| s.col_idx >= 0 && s.col_idx as usize == col_idx)
+                    .collect();
+                if refs.is_empty() { return false; }
+                let all_cd = refs.iter().all(|s| s.agg_type == AggType::CountDistinct);
+                let in_group_by = group_specs.iter().any(|gs| gs.col_idx as usize == col_idx);
+                all_cd && !in_group_by
+            })
+            .collect();
+
         // Extract batch quals and segment filters from WHERE clause (quals from custom_private)
         let (batch_quals, _handled_count) = extract_batch_quals(where_quals, &meta.col_names, &meta.col_types);
 
@@ -1156,6 +1177,78 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                 } else {
                     let blob = &seg.compressed_blobs[blob_idx];
                     let typmod = meta.col_typmods[col_idx];
+
+                    // Fast path: COUNT(DISTINCT) on text without GROUP BY or
+                    // row-level WHERE — hash directly from compressed data,
+                    // skipping all datum conversion.
+                    if count_distinct_only_str[col_idx] && !has_group_by && batch_quals.is_empty() {
+                        let cc_ref = compression::CompressedColumnRef::from_bytes(blob);
+                        let accumulators = global_accumulators.as_mut().unwrap();
+                        // Find the CountDistinctStr accumulator for this column
+                        for (spec_idx, spec) in agg_specs.iter().enumerate() {
+                            if spec.col_idx as usize == col_idx {
+                                if let AggAccumulator::CountDistinctStr { seen } = &mut accumulators[spec_idx] {
+                                    let non_null_count = count_non_null(cc_ref.null_bitmap, cc_ref.row_count as usize);
+                                    match cc_ref.type_tag {
+                                        compression::CompressionType::Dictionary
+                                        | compression::CompressionType::DictionaryLz4 => {
+                                            // Dict shortcut: hash only the dict entries — O(dict_size)
+                                            let norm_buf;
+                                            let dict_data = if cc_ref.type_tag == compression::CompressionType::DictionaryLz4 {
+                                                norm_buf = compression::dictionary::normalize_lz4(cc_ref.data);
+                                                &norm_buf[..]
+                                            } else {
+                                                cc_ref.data
+                                            };
+                                            let hdr = compression::dictionary::parse_header(dict_data);
+                                            for entry in &hdr.dict {
+                                                seen.insert(hash128_str(entry.as_bytes()));
+                                            }
+                                        }
+                                        compression::CompressionType::Lz4 => {
+                                            let (buf, ranges) = compression::lz4::decode_to_ranges(cc_ref.data, non_null_count);
+                                            let empty_hash = hash128_str(b"");
+                                            let mut has_empty = false;
+                                            for &(off, len) in &ranges {
+                                                if len == 0 {
+                                                    has_empty = true;
+                                                } else {
+                                                    seen.insert(hash128_str(&buf[off..off + len]));
+                                                }
+                                            }
+                                            if has_empty { seen.insert(empty_hash); }
+                                        }
+                                        compression::CompressionType::Lz4Blocked => {
+                                            let (buf, ranges) = compression::lz4::decode_to_ranges_blocked(cc_ref.data, non_null_count, None);
+                                            let empty_hash = hash128_str(b"");
+                                            let mut has_empty = false;
+                                            for &(off, len) in &ranges {
+                                                if len == 0 {
+                                                    has_empty = true;
+                                                } else {
+                                                    seen.insert(hash128_str(&buf[off..off + len]));
+                                                }
+                                            }
+                                            if has_empty { seen.insert(empty_hash); }
+                                        }
+                                        compression::CompressionType::Constant => {
+                                            // Single constant string — hash the raw bytes
+                                            if non_null_count > 0 {
+                                                seen.insert(hash128_str(cc_ref.data));
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                        // Push empty so the row loop skips this column
+                        decompressed.push(Vec::new());
+                        raw_strings.push(None);
+                        blob_idx += 1;
+                        continue;
+                    }
 
                     if raw_string_cols[col_idx] {
                         // Dictionary-optimized path: pre-warm regex cache from dict entries only
