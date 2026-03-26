@@ -1768,7 +1768,20 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                         pack_int_keys_2(int_keys[0], int_keys[1])
                     };
 
-                    // Lookup or insert group
+                    // Lookup or insert group.
+                    // Cap hashmap growth: above 32M entries, reserve in 8M
+                    // increments instead of letting hashbrown double.
+                    if compact_group_map.len() == compact_group_map.capacity() {
+                        let cap = compact_group_map.capacity();
+                        let extra = if cap >= 32_000_000 {
+                            8_000_000 // ~170MB at 21B/slot
+                        } else {
+                            0 // let hashbrown double normally for small maps
+                        };
+                        if extra > 0 {
+                            compact_group_map.reserve(extra);
+                        }
+                    }
                     let group_idx = match compact_group_map.entry(packed) {
                         hashbrown::hash_map::Entry::Occupied(e) => *e.get(),
                         hashbrown::hash_map::Entry::Vacant(e) => {
@@ -1803,6 +1816,19 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                     let (sum, count) = storage.sum_int_mut(group_idx, spec_idx);
                                     if spec.expr_kind == AggExpr::AddConst {
                                         *sum += v + spec.const_offset as i128;
+                                    } else {
+                                        *sum += v;
+                                    }
+                                    *count += 1;
+                                }
+                            }
+                            CompactAccKind::SumIntNarrow => {
+                                let col = &decompressed[spec.col_idx as usize];
+                                if !col.is_empty() && !col[row].1 {
+                                    let v = col[row].0.value() as i64;
+                                    let (sum, count) = storage.sum_int_narrow_mut(group_idx, spec_idx);
+                                    if spec.expr_kind == AggExpr::AddConst {
+                                        *sum += v + spec.const_offset;
                                     } else {
                                         *sum += v;
                                     }
@@ -2719,9 +2745,10 @@ pub(super) unsafe extern "C-unwind" fn rescan_agg_scan(
 /// Kind of accumulator slot in compact storage.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum CompactAccKind {
-    Count,      // 8 bytes: i64
-    SumInt,     // 24 bytes: i128 sum (16) + i64 count (8)
-    SumFloat,   // 16 bytes: f64 sum (8) + i64 count (8)
+    Count,          // 8 bytes: i64
+    SumInt,         // 24 bytes: i128 sum (16) + i64 count (8) — for INT8 columns
+    SumIntNarrow,   // 16 bytes: i64 sum (8) + i64 count (8) — for INT2/INT4 columns
+    SumFloat,       // 16 bytes: f64 sum (8) + i64 count (8)
 }
 
 impl CompactAccKind {
@@ -2729,6 +2756,7 @@ impl CompactAccKind {
         match self {
             CompactAccKind::Count => 8,
             CompactAccKind::SumInt => 24,
+            CompactAccKind::SumIntNarrow => 16,
             CompactAccKind::SumFloat => 16,
         }
     }
@@ -2737,6 +2765,7 @@ impl CompactAccKind {
         match self {
             CompactAccKind::Count => 8,
             CompactAccKind::SumInt => 16, // i128 needs 16-byte alignment
+            CompactAccKind::SumIntNarrow => 8,
             CompactAccKind::SumFloat => 8,
         }
     }
@@ -2780,12 +2809,18 @@ impl CompactAccLayout {
 }
 
 /// Determine the CompactAccKind for a given agg spec.
+///
+/// INT2/INT4 columns use SumIntNarrow (i64 sum, 16B) since their sums
+/// cannot overflow i64 even at 2^31 rows × max value (2^31 × 2^31 < 2^63).
+/// INT8 columns use SumInt (i128 sum, 24B) to handle potential overflow.
 fn compact_acc_kind(spec: &AggExecSpec) -> CompactAccKind {
     match spec.agg_type {
         AggType::CountStar | AggType::Count => CompactAccKind::Count,
         AggType::Sum | AggType::Avg => {
             if spec.col_type_oid == pg_sys::FLOAT4OID || spec.col_type_oid == pg_sys::FLOAT8OID {
                 CompactAccKind::SumFloat
+            } else if spec.col_type_oid == pg_sys::INT2OID || spec.col_type_oid == pg_sys::INT4OID {
+                CompactAccKind::SumIntNarrow
             } else {
                 CompactAccKind::SumInt
             }
@@ -2809,10 +2844,23 @@ impl CompactAccStorage {
     }
 
     /// Allocate accumulators for a new group. Returns the group index.
+    ///
+    /// Growth strategy: below 1GB, let Vec double normally. Above 1GB,
+    /// grow by 2GB increments to cap peak waste at ~2GB instead of 100%.
     #[inline]
     fn alloc_group(&mut self) -> u32 {
+        let new_len = self.buf.len() + self.layout.group_stride;
+        if new_len > self.buf.capacity() {
+            const GB: usize = 1 << 30;
+            let extra = if self.buf.capacity() >= GB {
+                2 * GB // fixed 2GB growth for large buffers
+            } else {
+                self.buf.capacity().max(self.layout.group_stride) // double (normal)
+            };
+            self.buf.reserve(extra);
+        }
         let group_idx = self.buf.len() / self.layout.group_stride;
-        self.buf.resize(self.buf.len() + self.layout.group_stride, 0);
+        self.buf.resize(new_len, 0);
         group_idx as u32
     }
 
@@ -2836,6 +2884,19 @@ impl CompactAccStorage {
                 .add(group_idx as usize * self.layout.group_stride + offset);
             let sum = &mut *(base as *mut i128);
             let count = &mut *(base.add(16) as *mut i64);
+            (sum, count)
+        }
+    }
+
+    /// Get mutable references to (sum: i64, count: i64) for SumIntNarrow.
+    #[inline]
+    unsafe fn sum_int_narrow_mut(&mut self, group_idx: u32, slot: usize) -> (&mut i64, &mut i64) {
+        unsafe {
+            let (offset, _) = self.layout.slots[slot];
+            let base = self.buf.as_mut_ptr()
+                .add(group_idx as usize * self.layout.group_stride + offset);
+            let sum = &mut *(base as *mut i64);
+            let count = &mut *(base.add(8) as *mut i64);
             (sum, count)
         }
     }
@@ -2873,6 +2934,19 @@ impl CompactAccStorage {
                 .add(group_idx as usize * self.layout.group_stride + offset);
             let sum = *(base as *const i128);
             let count = *(base.add(16) as *const i64);
+            (sum, count)
+        }
+    }
+
+    /// Read (sum_i64, count) for finalization (narrow path).
+    #[inline]
+    unsafe fn read_sum_int_narrow(&self, group_idx: u32, slot: usize) -> (i64, i64) {
+        unsafe {
+            let (offset, _) = self.layout.slots[slot];
+            let base = self.buf.as_ptr()
+                .add(group_idx as usize * self.layout.group_stride + offset);
+            let sum = *(base as *const i64);
+            let count = *(base.add(8) as *const i64);
             (sum, count)
         }
     }
@@ -2953,6 +3027,35 @@ unsafe fn compact_finalize(
                         (datum, false)
                     }
                     _ => (pg_sys::Datum::from(sum as i64 as usize), false),
+                }
+            }
+            CompactAccKind::SumIntNarrow => {
+                let (sum, count) = storage.read_sum_int_narrow(group_idx, slot);
+                if count == 0 {
+                    return (pg_sys::Datum::from(0usize), true);
+                }
+                match spec.agg_type {
+                    AggType::Sum => {
+                        // SUM(int2/int4) → INT8
+                        (pg_sys::Datum::from(sum as usize), false)
+                    }
+                    AggType::Avg => {
+                        // AVG(int*) → NUMERIC
+                        let sum_numeric = i128_to_numeric_datum(sum as i128);
+                        let count_numeric = pg_sys::OidFunctionCall1Coll(
+                            pg_sys::Oid::from(1781u32),
+                            pg_sys::InvalidOid,
+                            pg_sys::Datum::from(count as usize),
+                        );
+                        let datum = pg_sys::OidFunctionCall2Coll(
+                            pg_sys::Oid::from(1727u32),
+                            pg_sys::InvalidOid,
+                            sum_numeric,
+                            count_numeric,
+                        );
+                        (datum, false)
+                    }
+                    _ => (pg_sys::Datum::from(sum as usize), false),
                 }
             }
             CompactAccKind::SumFloat => {
