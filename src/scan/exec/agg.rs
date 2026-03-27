@@ -1144,8 +1144,19 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
             }
         }
 
-        // Also check if any agg references a raw_string_col for Min/Max on text
-        // (e.g. MIN(Referer) where Referer is also the regexp GROUP BY column)
+        // Mark text columns used for Min/Max aggregations as raw_string_cols
+        // only when the compact accumulator path is active (MinStr/MaxStr need raw bytes).
+        // The generic path handles MIN/MAX text via normal PG datums.
+        if use_compact_accs {
+            for spec in &agg_specs {
+                if matches!(spec.agg_type, AggType::Min | AggType::Max) {
+                    let t = spec.col_type_oid;
+                    if t == pg_sys::TEXTOID || t == pg_sys::VARCHAROID || t == pg_sys::BPCHAROID {
+                        raw_string_cols[spec.col_idx as usize] = true;
+                    }
+                }
+            }
+        }
 
         // Identify text GROUP BY columns (dictionary or LZ4)
         let mut text_group_cols: Vec<bool> = vec![false; meta.col_names.len()];
@@ -1340,6 +1351,29 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                             *gs += ws;
                                             *gc += wc;
                                         }
+                                        CompactAccKind::MinStr | CompactAccKind::MaxStr => {
+                                            let (w_off, w_len) = result.compact_storage.read_min_max_str(worker_idx, slot_idx);
+                                            if w_off != u32::MAX {
+                                                let w_str = result.compact_storage.str_arena.get(w_off, w_len);
+                                                let (g_off, g_len) = storage.read_min_max_str(global_idx, slot_idx);
+                                                let should_update = if g_off == u32::MAX {
+                                                    true
+                                                } else {
+                                                    let g_str = storage.str_arena.get(g_off, g_len);
+                                                    let cmp = collation_strcmp(w_str, g_str);
+                                                    match kind {
+                                                        CompactAccKind::MinStr => cmp < 0,
+                                                        CompactAccKind::MaxStr => cmp > 0,
+                                                        _ => unreachable!(),
+                                                    }
+                                                };
+                                                if should_update {
+                                                    let w_str = result.compact_storage.str_arena.get(w_off, w_len);
+                                                    let (new_off, new_len) = storage.str_arena.alloc(w_str);
+                                                    storage.write_min_max_str(global_idx, slot_idx, new_off, new_len);
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -1469,6 +1503,29 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                         let (gs, gc) = storage.sum_float_mut(global_idx, slot_idx);
                                         *gs += ws;
                                         *gc += wc;
+                                    }
+                                    CompactAccKind::MinStr | CompactAccKind::MaxStr => {
+                                        let (w_off, w_len) = result.compact_storage.read_min_max_str(worker_idx, slot_idx);
+                                        if w_off != u32::MAX {
+                                            let w_str = result.compact_storage.str_arena.get(w_off, w_len);
+                                            let (g_off, g_len) = storage.read_min_max_str(global_idx, slot_idx);
+                                            let should_update = if g_off == u32::MAX {
+                                                true
+                                            } else {
+                                                let g_str = storage.str_arena.get(g_off, g_len);
+                                                let cmp = collation_strcmp(w_str, g_str);
+                                                match kind {
+                                                    CompactAccKind::MinStr => cmp < 0,
+                                                    CompactAccKind::MaxStr => cmp > 0,
+                                                    _ => unreachable!(),
+                                                }
+                                            };
+                                            if should_update {
+                                                let w_str = result.compact_storage.str_arena.get(w_off, w_len);
+                                                let (new_off, new_len) = storage.str_arena.alloc(w_str);
+                                                storage.write_min_max_str(global_idx, slot_idx, new_off, new_len);
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -1917,6 +1974,29 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                             *gs += ws;
                                             *gc += wc;
                                         }
+                                        CompactAccKind::MinStr | CompactAccKind::MaxStr => {
+                                            let (w_off, w_len) = result.compact_storage.read_min_max_str(worker_idx, slot_idx);
+                                            if w_off != u32::MAX {
+                                                let w_str = result.compact_storage.str_arena.get(w_off, w_len);
+                                                let (g_off, g_len) = storage.read_min_max_str(global_idx, slot_idx);
+                                                let should_update = if g_off == u32::MAX {
+                                                    true
+                                                } else {
+                                                    let g_str = storage.str_arena.get(g_off, g_len);
+                                                    let cmp = collation_strcmp(w_str, g_str);
+                                                    match kind {
+                                                        CompactAccKind::MinStr => cmp < 0,
+                                                        CompactAccKind::MaxStr => cmp > 0,
+                                                        _ => unreachable!(),
+                                                    }
+                                                };
+                                                if should_update {
+                                                    let w_str = result.compact_storage.str_arena.get(w_off, w_len);
+                                                    let (new_off, new_len) = storage.str_arena.alloc(w_str);
+                                                    storage.write_min_max_str(global_idx, slot_idx, new_off, new_len);
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -2078,6 +2158,29 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                         *gs += ws;
                                         *gc += wc;
                                     }
+                                    CompactAccKind::MinStr | CompactAccKind::MaxStr => {
+                                        let (w_off, w_len) = result.compact_storage.read_min_max_str(worker_gidx, slot_idx);
+                                        if w_off != u32::MAX {
+                                            let w_str = result.compact_storage.str_arena.get(w_off, w_len);
+                                            let (g_off, g_len) = final_storage.read_min_max_str(group_idx, slot_idx);
+                                            let should_update = if g_off == u32::MAX {
+                                                true
+                                            } else {
+                                                let g_str = final_storage.str_arena.get(g_off, g_len);
+                                                let cmp = collation_strcmp(w_str, g_str);
+                                                match kind {
+                                                    CompactAccKind::MinStr => cmp < 0,
+                                                    CompactAccKind::MaxStr => cmp > 0,
+                                                    _ => unreachable!(),
+                                                }
+                                            };
+                                            if should_update {
+                                                let w_str = result.compact_storage.str_arena.get(w_off, w_len);
+                                                let (new_off, new_len) = final_storage.str_arena.alloc(w_str);
+                                                final_storage.write_min_max_str(group_idx, slot_idx, new_off, new_len);
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -2231,6 +2334,29 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                 let (gs, gc) = storage.sum_float_mut(global_group_idx, slot_idx);
                                 *gs += ws;
                                 *gc += wc;
+                            }
+                            CompactAccKind::MinStr | CompactAccKind::MaxStr => {
+                                let (w_off, w_len) = result.compact_storage.read_min_max_str(worker_group_idx, slot_idx);
+                                if w_off != u32::MAX {
+                                    let w_str = result.compact_storage.str_arena.get(w_off, w_len);
+                                    let (g_off, g_len) = storage.read_min_max_str(global_group_idx, slot_idx);
+                                    let should_update = if g_off == u32::MAX {
+                                        true
+                                    } else {
+                                        let g_str = storage.str_arena.get(g_off, g_len);
+                                        let cmp = collation_strcmp(w_str, g_str);
+                                        match kind {
+                                            CompactAccKind::MinStr => cmp < 0,
+                                            CompactAccKind::MaxStr => cmp > 0,
+                                            _ => unreachable!(),
+                                        }
+                                    };
+                                    if should_update {
+                                        let w_str = result.compact_storage.str_arena.get(w_off, w_len);
+                                        let (new_off, new_len) = storage.str_arena.alloc(w_str);
+                                        storage.write_min_max_str(global_group_idx, slot_idx, new_off, new_len);
+                                    }
+                                }
                             }
                         }
                     }
@@ -3123,6 +3249,28 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                         *sum += v;
                                     }
                                     *count += 1;
+                                }
+                            }
+                            CompactAccKind::MinStr | CompactAccKind::MaxStr => {
+                                let col_idx = spec.col_idx as usize;
+                                if let Some(ref rs) = raw_strings[col_idx]
+                                    && let Some(ref s) = rs[row] {
+                                        let (cur_off, cur_len) = storage.read_min_max_str(group_idx, spec_idx);
+                                        let should_update = if cur_off == u32::MAX {
+                                            true
+                                        } else {
+                                            let cur = storage.str_arena.get(cur_off, cur_len);
+                                            let cmp = collation_strcmp(s, cur);
+                                            match kind {
+                                                CompactAccKind::MinStr => cmp < 0,
+                                                CompactAccKind::MaxStr => cmp > 0,
+                                                _ => unreachable!(),
+                                            }
+                                        };
+                                        if should_update {
+                                            let (new_off, new_len) = storage.str_arena.alloc(s);
+                                            storage.write_min_max_str(group_idx, spec_idx, new_off, new_len);
+                                        }
                                 }
                             }
                         }
@@ -4095,6 +4243,8 @@ enum CompactAccKind {
     SumInt,         // 24 bytes: i128 sum (16) + i64 count (8) — for INT8 columns
     SumIntNarrow,   // 16 bytes: i64 sum (8) + i64 count (8) — for INT2/INT4 columns
     SumFloat,       // 16 bytes: f64 sum (8) + i64 count (8)
+    MinStr,         // 8 bytes: u32 arena_offset + u32 length (sentinel: u32::MAX, 0)
+    MaxStr,         // 8 bytes: u32 arena_offset + u32 length (sentinel: u32::MAX, 0)
 }
 
 impl CompactAccKind {
@@ -4104,6 +4254,7 @@ impl CompactAccKind {
             CompactAccKind::SumInt => 24,
             CompactAccKind::SumIntNarrow => 16,
             CompactAccKind::SumFloat => 16,
+            CompactAccKind::MinStr | CompactAccKind::MaxStr => 8,
         }
     }
 
@@ -4113,6 +4264,7 @@ impl CompactAccKind {
             CompactAccKind::SumInt => 16, // i128 needs 16-byte alignment
             CompactAccKind::SumIntNarrow => 8,
             CompactAccKind::SumFloat => 8,
+            CompactAccKind::MinStr | CompactAccKind::MaxStr => 4,
         }
     }
 }
@@ -4171,6 +4323,22 @@ fn compact_acc_kind(spec: &AggExecSpec) -> CompactAccKind {
                 CompactAccKind::SumInt
             }
         }
+        AggType::Min => {
+            let t = spec.col_type_oid;
+            if t == pg_sys::TEXTOID || t == pg_sys::VARCHAROID || t == pg_sys::BPCHAROID {
+                CompactAccKind::MinStr
+            } else {
+                unreachable!("compact_acc_kind: MIN on non-text not supported in compact path")
+            }
+        }
+        AggType::Max => {
+            let t = spec.col_type_oid;
+            if t == pg_sys::TEXTOID || t == pg_sys::VARCHAROID || t == pg_sys::BPCHAROID {
+                CompactAccKind::MaxStr
+            } else {
+                unreachable!("compact_acc_kind: MAX on non-text not supported in compact path")
+            }
+        }
         _ => unreachable!("compact_acc_kind called for unsupported agg type"),
     }
 }
@@ -4179,6 +4347,7 @@ fn compact_acc_kind(spec: &AggExecSpec) -> CompactAccKind {
 struct CompactAccStorage {
     buf: Vec<u8>,
     layout: CompactAccLayout,
+    str_arena: StringArena,
 }
 
 impl CompactAccStorage {
@@ -4186,6 +4355,7 @@ impl CompactAccStorage {
         CompactAccStorage {
             buf: Vec::new(),
             layout,
+            str_arena: StringArena::new(),
         }
     }
 
@@ -4208,6 +4378,13 @@ impl CompactAccStorage {
         }
         let group_idx = self.buf.len() / self.layout.group_stride;
         self.buf.resize(new_len, 0);
+        // Set MinStr/MaxStr sentinels (u32::MAX offset = no value)
+        for slot_idx in 0..self.layout.slots.len() {
+            let (_, kind) = self.layout.slots[slot_idx];
+            if kind == CompactAccKind::MinStr || kind == CompactAccKind::MaxStr {
+                unsafe { self.write_min_max_str(group_idx as u32, slot_idx, u32::MAX, 0); }
+            }
+        }
         group_idx as u32
     }
 
@@ -4311,6 +4488,31 @@ impl CompactAccStorage {
         }
     }
 
+    /// Read MinStr/MaxStr: returns (arena_offset, length). Sentinel is (u32::MAX, 0) = no value.
+    #[inline]
+    unsafe fn read_min_max_str(&self, group_idx: u32, slot: usize) -> (u32, u32) {
+        unsafe {
+            let (offset, _) = self.layout.slots[slot];
+            let base = self.buf.as_ptr()
+                .add(group_idx as usize * self.layout.group_stride + offset);
+            let off = *(base as *const u32);
+            let len = *(base.add(4) as *const u32);
+            (off, len)
+        }
+    }
+
+    /// Write MinStr/MaxStr arena offset and length.
+    #[inline]
+    unsafe fn write_min_max_str(&mut self, group_idx: u32, slot: usize, off: u32, len: u32) {
+        unsafe {
+            let (offset, _) = self.layout.slots[slot];
+            let base = self.buf.as_mut_ptr()
+                .add(group_idx as usize * self.layout.group_stride + offset);
+            *(base as *mut u32) = off;
+            *(base.add(4) as *mut u32) = len;
+        }
+    }
+
 }
 
 /// Check if all aggregates can use the compact accumulator path.
@@ -4325,6 +4527,10 @@ fn can_use_compact_accs(agg_specs: &[AggExecSpec]) -> bool {
                 let t = spec.col_type_oid;
                 t == pg_sys::INT2OID || t == pg_sys::INT4OID || t == pg_sys::INT8OID
                     || t == pg_sys::FLOAT4OID || t == pg_sys::FLOAT8OID
+            }
+            AggType::Min | AggType::Max => {
+                let t = spec.col_type_oid;
+                t == pg_sys::TEXTOID || t == pg_sys::VARCHAROID || t == pg_sys::BPCHAROID
             }
             _ => false,
         }
@@ -4493,6 +4699,16 @@ unsafe fn compact_finalize(
                         (pg_sys::Datum::from(avg.to_bits() as usize), false)
                     }
                     _ => (pg_sys::Datum::from(sum.to_bits() as usize), false),
+                }
+            }
+            CompactAccKind::MinStr | CompactAccKind::MaxStr => {
+                let (off, len) = storage.read_min_max_str(group_idx, slot);
+                if off == u32::MAX {
+                    (pg_sys::Datum::from(0usize), true) // NULL
+                } else {
+                    let s = storage.str_arena.get(off, len);
+                    let datum = string_to_datum(s, spec.col_type_oid);
+                    (datum, false)
                 }
             }
         }
@@ -4936,6 +5152,11 @@ fn process_segments_compact(
                             *count += 1;
                         }
                     }
+                    CompactAccKind::MinStr | CompactAccKind::MaxStr => {
+                        // compact parallel path requires all_needed_cols_numeric,
+                        // so MinStr/MaxStr cannot appear here
+                        unreachable!("MinStr/MaxStr in compact parallel worker")
+                    }
                 }
             }
         }
@@ -5071,6 +5292,29 @@ fn merge_compact_results(
                     let (global_sum, global_count) = global_storage.sum_float_mut(global_group_idx, slot_idx);
                     *global_sum += worker_sum;
                     *global_count += worker_count;
+                },
+                CompactAccKind::MinStr | CompactAccKind::MaxStr => unsafe {
+                    let (w_off, w_len) = worker_storage.read_min_max_str(worker_group_idx, slot_idx);
+                    if w_off != u32::MAX {
+                        let w_str = worker_storage.str_arena.get(w_off, w_len);
+                        let (g_off, g_len) = global_storage.read_min_max_str(global_group_idx, slot_idx);
+                        let should_update = if g_off == u32::MAX {
+                            true
+                        } else {
+                            let g_str = global_storage.str_arena.get(g_off, g_len);
+                            let cmp = collation_strcmp(w_str, g_str);
+                            match kind {
+                                CompactAccKind::MinStr => cmp < 0,
+                                CompactAccKind::MaxStr => cmp > 0,
+                                _ => unreachable!(),
+                            }
+                        };
+                        if should_update {
+                            let w_str = worker_storage.str_arena.get(w_off, w_len);
+                            let (new_off, new_len) = global_storage.str_arena.alloc(w_str);
+                            global_storage.write_min_max_str(global_group_idx, slot_idx, new_off, new_len);
+                        }
+                    }
                 },
             }
         }
@@ -5376,16 +5620,6 @@ fn can_parallel_mixed(
         return false;
     }
 
-    // No MIN/MAX on text (requires collation_strcmp — not thread-safe)
-    for spec in agg_specs {
-        if matches!(spec.agg_type, AggType::Min | AggType::Max) {
-            let t = spec.col_type_oid;
-            if t == pg_sys::TEXTOID || t == pg_sys::VARCHAROID || t == pg_sys::BPCHAROID {
-                return false;
-            }
-        }
-    }
-
     // All non-text needed columns must be numeric (for thread-safe decompression)
     for (i, (&needed, &type_oid)) in needed_cols.iter().zip(col_types.iter()).enumerate() {
         if !needed {
@@ -5394,7 +5628,8 @@ fn can_parallel_mixed(
         if is_numeric_type(type_oid) {
             continue; // numeric — fine
         }
-        // Text column — must be a GROUP BY column or have a supported text qual
+        // Text column — must be a GROUP BY column, have a supported text qual,
+        // or be used in a MIN/MAX aggregation
         let is_text_gb = group_specs.iter().any(|gs| gs.col_idx as usize == i && is_text_group_col(gs));
         let has_text_qual = batch_quals.iter().any(|bq| {
             bq.col_idx == i && (
@@ -5402,7 +5637,12 @@ fn can_parallel_mixed(
                 || (matches!(bq.op, BatchCompareOp::Like | BatchCompareOp::NotLike) && bq.like_strategy.is_some())
             )
         });
-        if !is_text_gb && !has_text_qual {
+        let is_text_minmax_agg = agg_specs.iter().any(|s| {
+            s.col_idx as usize == i
+                && matches!(s.agg_type, AggType::Min | AggType::Max)
+                && (type_oid == pg_sys::TEXTOID || type_oid == pg_sys::VARCHAROID || type_oid == pg_sys::BPCHAROID)
+        });
+        if !is_text_gb && !has_text_qual && !is_text_minmax_agg {
             return false; // unsupported column type
         }
     }
@@ -5714,6 +5954,28 @@ fn process_segments_mixed(
                                 *sum += v;
                             }
                             *count += 1;
+                        }
+                    }
+                    CompactAccKind::MinStr | CompactAccKind::MaxStr => {
+                        let col_idx = spec.col_idx as usize;
+                        if let Some(ref seg_col) = text_seg_cols[col_idx]
+                            && let Some(s) = seg_col.get_str(row) {
+                                let (cur_off, cur_len) = unsafe { compact_storage.read_min_max_str(group_idx, spec_idx) };
+                                let should_update = if cur_off == u32::MAX {
+                                    true // no current value
+                                } else {
+                                    let cur = compact_storage.str_arena.get(cur_off, cur_len);
+                                    let cmp = s.as_bytes().cmp(cur.as_bytes()); // memcmp (thread-safe)
+                                    match kind {
+                                        CompactAccKind::MinStr => cmp == std::cmp::Ordering::Less,
+                                        CompactAccKind::MaxStr => cmp == std::cmp::Ordering::Greater,
+                                        _ => unreachable!(),
+                                    }
+                                };
+                                if should_update {
+                                    let (new_off, new_len) = compact_storage.str_arena.alloc(s);
+                                    unsafe { compact_storage.write_min_max_str(group_idx, spec_idx, new_off, new_len); }
+                                }
                         }
                     }
                 }
