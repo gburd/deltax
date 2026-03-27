@@ -33,6 +33,11 @@ pub(super) fn set_agg_topn_info(limit: i64, sort_col: i32, ascending: bool) {
     AGG_TOPN_INFO.with(|cell| *cell.borrow_mut() = Some((limit, sort_col, ascending)));
 }
 
+/// Clear any stale top-N info (e.g. from a previous query whose DeltaXAgg path was not chosen).
+pub(super) fn clear_agg_topn_info() {
+    AGG_TOPN_INFO.with(|cell| *cell.borrow_mut() = None);
+}
+
 /// Take (consume) the stored top-N info.
 fn take_agg_topn_info() -> Option<(i64, i32, bool)> {
     AGG_TOPN_INFO.with(|cell| cell.borrow_mut().take())

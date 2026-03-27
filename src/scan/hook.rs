@@ -1869,6 +1869,9 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
         };
 
         // === Top-N detection: ORDER BY <agg> [ASC|DESC] LIMIT N ===
+        // Clear any stale topn info from a previous query whose DeltaXAgg path
+        // was not chosen by the planner (leaving the thread-local unconsumed).
+        path::clear_agg_topn_info();
         let mut topn_active = false;
         if has_group_by {
             let mut topn_limit: i64 = 0;
