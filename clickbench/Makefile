@@ -80,7 +80,7 @@ deploy:
 		$(CURDIR)/ $(EC2_USER)@$(EC2):~/clickbench/
 	@echo "=== Compiling extension (release) ==="
 	@START=$$(date +%s); \
-	$(EC2_SSH) 'cd ~/pg_deltax && sudo env "PATH=$$PATH" "RUSTUP_HOME=$${RUSTUP_HOME:-$$HOME/.rustup}" "CARGO_HOME=$${CARGO_HOME:-$$HOME/.cargo}" "PGRX_HOME=$$HOME/.pgrx" cargo pgrx install --pg-config $(EC2_PG_CONFIG) --release' && \
+	$(EC2_SSH) 'cd ~/pg_deltax && sudo env "PATH=$$HOME/.cargo/bin:$$PATH" "RUSTUP_HOME=$${RUSTUP_HOME:-$$HOME/.rustup}" "CARGO_HOME=$${CARGO_HOME:-$$HOME/.cargo}" "PGRX_HOME=$$HOME/.pgrx" cargo pgrx install --pg-config $(EC2_PG_CONFIG) --release' && \
 	END=$$(date +%s) && \
 	echo "=== Compilation took $$((END - START))s ==="
 	@echo "=== Restarting PostgreSQL ==="

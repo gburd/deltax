@@ -1736,7 +1736,11 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                 // 2. The text column has very high global ndistinct (> 100K)
                 // For small filtered sets on high-cardinality columns, PG's native
                 // HashAgg on emitted rows beats AggScan's text decompression overhead.
-                if has_text_group && has_where {
+                // However, when parallel workers are available, the parallel mixed
+                // aggregation path handles high-cardinality text efficiently, so we
+                // only bail when single-threaded.
+                let n_workers = crate::get_parallel_workers();
+                if has_text_group && has_where && n_workers <= 1 {
                     let estimated_rows = (*input_rel).rows;
                     let few_rows = estimated_rows < total_uncompressed_rows as f64 * 0.05;
                     let has_high_card_text = group_specs.iter().any(|gs| {
