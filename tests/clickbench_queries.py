@@ -3,6 +3,8 @@
 Queries taken verbatim from the ClickBench postgresql/queries.sql reference.
 Each entry: (query_id, short_description, sql_text).
 
+Query IDs are 0-indexed (Q0..Q42) to match the ClickBench reporting convention.
+
 Note: EventDate references are kept as-is (DATE type in schema).
 EventTime is TIMESTAMPTZ in our schema; queries referencing it work unchanged.
 """
@@ -11,242 +13,242 @@ EventTime is TIMESTAMPTZ in our schema; queries referencing it work unchanged.
 # with LIMIT/OFFSET, or no ORDER BY at all.  Content comparison between
 # compressed and uncompressed scans is not meaningful for these.
 NONDETERMINISTIC_QUERIES = {
-    "Q18",  # GROUP BY + LIMIT, no ORDER BY
-    "Q25",  # ORDER BY EventTime LIMIT — timestamp ties (single sort key not in SELECT)
-    "Q27",  # ORDER BY EventTime, SearchPhrase LIMIT — primary sort key not in SELECT
+    "Q17",  # GROUP BY + LIMIT, no ORDER BY
+    "Q24",  # ORDER BY EventTime LIMIT — timestamp ties (single sort key not in SELECT)
+    "Q26",  # ORDER BY EventTime, SearchPhrase LIMIT — primary sort key not in SELECT
 }
 
 # Validation hints for non-deterministic queries.
-# Maps qid → (sort_key_col_index, "ASC"|"DESC", has_offset).
+# Maps qid -> (sort_key_col_index, "ASC"|"DESC", has_offset).
 # None means no ORDER BY (only row count can be validated).
 NONDET_SORT_INFO = {
-    "Q18": None,                 # no ORDER BY
-    "Q25": None,                 # ORDER BY EventTime, but not in SELECT list
-    "Q27": None,                 # ORDER BY EventTime, SearchPhrase — not all sort cols in SELECT
+    "Q17": None,                 # no ORDER BY
+    "Q24": None,                 # ORDER BY EventTime, but not in SELECT list
+    "Q26": None,                 # ORDER BY EventTime, SearchPhrase — not all sort cols in SELECT
 }
 
 # Queries where ORDER BY ... LIMIT can have ties at the boundary.
-# Maps qid → 0-based column index of the sort key.
+# Maps qid -> 0-based column index of the sort key.
 # Validation: strip rows sharing the last-row's sort key, then exact-match the rest.
 # For OFFSET queries, ties at both ends of the window are stripped.
 LIMIT_TIE_QUERIES = {
-    "Q10": 2,  # COUNT(*) AS c
-    "Q12": 2,  # COUNT(DISTINCT UserID) AS u
-    "Q19": 3,  # COUNT(*)
-    "Q23": 3,  # COUNT(*) AS c
-    "Q24": 4,  # EventTime (col 4 in SELECT *)
+    "Q9": 2,   # COUNT(*) AS c
+    "Q11": 2,  # COUNT(DISTINCT UserID) AS u
+    "Q18": 3,  # COUNT(*)
+    "Q22": 3,  # COUNT(*) AS c
+    "Q23": 4,  # EventTime (col 4 in SELECT *)
+    "Q30": 2,  # COUNT(*) AS c
     "Q31": 2,  # COUNT(*) AS c
     "Q32": 2,  # COUNT(*) AS c
-    "Q33": 2,  # COUNT(*) AS c
-    "Q39": 1,  # PageViews (OFFSET 1000)
-    "Q40": 5,  # PageViews (OFFSET 1000)
-    "Q41": 2,  # PageViews (OFFSET 100)
+    "Q38": 1,  # PageViews (OFFSET 1000)
+    "Q39": 5,  # PageViews (OFFSET 1000)
+    "Q40": 2,  # PageViews (OFFSET 100)
 }
 
 QUERIES = [
-    # Q1: COUNT(*) — full scan baseline
+    # Q0: COUNT(*) — full scan baseline
     (
-        "Q1",
+        "Q0",
         "COUNT(*)",
         "SELECT COUNT(*) FROM hits",
     ),
-    # Q2: Filtered count
+    # Q1: Filtered count
     (
-        "Q2",
+        "Q1",
         "COUNT WHERE AdvEngineID",
         "SELECT COUNT(*) FROM hits WHERE AdvEngineID <> 0",
     ),
-    # Q3: SUM/AVG aggregation — full scan
+    # Q2: SUM/AVG aggregation — full scan
     (
-        "Q3",
+        "Q2",
         "SUM/AVG full scan",
         "SELECT SUM(AdvEngineID), COUNT(*), AVG(ResolutionWidth) FROM hits",
     ),
-    # Q4: AVG UserID
+    # Q3: AVG UserID
     (
-        "Q4",
+        "Q3",
         "AVG UserID",
         "SELECT AVG(UserID) FROM hits",
     ),
-    # Q5: COUNT DISTINCT UserID
+    # Q4: COUNT DISTINCT UserID
     (
-        "Q5",
+        "Q4",
         "COUNT DISTINCT UserID",
         "SELECT COUNT(DISTINCT UserID) FROM hits",
     ),
-    # Q6: COUNT DISTINCT SearchPhrase
+    # Q5: COUNT DISTINCT SearchPhrase
     (
-        "Q6",
+        "Q5",
         "COUNT DISTINCT SearchPhrase",
         "SELECT COUNT(DISTINCT SearchPhrase) FROM hits",
     ),
-    # Q7: MIN/MAX EventDate
+    # Q6: MIN/MAX EventDate
     (
-        "Q7",
+        "Q6",
         "MIN/MAX EventDate",
         "SELECT MIN(EventDate), MAX(EventDate) FROM hits",
     ),
-    # Q8: GROUP BY AdvEngineID
+    # Q7: GROUP BY AdvEngineID
     (
-        "Q8",
+        "Q7",
         "GROUP BY AdvEngineID",
         "SELECT AdvEngineID, COUNT(*) FROM hits WHERE AdvEngineID <> 0 "
         "GROUP BY AdvEngineID ORDER BY COUNT(*) DESC",
     ),
-    # Q9: GROUP BY RegionID with DISTINCT
+    # Q8: GROUP BY RegionID with DISTINCT
     (
-        "Q9",
+        "Q8",
         "GROUP BY RegionID",
         "SELECT RegionID, COUNT(DISTINCT UserID) AS u FROM hits "
         "GROUP BY RegionID ORDER BY u DESC LIMIT 10",
     ),
-    # Q10: GROUP BY RegionID multi-agg
+    # Q9: GROUP BY RegionID multi-agg
     (
-        "Q10",
+        "Q9",
         "RegionID multi-agg",
         "SELECT RegionID, SUM(AdvEngineID), COUNT(*) AS c, AVG(ResolutionWidth), "
         "COUNT(DISTINCT UserID) FROM hits GROUP BY RegionID ORDER BY c DESC LIMIT 10",
     ),
-    # Q11: MobilePhoneModel distinct users
+    # Q10: MobilePhoneModel distinct users
     (
-        "Q11",
+        "Q10",
         "MobilePhoneModel users",
         "SELECT MobilePhoneModel, COUNT(DISTINCT UserID) AS u FROM hits "
         "WHERE MobilePhoneModel <> '' GROUP BY MobilePhoneModel ORDER BY u DESC LIMIT 10",
     ),
-    # Q12: MobilePhone + Model distinct users
+    # Q11: MobilePhone + Model distinct users
     (
-        "Q12",
+        "Q11",
         "MobilePhone+Model users",
         "SELECT MobilePhone, MobilePhoneModel, COUNT(DISTINCT UserID) AS u FROM hits "
         "WHERE MobilePhoneModel <> '' GROUP BY MobilePhone, MobilePhoneModel "
         "ORDER BY u DESC LIMIT 10",
     ),
-    # Q13: Top SearchPhrase
+    # Q12: Top SearchPhrase
     (
-        "Q13",
+        "Q12",
         "Top SearchPhrase",
         "SELECT SearchPhrase, COUNT(*) AS c FROM hits "
         "WHERE SearchPhrase <> '' GROUP BY SearchPhrase ORDER BY c DESC LIMIT 10",
     ),
-    # Q14: SearchPhrase distinct users
+    # Q13: SearchPhrase distinct users
     (
-        "Q14",
+        "Q13",
         "SearchPhrase users",
         "SELECT SearchPhrase, COUNT(DISTINCT UserID) AS u FROM hits "
         "WHERE SearchPhrase <> '' GROUP BY SearchPhrase ORDER BY u DESC LIMIT 10",
     ),
-    # Q15: SearchEngineID + SearchPhrase
+    # Q14: SearchEngineID + SearchPhrase
     (
-        "Q15",
+        "Q14",
         "SearchEngine+Phrase",
         "SELECT SearchEngineID, SearchPhrase, COUNT(*) AS c FROM hits "
         "WHERE SearchPhrase <> '' GROUP BY SearchEngineID, SearchPhrase "
         "ORDER BY c DESC LIMIT 10",
     ),
-    # Q16: Top UserID
+    # Q15: Top UserID
     (
-        "Q16",
+        "Q15",
         "Top UserID",
         "SELECT UserID, COUNT(*) FROM hits GROUP BY UserID ORDER BY COUNT(*) DESC LIMIT 10",
     ),
-    # Q17: UserID + SearchPhrase ordered
+    # Q16: UserID + SearchPhrase ordered
     (
-        "Q17",
+        "Q16",
         "UserID+SearchPhrase top",
         "SELECT UserID, SearchPhrase, COUNT(*) FROM hits "
         "GROUP BY UserID, SearchPhrase ORDER BY COUNT(*) DESC LIMIT 10",
     ),
-    # Q18: UserID + SearchPhrase unordered
+    # Q17: UserID + SearchPhrase unordered
     (
-        "Q18",
+        "Q17",
         "UserID+SearchPhrase",
         "SELECT UserID, SearchPhrase, COUNT(*) FROM hits "
         "GROUP BY UserID, SearchPhrase LIMIT 10",
     ),
-    # Q19: UserID + minute + SearchPhrase
+    # Q18: UserID + minute + SearchPhrase
     (
-        "Q19",
+        "Q18",
         "UserID+minute+Phrase",
         "SELECT UserID, extract(minute FROM EventTime) AS m, SearchPhrase, COUNT(*) "
         "FROM hits GROUP BY UserID, m, SearchPhrase ORDER BY COUNT(*) DESC LIMIT 10",
     ),
-    # Q20: Point lookup by UserID
+    # Q19: Point lookup by UserID
     (
-        "Q20",
+        "Q19",
         "Point lookup UserID",
         "SELECT UserID FROM hits WHERE UserID = 435090932899640449",
     ),
-    # Q21: URL LIKE google
+    # Q20: URL LIKE google
     (
-        "Q21",
+        "Q20",
         "URL LIKE google",
         "SELECT COUNT(*) FROM hits WHERE URL LIKE '%google%'",
     ),
-    # Q22: SearchPhrase + URL LIKE google
+    # Q21: SearchPhrase + URL LIKE google
     (
-        "Q22",
+        "Q21",
         "SearchPhrase+URL google",
         "SELECT SearchPhrase, MIN(URL), COUNT(*) AS c FROM hits "
         "WHERE URL LIKE '%google%' AND SearchPhrase <> '' "
         "GROUP BY SearchPhrase ORDER BY c DESC LIMIT 10",
     ),
-    # Q23: Title LIKE Google complex
+    # Q22: Title LIKE Google complex
     (
-        "Q23",
+        "Q22",
         "Title LIKE Google",
         "SELECT SearchPhrase, MIN(URL), MIN(Title), COUNT(*) AS c, "
         "COUNT(DISTINCT UserID) FROM hits "
         "WHERE Title LIKE '%Google%' AND URL NOT LIKE '%.google.%' "
         "AND SearchPhrase <> '' GROUP BY SearchPhrase ORDER BY c DESC LIMIT 10",
     ),
-    # Q24: SELECT * URL LIKE google ORDER BY EventTime
+    # Q23: SELECT * URL LIKE google ORDER BY EventTime
     (
-        "Q24",
+        "Q23",
         "SELECT * google sorted",
         "SELECT * FROM hits WHERE URL LIKE '%google%' ORDER BY EventTime LIMIT 10",
     ),
-    # Q25: SearchPhrase ORDER BY EventTime
+    # Q24: SearchPhrase ORDER BY EventTime
     (
-        "Q25",
+        "Q24",
         "SearchPhrase by time",
         "SELECT SearchPhrase FROM hits WHERE SearchPhrase <> '' "
         "ORDER BY EventTime LIMIT 10",
     ),
-    # Q26: SearchPhrase ORDER BY SearchPhrase
+    # Q25: SearchPhrase ORDER BY SearchPhrase
     (
-        "Q26",
+        "Q25",
         "SearchPhrase sorted",
         "SELECT SearchPhrase FROM hits WHERE SearchPhrase <> '' "
         "ORDER BY SearchPhrase LIMIT 10",
     ),
-    # Q27: SearchPhrase ORDER BY EventTime, SearchPhrase
+    # Q26: SearchPhrase ORDER BY EventTime, SearchPhrase
     (
-        "Q27",
+        "Q26",
         "SearchPhrase time+phrase",
         "SELECT SearchPhrase FROM hits WHERE SearchPhrase <> '' "
         "ORDER BY EventTime, SearchPhrase LIMIT 10",
     ),
-    # Q28: CounterID avg URL length
+    # Q27: CounterID avg URL length
     (
-        "Q28",
+        "Q27",
         "CounterID avg URL len",
         "SELECT CounterID, AVG(length(URL)) AS l, COUNT(*) AS c FROM hits "
         "WHERE URL <> '' GROUP BY CounterID HAVING COUNT(*) > 100000 "
         "ORDER BY l DESC LIMIT 25",
     ),
-    # Q29: Referer domain extraction
+    # Q28: Referer domain extraction
     (
-        "Q29",
+        "Q28",
         "Referer domain regex",
         r"SELECT REGEXP_REPLACE(Referer, '^https?://(?:www\.)?([^/]+)/.*$', '\1') AS k, "
         "AVG(length(Referer)) AS l, COUNT(*) AS c, MIN(Referer) FROM hits "
         "WHERE Referer <> '' GROUP BY k HAVING COUNT(*) > 100000 "
         "ORDER BY l DESC LIMIT 25",
     ),
-    # Q30: Wide SUM aggregation (89 columns)
+    # Q29: Wide SUM aggregation (89 columns)
     (
-        "Q30",
+        "Q29",
         "Wide SUM 89 cols",
         "SELECT SUM(ResolutionWidth), SUM(ResolutionWidth + 1), SUM(ResolutionWidth + 2), "
         "SUM(ResolutionWidth + 3), SUM(ResolutionWidth + 4), SUM(ResolutionWidth + 5), "
@@ -280,81 +282,81 @@ QUERIES = [
         "SUM(ResolutionWidth + 87), SUM(ResolutionWidth + 88), SUM(ResolutionWidth + 89) "
         "FROM hits",
     ),
-    # Q31: SearchEngineID + ClientIP aggregation
+    # Q30: SearchEngineID + ClientIP aggregation
     (
-        "Q31",
+        "Q30",
         "SearchEngine+ClientIP",
         "SELECT SearchEngineID, ClientIP, COUNT(*) AS c, SUM(IsRefresh), "
         "AVG(ResolutionWidth) FROM hits WHERE SearchPhrase <> '' "
         "GROUP BY SearchEngineID, ClientIP ORDER BY c DESC LIMIT 10",
     ),
-    # Q32: WatchID + ClientIP (SearchPhrase filter)
+    # Q31: WatchID + ClientIP (SearchPhrase filter)
     (
-        "Q32",
+        "Q31",
         "WatchID+ClientIP filter",
         "SELECT WatchID, ClientIP, COUNT(*) AS c, SUM(IsRefresh), "
         "AVG(ResolutionWidth) FROM hits WHERE SearchPhrase <> '' "
         "GROUP BY WatchID, ClientIP ORDER BY c DESC LIMIT 10",
     ),
-    # Q33: WatchID + ClientIP (no filter)
+    # Q32: WatchID + ClientIP (no filter)
     (
-        "Q33",
+        "Q32",
         "WatchID+ClientIP all",
         "SELECT WatchID, ClientIP, COUNT(*) AS c, SUM(IsRefresh), "
         "AVG(ResolutionWidth) FROM hits "
         "GROUP BY WatchID, ClientIP ORDER BY c DESC LIMIT 10",
     ),
-    # Q34: Top URLs
+    # Q33: Top URLs
     (
-        "Q34",
+        "Q33",
         "Top URLs",
         "SELECT URL, COUNT(*) AS c FROM hits GROUP BY URL ORDER BY c DESC LIMIT 10",
     ),
-    # Q35: Top URLs with constant
+    # Q34: Top URLs with constant
     (
-        "Q35",
+        "Q34",
         "Top URLs with const",
         "SELECT 1, URL, COUNT(*) AS c FROM hits "
         "GROUP BY 1, URL ORDER BY c DESC LIMIT 10",
     ),
-    # Q36: ClientIP arithmetic GROUP BY
+    # Q35: ClientIP arithmetic GROUP BY
     (
-        "Q36",
+        "Q35",
         "ClientIP arithmetic",
         "SELECT ClientIP, ClientIP - 1, ClientIP - 2, ClientIP - 3, COUNT(*) AS c "
         "FROM hits GROUP BY ClientIP, ClientIP - 1, ClientIP - 2, ClientIP - 3 "
         "ORDER BY c DESC LIMIT 10",
     ),
-    # Q37: CounterID=62 URLs
+    # Q36: CounterID=62 URLs
     (
-        "Q37",
+        "Q36",
         "CounterID=62 URLs",
         "SELECT URL, COUNT(*) AS PageViews FROM hits "
         "WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' "
         "AND DontCountHits = 0 AND IsRefresh = 0 AND URL <> '' "
         "GROUP BY URL ORDER BY PageViews DESC LIMIT 10",
     ),
-    # Q38: CounterID=62 Titles
+    # Q37: CounterID=62 Titles
     (
-        "Q38",
+        "Q37",
         "CounterID=62 Titles",
         "SELECT Title, COUNT(*) AS PageViews FROM hits "
         "WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' "
         "AND DontCountHits = 0 AND IsRefresh = 0 AND Title <> '' "
         "GROUP BY Title ORDER BY PageViews DESC LIMIT 10",
     ),
-    # Q39: CounterID=62 URLs with link filter
+    # Q38: CounterID=62 URLs with link filter
     (
-        "Q39",
+        "Q38",
         "CounterID=62 links",
         "SELECT URL, COUNT(*) AS PageViews FROM hits "
         "WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' "
         "AND IsRefresh = 0 AND IsLink <> 0 AND IsDownload = 0 "
         "GROUP BY URL ORDER BY PageViews DESC LIMIT 10 OFFSET 1000",
     ),
-    # Q40: CounterID=62 traffic sources
+    # Q39: CounterID=62 traffic sources
     (
-        "Q40",
+        "Q39",
         "CounterID=62 traffic src",
         "SELECT TraficSourceID, SearchEngineID, AdvEngineID, "
         "CASE WHEN (SearchEngineID = 0 AND AdvEngineID = 0) THEN Referer ELSE '' END AS Src, "
@@ -364,9 +366,9 @@ QUERIES = [
         "GROUP BY TraficSourceID, SearchEngineID, AdvEngineID, Src, Dst "
         "ORDER BY PageViews DESC LIMIT 10 OFFSET 1000",
     ),
-    # Q41: CounterID=62 URLHash + EventDate
+    # Q40: CounterID=62 URLHash + EventDate
     (
-        "Q41",
+        "Q40",
         "CounterID=62 URLHash",
         "SELECT URLHash, EventDate, COUNT(*) AS PageViews FROM hits "
         "WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' "
@@ -374,9 +376,9 @@ QUERIES = [
         "AND RefererHash = 3594120000172545465 "
         "GROUP BY URLHash, EventDate ORDER BY PageViews DESC LIMIT 10 OFFSET 100",
     ),
-    # Q42: CounterID=62 WindowClient dimensions
+    # Q41: CounterID=62 WindowClient dimensions
     (
-        "Q42",
+        "Q41",
         "CounterID=62 window dim",
         "SELECT WindowClientWidth, WindowClientHeight, COUNT(*) AS PageViews FROM hits "
         "WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' "
@@ -385,9 +387,9 @@ QUERIES = [
         "GROUP BY WindowClientWidth, WindowClientHeight "
         "ORDER BY PageViews DESC LIMIT 10 OFFSET 10000",
     ),
-    # Q43: CounterID=62 by minute
+    # Q42: CounterID=62 by minute
     (
-        "Q43",
+        "Q42",
         "CounterID=62 by minute",
         "SELECT DATE_TRUNC('minute', EventTime) AS M, COUNT(*) AS PageViews FROM hits "
         "WHERE CounterID = 62 AND EventDate >= '2013-07-14' AND EventDate <= '2013-07-15' "
