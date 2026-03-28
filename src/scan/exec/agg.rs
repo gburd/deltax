@@ -1124,6 +1124,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
         // Compact keys: pack integer GROUP BY keys into u128
         let use_compact_keys = has_group_by && can_use_compact_keys(&group_specs);
         let mut compact_group_map: CompactGroupMap = CompactGroupMap::with_hasher(BuildHasherDefault::default());
+        let mut cd_sidecar = CountDistinctSideCar::new(&agg_specs);
 
         // Check if any GROUP BY uses RegexpReplace — set up cross-segment caches
         let has_regexp_group = group_specs.iter().any(|gs| matches!(gs.expr, GroupByExpr::RegexpReplace { .. }));
@@ -1243,7 +1244,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                 topn_spec,
             };
 
-            let chunk_size = (all_segments.len() + n_workers - 1) / n_workers;
+            let chunk_size = all_segments.len().div_ceil(n_workers);
             let partial_results: Vec<ParallelCompactResult> = std::thread::scope(|s| {
                 let handles: Vec<_> = all_segments.chunks(chunk_size).map(|chunk| {
                     let cfg = &config;
@@ -1269,11 +1270,18 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
             // each worker (computed while data was cache-hot), merge only
             // those, and verify no missed key could beat the Nth result.
             // ----------------------------------------------------------
-            if topn_limit > 0 && having_filters.is_empty() {
-                let sort_slot = match output_map[topn_sort_col] {
-                    OutputEntry::Agg(ai) => ai,
-                    _ => unreachable!(),
-                };
+            let sort_slot_for_compact_spec = match output_map[topn_sort_col] {
+                OutputEntry::Agg(ai) => ai,
+                _ => 0,
+            };
+            let compact_sort_is_cd = topn_limit > 0 && matches!(
+                compact_storage.as_ref().unwrap().layout.slots[sort_slot_for_compact_spec].1,
+                CompactAccKind::CountDistinctInt | CompactAccKind::CountDistinctStr
+            );
+            let has_any_cd_agg = compact_storage.as_ref().unwrap().layout.slots.iter()
+                .any(|(_, k)| matches!(k, CompactAccKind::CountDistinctInt | CompactAccKind::CountDistinctStr));
+            if topn_limit > 0 && having_filters.is_empty() && !compact_sort_is_cd {
+                let sort_slot = sort_slot_for_compact_spec;
                 let (_, sort_kind) = compact_storage.as_ref().unwrap().layout.slots[sort_slot];
                 let limit = topn_limit as usize;
                 let k = (topn_limit as usize).max(1000);
@@ -1343,9 +1351,11 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                     let storage = compact_storage.as_mut().unwrap();
                     let num_group_keys = group_specs.len();
                     let mut result_rows = Vec::with_capacity(merged.len());
+                    let mut spec_cd_sidecar = CountDistinctSideCar::new(&agg_specs);
 
                     for &(_, packed_key) in &merged {
                         let global_idx = storage.alloc_group();
+                        spec_cd_sidecar.alloc_group();
 
                         // Targeted merge: only this key's accumulators across workers
                         for result in &partial_results {
@@ -1398,9 +1408,22 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                                 }
                                             }
                                         }
+                                        CompactAccKind::CountDistinctInt | CompactAccKind::CountDistinctStr => {
+                                            spec_cd_sidecar.union_from(slot_idx, global_idx, &result.cd_sidecar, worker_idx);
+                                        }
                                     }
                                 }
                             }
+                        }
+
+                        // Write CountDistinct counts for this group
+                        for e in &spec_cd_sidecar.entries {
+                            let count = if e.is_str {
+                                e.sets_str[global_idx as usize].len() as i64
+                            } else {
+                                e.sets_int[global_idx as usize].len() as i64
+                            };
+                            *storage.count_mut(global_idx, e.spec_idx) = count;
                         }
 
                         // Finalize this group
@@ -1497,9 +1520,11 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                 let pre_topn_groups: usize = partial_results.iter()
                     .map(|r| r.compact_map.len()).sum();
 
+                let mut bare_cd_sidecar = CountDistinctSideCar::new(&agg_specs);
                 let mut result_rows = Vec::with_capacity(n);
                 for &packed_key in &target_keys {
                     let global_idx = storage.alloc_group();
+                    bare_cd_sidecar.alloc_group();
 
                     // Targeted merge: only this key's accumulators across workers
                     for result in &partial_results {
@@ -1552,9 +1577,22 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                             }
                                         }
                                     }
+                                    CompactAccKind::CountDistinctInt | CompactAccKind::CountDistinctStr => {
+                                        bare_cd_sidecar.union_from(slot_idx, global_idx, &result.cd_sidecar, worker_idx);
+                                    }
                                 }
                             }
                         }
+                    }
+
+                    // Write CountDistinct counts for this group
+                    for e in &bare_cd_sidecar.entries {
+                        let count = if e.is_str {
+                            e.sets_str[global_idx as usize].len() as i64
+                        } else {
+                            e.sets_int[global_idx as usize].len() as i64
+                        };
+                        *storage.count_mut(global_idx, e.spec_idx) = count;
                     }
 
                     // Finalize this group
@@ -1620,7 +1658,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
             // across threads, each merges its slice and finds local
             // top-N, then merge the local results.
             // ----------------------------------------------------------
-            if topn_limit > 0 && having_filters.is_empty() {
+            if topn_limit > 0 && having_filters.is_empty() && !compact_sort_is_cd && !has_any_cd_agg {
                 let t_merge = Instant::now();
                 let limit = topn_limit as usize;
                 let sort_slot = match output_map[topn_sort_col] {
@@ -1634,6 +1672,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
 
                 // Each partition thread: merge its slice, find local top-N,
                 // copy winners to mini storage, drop the rest.
+                #[allow(clippy::type_complexity)]
                 let partition_results: Vec<(CompactAccStorage, Vec<(i64, u128, u32)>)> =
                     std::thread::scope(|s| {
                     let workers = &partial_results;
@@ -1708,6 +1747,10 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                                         storage.write_min_max_str(gidx, slot_idx, new_off, new_len);
                                                     }
                                                 }
+                                            }
+                                            CompactAccKind::CountDistinctInt | CompactAccKind::CountDistinctStr => {
+                                                // Partitioned merge is skipped when has_any_cd_agg
+                                                unreachable!("CountDistinct in partitioned merge")
                                             }
                                         }
                                     }
@@ -1879,6 +1922,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
             let largest = partial_results.swap_remove(largest_idx);
             compact_group_map = largest.compact_map;
             *compact_storage.as_mut().unwrap() = largest.compact_storage;
+            let mut global_cd_sidecar = largest.cd_sidecar;
 
             // Pre-reserve for remaining entries
             let remaining_entries: usize = partial_results.iter()
@@ -1891,11 +1935,15 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                 merge_compact_results(
                     &mut compact_group_map,
                     storage,
+                    &mut global_cd_sidecar,
                     &result.compact_map,
                     &result.compact_storage,
+                    &result.cd_sidecar,
                     &agg_specs,
                 );
             }
+            // Write merged CD counts back to storage
+            global_cd_sidecar.write_counts_to_storage(storage, &compact_group_map);
             let merge_us = t_merge.elapsed().as_micros() as u64;
 
             // Finalize
@@ -2013,15 +2061,14 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                 .filter(|gs| matches!(gs.expr, GroupByExpr::RegexpReplace { .. }))
                 .count();
             for gs in group_specs.iter() {
-                if let GroupByExpr::RegexpReplace { ref pattern, ref replacement, .. } = gs.expr {
-                    if let Some(compiled) = try_compile_rust_regex(pattern) {
-                        let rust_replacement = convert_pg_replacement(replacement);
-                        rust_regex_infos.push(RustRegexInfo {
-                            regex: compiled,
-                            replacement: rust_replacement,
-                            col_idx: gs.col_idx as usize,
-                        });
-                    }
+                if let GroupByExpr::RegexpReplace { ref pattern, ref replacement, .. } = gs.expr
+                    && let Some(compiled) = try_compile_rust_regex(pattern) {
+                    let rust_replacement = convert_pg_replacement(replacement);
+                    rust_regex_infos.push(RustRegexInfo {
+                        regex: compiled,
+                        replacement: rust_replacement,
+                        col_idx: gs.col_idx as usize,
+                    });
                 }
             }
             if rust_regex_infos.len() != regexp_count {
@@ -2125,11 +2172,18 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
             // ----------------------------------------------------------
             // Speculative top-N: merge-skip using pre-computed top-K
             // ----------------------------------------------------------
-            if topn_limit > 0 && having_filters.is_empty() {
-                let sort_slot = match output_map[topn_sort_col] {
-                    OutputEntry::Agg(ai) => ai,
-                    _ => unreachable!(),
-                };
+            // CountDistinct sort values can't be summed across workers for speculative
+            // top-N (worker counts overestimate merged count due to set overlap).
+            let sort_slot_for_spec = match output_map[topn_sort_col] {
+                OutputEntry::Agg(ai) => ai,
+                _ => 0,
+            };
+            let sort_is_cd = topn_limit > 0 && matches!(
+                compact_storage.as_ref().unwrap().layout.slots[sort_slot_for_spec].1,
+                CompactAccKind::CountDistinctInt | CompactAccKind::CountDistinctStr
+            );
+            if topn_limit > 0 && having_filters.is_empty() && !sort_is_cd {
+                let sort_slot = sort_slot_for_spec;
                 let (_, sort_kind) = compact_storage.as_ref().unwrap().layout.slots[sort_slot];
                 let limit = topn_limit as usize;
                 let k = (topn_limit as usize).max(1000);
@@ -2198,10 +2252,12 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                     let t_fin = Instant::now();
                     let storage = compact_storage.as_mut().unwrap();
                     let mut result_rows = Vec::with_capacity(merged.len());
+                    let mut spec_cd_sidecar = CountDistinctSideCar::new(&agg_specs);
 
                     // Find which worker has each winning key for MixedKeyStorage lookup
                     for &(_, hash_key) in &merged {
                         let global_idx = storage.alloc_group();
+                        spec_cd_sidecar.alloc_group();
 
                         // Targeted merge: only this key's accumulators across workers
                         let mut key_source_worker: Option<usize> = None;
@@ -2258,9 +2314,22 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                                 }
                                             }
                                         }
+                                        CompactAccKind::CountDistinctInt | CompactAccKind::CountDistinctStr => {
+                                            spec_cd_sidecar.union_from(slot_idx, global_idx, &result.cd_sidecar, worker_idx);
+                                        }
                                     }
                                 }
                             }
+                        }
+
+                        // Write CountDistinct counts for this group
+                        for e in &spec_cd_sidecar.entries {
+                            let count = if e.is_str {
+                                e.sets_str[global_idx as usize].len() as i64
+                            } else {
+                                e.sets_int[global_idx as usize].len() as i64
+                            };
+                            *storage.count_mut(global_idx, e.spec_idx) = count;
                         }
 
                         // Finalize this group
@@ -2372,9 +2441,11 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                 };
                 let mut final_storage = CompactAccStorage::new(layout);
                 let mut final_mixed_keys = MixedKeyStorage::new(group_specs.len());
+                let mut final_cd_sidecar = CountDistinctSideCar::new(&agg_specs);
 
                 for &key in &target_keys {
                     let group_idx = final_storage.alloc_group();
+                    final_cd_sidecar.alloc_group();
 
                     // Copy key values from the largest worker
                     let src = &partial_results[largest_idx];
@@ -2443,11 +2514,30 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                             }
                                         }
                                     }
+                                    CompactAccKind::CountDistinctInt | CompactAccKind::CountDistinctStr => {
+                                        final_cd_sidecar.union_from(slot_idx, group_idx, &result.cd_sidecar, worker_gidx);
+                                    }
                                 }
                             }
                         }
                     }
                 }
+
+                // Write CountDistinct counts to storage
+                if !final_cd_sidecar.is_empty() {
+                    for i in 0..target_keys.len() {
+                        let group_idx = i as u32;
+                        for e in &final_cd_sidecar.entries {
+                            let count = if e.is_str {
+                                e.sets_str[group_idx as usize].len() as i64
+                            } else {
+                                e.sets_int[group_idx as usize].len() as i64
+                            };
+                            *final_storage.count_mut(group_idx, e.spec_idx) = count;
+                        }
+                    }
+                }
+
                 let merge_us = t_merge.elapsed().as_micros() as u64;
 
                 // Finalize just N groups
@@ -2539,6 +2629,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
             compact_group_map = largest.compact_map;
             *compact_storage.as_mut().unwrap() = largest.compact_storage;
             let mut merged_mixed_keys = largest.mixed_keys;
+            let mut merged_cd_sidecar = largest.cd_sidecar;
 
             let remaining_entries: usize = partial_results.iter()
                 .map(|r| r.compact_map.len()).sum();
@@ -2551,6 +2642,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                         hashbrown::hash_map::Entry::Occupied(e) => *e.get(),
                         hashbrown::hash_map::Entry::Vacant(e) => {
                             let idx = storage.alloc_group();
+                            merged_cd_sidecar.alloc_group();
                             e.insert(idx);
                             // Copy key values from this worker's MixedKeyStorage
                             let src_keys = &result.mixed_keys;
@@ -2621,9 +2713,16 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                     }
                                 }
                             }
+                            CompactAccKind::CountDistinctInt | CompactAccKind::CountDistinctStr => {
+                                merged_cd_sidecar.union_from(slot_idx, global_group_idx, &result.cd_sidecar, worker_group_idx);
+                            }
                         }
                     }
                 }
+            }
+            // Write final CountDistinct counts into compact storage
+            if !merged_cd_sidecar.is_empty() {
+                merged_cd_sidecar.write_counts_to_storage(storage, &compact_group_map);
             }
             let merge_us = t_merge.elapsed().as_micros() as u64;
 
@@ -3180,7 +3279,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                             let strat = bq.like_strategy.as_ref().unwrap();
                             let neg = bq.op == BatchCompareOp::NotLike;
                             let (datums, like_sel) =
-                                decompress_text_blob_with_like_filter(blob, type_oid, typmod, strat, neg);
+                                decompress_text_blob_with_like_filter(blob, type_oid, typmod, strat, neg, None);
                             decompressed.push(datums);
                             if pre_selection.is_empty() {
                                 pre_selection = like_sel;
@@ -3193,7 +3292,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                             let const_str = bq.text_const.as_ref().unwrap();
                             let is_ne = bq.op == BatchCompareOp::Ne;
                             let (datums, eq_sel) = decompress_text_blob_with_eq_filter(
-                                blob, type_oid, typmod, const_str, is_ne,
+                                blob, type_oid, typmod, const_str, is_ne, None,
                             );
                             decompressed.push(datums);
                             if pre_selection.is_empty() {
@@ -3454,6 +3553,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                         hashbrown::hash_map::Entry::Occupied(e) => *e.get(),
                         hashbrown::hash_map::Entry::Vacant(e) => {
                             let idx = storage.alloc_group();
+                            cd_sidecar.alloc_group();
                             e.insert(idx);
                             idx
                         }
@@ -3536,6 +3636,19 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                             let (new_off, new_len) = storage.str_arena.alloc(s);
                                             storage.write_min_max_str(group_idx, spec_idx, new_off, new_len);
                                         }
+                                }
+                            }
+                            CompactAccKind::CountDistinctInt => {
+                                let col = &decompressed[spec.col_idx as usize];
+                                if !col.is_empty() && !col[row].1 {
+                                    cd_sidecar.insert_int(spec_idx, group_idx, col[row].0.value() as i64);
+                                }
+                            }
+                            CompactAccKind::CountDistinctStr => {
+                                let col_idx = spec.col_idx as usize;
+                                if let Some(ref rs) = raw_strings[col_idx]
+                                    && let Some(ref s) = rs[row] {
+                                    cd_sidecar.insert_str(spec_idx, group_idx, hash128_str(s.as_bytes()));
                                 }
                             }
                         }
@@ -3840,6 +3953,11 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
         }
 
         let agg_us = t2.elapsed().as_micros() as u64 - decompress_us;
+
+        // Write CountDistinct counts from sidecar into compact storage
+        if use_compact_keys && use_compact_accs {
+            cd_sidecar.write_counts_to_storage(compact_storage.as_mut().unwrap(), &compact_group_map);
+        }
 
         // Finalize results using output mapping, applying HAVING filters
         let mut topn_select_us: u64 = 0;
@@ -4508,18 +4626,22 @@ pub(super) unsafe extern "C-unwind" fn rescan_agg_scan(
 /// Kind of accumulator slot in compact storage.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum CompactAccKind {
-    Count,          // 8 bytes: i64
-    SumInt,         // 24 bytes: i128 sum (16) + i64 count (8) — for INT8 columns
-    SumIntNarrow,   // 16 bytes: i64 sum (8) + i64 count (8) — for INT2/INT4 columns
-    SumFloat,       // 16 bytes: f64 sum (8) + i64 count (8)
-    MinStr,         // 8 bytes: u32 arena_offset + u32 length (sentinel: u32::MAX, 0)
-    MaxStr,         // 8 bytes: u32 arena_offset + u32 length (sentinel: u32::MAX, 0)
+    Count,              // 8 bytes: i64
+    SumInt,             // 24 bytes: i128 sum (16) + i64 count (8) — for INT8 columns
+    SumIntNarrow,       // 16 bytes: i64 sum (8) + i64 count (8) — for INT2/INT4 columns
+    SumFloat,           // 16 bytes: f64 sum (8) + i64 count (8)
+    MinStr,             // 8 bytes: u32 arena_offset + u32 length (sentinel: u32::MAX, 0)
+    MaxStr,             // 8 bytes: u32 arena_offset + u32 length (sentinel: u32::MAX, 0)
+    CountDistinctInt,   // 8 bytes: i64 count cache (real data in CountDistinctSideCar)
+    CountDistinctStr,   // 8 bytes: i64 count cache (real data in CountDistinctSideCar)
 }
 
 impl CompactAccKind {
     fn byte_size(self) -> usize {
         match self {
-            CompactAccKind::Count => 8,
+            CompactAccKind::Count
+            | CompactAccKind::CountDistinctInt
+            | CompactAccKind::CountDistinctStr => 8,
             CompactAccKind::SumInt => 24,
             CompactAccKind::SumIntNarrow => 16,
             CompactAccKind::SumFloat => 16,
@@ -4529,7 +4651,9 @@ impl CompactAccKind {
 
     fn alignment(self) -> usize {
         match self {
-            CompactAccKind::Count => 8,
+            CompactAccKind::Count
+            | CompactAccKind::CountDistinctInt
+            | CompactAccKind::CountDistinctStr => 8,
             CompactAccKind::SumInt => 16, // i128 needs 16-byte alignment
             CompactAccKind::SumIntNarrow => 8,
             CompactAccKind::SumFloat => 8,
@@ -4608,7 +4732,124 @@ fn compact_acc_kind(spec: &AggExecSpec) -> CompactAccKind {
                 unreachable!("compact_acc_kind: MAX on non-text not supported in compact path")
             }
         }
-        _ => unreachable!("compact_acc_kind called for unsupported agg type"),
+        AggType::CountDistinct => {
+            let t = spec.col_type_oid;
+            if t == pg_sys::TEXTOID || t == pg_sys::VARCHAROID || t == pg_sys::BPCHAROID {
+                CompactAccKind::CountDistinctStr
+            } else {
+                CompactAccKind::CountDistinctInt
+            }
+        }
+    }
+}
+
+/// Side-car storage for COUNT(DISTINCT) accumulators.
+/// Each CountDistinct agg spec gets a Vec of HashSets indexed by group_idx.
+/// Int columns store raw i64 values; text columns store 128-bit hash digests.
+struct CountDistinctSideCar {
+    /// (agg_spec_index, is_str, sets_int, sets_str) per CountDistinct spec.
+    /// Only one of sets_int/sets_str is populated based on is_str.
+    entries: Vec<CdEntry>,
+}
+
+struct CdEntry {
+    spec_idx: usize,
+    is_str: bool,
+    sets_int: Vec<hashbrown::HashSet<i64, BuildHasherDefault<ahash::AHasher>>>,
+    sets_str: Vec<hashbrown::HashSet<u128, BuildHasherDefault<ahash::AHasher>>>,
+}
+
+impl CountDistinctSideCar {
+    fn new(agg_specs: &[AggExecSpec]) -> Self {
+        let mut entries = Vec::new();
+        for (i, spec) in agg_specs.iter().enumerate() {
+            if spec.agg_type == AggType::CountDistinct {
+                let is_str = matches!(spec.col_type_oid,
+                    pg_sys::TEXTOID | pg_sys::VARCHAROID | pg_sys::BPCHAROID);
+                entries.push(CdEntry {
+                    spec_idx: i,
+                    is_str,
+                    sets_int: Vec::new(),
+                    sets_str: Vec::new(),
+                });
+            }
+        }
+        CountDistinctSideCar { entries }
+    }
+
+    fn alloc_group(&mut self) {
+        for e in &mut self.entries {
+            if e.is_str {
+                e.sets_str.push(hashbrown::HashSet::with_hasher(BuildHasherDefault::default()));
+            } else {
+                e.sets_int.push(hashbrown::HashSet::with_hasher(BuildHasherDefault::default()));
+            }
+        }
+    }
+
+    fn insert_int(&mut self, spec_idx: usize, group_idx: u32, val: i64) {
+        for e in &mut self.entries {
+            if e.spec_idx == spec_idx {
+                e.sets_int[group_idx as usize].insert(val);
+                return;
+            }
+        }
+    }
+
+    fn insert_str(&mut self, spec_idx: usize, group_idx: u32, hash: u128) {
+        for e in &mut self.entries {
+            if e.spec_idx == spec_idx {
+                e.sets_str[group_idx as usize].insert(hash);
+                return;
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    fn len(&self, spec_idx: usize, group_idx: u32) -> i64 {
+        for e in &self.entries {
+            if e.spec_idx == spec_idx {
+                return if e.is_str {
+                    e.sets_str[group_idx as usize].len() as i64
+                } else {
+                    e.sets_int[group_idx as usize].len() as i64
+                };
+            }
+        }
+        0
+    }
+
+    fn union_from(&mut self, spec_idx: usize, dst_group: u32, other: &Self, src_group: u32) {
+        for (e, oe) in self.entries.iter_mut().zip(other.entries.iter()) {
+            if e.spec_idx == spec_idx {
+                if e.is_str {
+                    let src = &oe.sets_str[src_group as usize];
+                    e.sets_str[dst_group as usize].extend(src.iter().copied());
+                } else {
+                    let src = &oe.sets_int[src_group as usize];
+                    e.sets_int[dst_group as usize].extend(src.iter().copied());
+                }
+                return;
+            }
+        }
+    }
+
+    /// Write cached counts into compact storage Count slots for top-N sorting.
+    fn write_counts_to_storage(&self, storage: &mut CompactAccStorage, map: &CompactGroupMap) {
+        for e in &self.entries {
+            for (_, &gidx) in map.iter() {
+                let count = if e.is_str {
+                    e.sets_str[gidx as usize].len() as i64
+                } else {
+                    e.sets_int[gidx as usize].len() as i64
+                };
+                unsafe { *storage.count_mut(gidx, e.spec_idx) = count; }
+            }
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 }
 
@@ -4801,7 +5042,11 @@ fn can_use_compact_accs(agg_specs: &[AggExecSpec]) -> bool {
                 let t = spec.col_type_oid;
                 t == pg_sys::TEXTOID || t == pg_sys::VARCHAROID || t == pg_sys::BPCHAROID
             }
-            _ => false,
+            AggType::CountDistinct => {
+                let t = spec.col_type_oid;
+                t == pg_sys::INT2OID || t == pg_sys::INT4OID || t == pg_sys::INT8OID
+                    || t == pg_sys::TEXTOID || t == pg_sys::VARCHAROID || t == pg_sys::BPCHAROID
+            }
         }
     })
 }
@@ -4979,6 +5224,11 @@ unsafe fn compact_finalize(
                     let datum = string_to_datum(s, spec.col_type_oid);
                     (datum, false)
                 }
+            }
+            CompactAccKind::CountDistinctInt | CompactAccKind::CountDistinctStr => {
+                // Count was pre-written into the compact slot by write_counts_to_storage
+                let count = storage.read_count(group_idx, slot);
+                (pg_sys::Datum::from(count as usize), false)
             }
         }
     }
@@ -5204,6 +5454,7 @@ struct ParallelCompactConfig<'a> {
 struct ParallelCompactResult {
     compact_map: CompactGroupMap,
     compact_storage: CompactAccStorage,
+    cd_sidecar: CountDistinctSideCar,
     segments_processed: u64,
     rows_processed: u64,
     decompress_us: u64,
@@ -5222,6 +5473,7 @@ fn process_segments_compact(
 ) -> ParallelCompactResult {
     let mut compact_map = CompactGroupMap::with_hasher(BuildHasherDefault::default());
     let mut compact_storage = CompactAccStorage::new(CompactAccLayout::new(config.agg_specs));
+    let mut cd_sidecar = CountDistinctSideCar::new(config.agg_specs);
     let mut segments_processed: u64 = 0;
     let mut rows_processed: u64 = 0;
     let mut decompress_us: u64 = 0;
@@ -5359,6 +5611,7 @@ fn process_segments_compact(
                 hashbrown::hash_map::Entry::Occupied(e) => *e.get(),
                 hashbrown::hash_map::Entry::Vacant(e) => {
                     let idx = compact_storage.alloc_group();
+                    cd_sidecar.alloc_group();
                     e.insert(idx);
                     idx
                 }
@@ -5426,6 +5679,16 @@ fn process_segments_compact(
                         // so MinStr/MaxStr cannot appear here
                         unreachable!("MinStr/MaxStr in compact parallel worker")
                     }
+                    CompactAccKind::CountDistinctInt => {
+                        let col = &decompressed[spec.col_idx as usize];
+                        if !col.is_empty() && !col[row].1 {
+                            cd_sidecar.insert_int(spec_idx, group_idx, col[row].0.value() as i64);
+                        }
+                    }
+                    CompactAccKind::CountDistinctStr => {
+                        // compact path requires all_needed_cols_numeric
+                        unreachable!("CountDistinctStr in compact parallel worker")
+                    }
                 }
             }
         }
@@ -5472,9 +5735,13 @@ fn process_segments_compact(
         }
     });
 
+    // Write CD counts to compact storage before top-K evaluation
+    cd_sidecar.write_counts_to_storage(&mut compact_storage, &compact_map);
+
     ParallelCompactResult {
         compact_map,
         compact_storage,
+        cd_sidecar,
         segments_processed,
         rows_processed,
         decompress_us,
@@ -5522,8 +5789,10 @@ fn parse_string_to_datum(s: &str, type_oid: pg_sys::Oid) -> pg_sys::Datum {
 fn merge_compact_results(
     global_map: &mut CompactGroupMap,
     global_storage: &mut CompactAccStorage,
+    global_cd: &mut CountDistinctSideCar,
     worker_map: &CompactGroupMap,
     worker_storage: &CompactAccStorage,
+    worker_cd: &CountDistinctSideCar,
     agg_specs: &[AggExecSpec],
 ) {
     for (&packed_key, &worker_group_idx) in worker_map {
@@ -5531,6 +5800,7 @@ fn merge_compact_results(
             hashbrown::hash_map::Entry::Occupied(e) => *e.get(),
             hashbrown::hash_map::Entry::Vacant(e) => {
                 let idx = global_storage.alloc_group();
+                global_cd.alloc_group();
                 e.insert(idx);
                 idx
             }
@@ -5584,6 +5854,9 @@ fn merge_compact_results(
                             global_storage.write_min_max_str(global_group_idx, slot_idx, new_off, new_len);
                         }
                     }
+                },
+                CompactAccKind::CountDistinctInt | CompactAccKind::CountDistinctStr => {
+                    global_cd.union_from(slot_idx, global_group_idx, worker_cd, worker_group_idx);
                 },
             }
         }
@@ -5778,7 +6051,7 @@ fn convert_pg_replacement(replacement: &str) -> String {
     while i < bytes.len() {
         if bytes[i] == b'\\' && i + 1 < bytes.len() {
             let next = bytes[i + 1];
-            if next >= b'0' && next <= b'9' {
+            if next.is_ascii_digit() {
                 result.push('$');
                 result.push(next as char);
                 i += 2;
@@ -5810,11 +6083,11 @@ fn pg_pattern_to_rust(pattern: &str) -> String {
     result.push_str("(?s)");
 
     // Replace unescaped $ at end of pattern with \z
-    if pattern.ends_with('$') {
-        let preceding_backslashes = pattern[..pattern.len() - 1]
+    if let Some(prefix) = pattern.strip_suffix('$') {
+        let preceding_backslashes = prefix
             .chars().rev().take_while(|&c| c == '\\').count();
         if preceding_backslashes % 2 == 0 {
-            result.push_str(&pattern[..pattern.len() - 1]);
+            result.push_str(prefix);
             result.push_str("\\z");
             return result;
         }
@@ -5922,6 +6195,7 @@ struct ParallelMixedResult {
     compact_map: CompactGroupMap,
     compact_storage: CompactAccStorage,
     mixed_keys: MixedKeyStorage,
+    cd_sidecar: CountDistinctSideCar,
     segments_processed: u64,
     rows_processed: u64,
     decompress_us: u64,
@@ -6108,7 +6382,12 @@ fn can_parallel_mixed(
                 && matches!(s.agg_type, AggType::Min | AggType::Max)
                 && (type_oid == pg_sys::TEXTOID || type_oid == pg_sys::VARCHAROID || type_oid == pg_sys::BPCHAROID)
         });
-        if !is_text_gb && !has_text_qual && !is_text_minmax_agg {
+        let is_text_cd_agg = agg_specs.iter().any(|s| {
+            s.col_idx as usize == i
+                && s.agg_type == AggType::CountDistinct
+                && (type_oid == pg_sys::TEXTOID || type_oid == pg_sys::VARCHAROID || type_oid == pg_sys::BPCHAROID)
+        });
+        if !is_text_gb && !has_text_qual && !is_text_minmax_agg && !is_text_cd_agg {
             return false; // unsupported column type
         }
     }
@@ -6141,6 +6420,7 @@ fn process_segments_mixed(
     let mut compact_storage = CompactAccStorage::new(CompactAccLayout::new(config.agg_specs));
     let num_group_keys = config.group_specs.len();
     let mut mixed_keys = MixedKeyStorage::new(num_group_keys);
+    let mut cd_sidecar = CountDistinctSideCar::new(config.agg_specs);
     let mut segments_processed: u64 = 0;
     let mut rows_processed: u64 = 0;
     let mut decompress_us: u64 = 0;
@@ -6374,6 +6654,7 @@ fn process_segments_mixed(
                 hashbrown::hash_map::Entry::Occupied(e) => *e.get(),
                 hashbrown::hash_map::Entry::Vacant(e) => {
                     let idx = compact_storage.alloc_group();
+                    cd_sidecar.alloc_group();
                     e.insert(idx);
                     // Store actual key values for this new group
                     mixed_keys.insert(&int_keys[..n_int_keys], &str_keys[..n_str_keys], config.group_specs);
@@ -6417,13 +6698,12 @@ fn process_segments_mixed(
                                 *sum += v;
                             }
                             *count += 1;
-                        } else if spec.expr_kind == AggExpr::LengthOf {
-                            if let Some(ref seg_col) = text_seg_cols[spec.col_idx as usize]
-                                && let Some(s) = seg_col.get_str(row) {
-                                let (sum, count) = unsafe { compact_storage.sum_int_mut(group_idx, spec_idx) };
-                                *sum += s.chars().count() as i128;
-                                *count += 1;
-                            }
+                        } else if spec.expr_kind == AggExpr::LengthOf
+                            && let Some(ref seg_col) = text_seg_cols[spec.col_idx as usize]
+                            && let Some(s) = seg_col.get_str(row) {
+                            let (sum, count) = unsafe { compact_storage.sum_int_mut(group_idx, spec_idx) };
+                            *sum += s.chars().count() as i128;
+                            *count += 1;
                         }
                     }
                     CompactAccKind::SumIntNarrow => {
@@ -6437,13 +6717,12 @@ fn process_segments_mixed(
                                 *sum += v;
                             }
                             *count += 1;
-                        } else if spec.expr_kind == AggExpr::LengthOf {
-                            if let Some(ref seg_col) = text_seg_cols[spec.col_idx as usize]
-                                && let Some(s) = seg_col.get_str(row) {
-                                let (sum, count) = unsafe { compact_storage.sum_int_narrow_mut(group_idx, spec_idx) };
-                                *sum += s.chars().count() as i64;
-                                *count += 1;
-                            }
+                        } else if spec.expr_kind == AggExpr::LengthOf
+                            && let Some(ref seg_col) = text_seg_cols[spec.col_idx as usize]
+                            && let Some(s) = seg_col.get_str(row) {
+                            let (sum, count) = unsafe { compact_storage.sum_int_narrow_mut(group_idx, spec_idx) };
+                            *sum += s.chars().count() as i64;
+                            *count += 1;
                         }
                     }
                     CompactAccKind::SumFloat => {
@@ -6457,13 +6736,12 @@ fn process_segments_mixed(
                                 *sum += v;
                             }
                             *count += 1;
-                        } else if spec.expr_kind == AggExpr::LengthOf {
-                            if let Some(ref seg_col) = text_seg_cols[spec.col_idx as usize]
-                                && let Some(s) = seg_col.get_str(row) {
-                                let (sum, count) = unsafe { compact_storage.sum_float_mut(group_idx, spec_idx) };
-                                *sum += s.chars().count() as f64;
-                                *count += 1;
-                            }
+                        } else if spec.expr_kind == AggExpr::LengthOf
+                            && let Some(ref seg_col) = text_seg_cols[spec.col_idx as usize]
+                            && let Some(s) = seg_col.get_str(row) {
+                            let (sum, count) = unsafe { compact_storage.sum_float_mut(group_idx, spec_idx) };
+                            *sum += s.chars().count() as f64;
+                            *count += 1;
                         }
                     }
                     CompactAccKind::MinStr | CompactAccKind::MaxStr => {
@@ -6488,9 +6766,27 @@ fn process_segments_mixed(
                                 }
                         }
                     }
+                    CompactAccKind::CountDistinctInt => {
+                        let col = &numeric_cols[spec.col_idx as usize];
+                        if !col.is_empty() && !col[row].1 {
+                            cd_sidecar.insert_int(spec_idx, group_idx, col[row].0.value() as i64);
+                        }
+                    }
+                    CompactAccKind::CountDistinctStr => {
+                        let col_idx = spec.col_idx as usize;
+                        if let Some(ref seg_col) = text_seg_cols[col_idx]
+                            && let Some(s) = seg_col.get_str(row) {
+                            cd_sidecar.insert_str(spec_idx, group_idx, hash128_str(s.as_bytes()));
+                        }
+                    }
                 }
             }
         }
+    }
+
+    // Write CountDistinct counts into compact storage for top-K sorting
+    if !cd_sidecar.is_empty() {
+        cd_sidecar.write_counts_to_storage(&mut compact_storage, &compact_map);
     }
 
     // Compute top-K candidates while data is cache-hot (if requested)
@@ -6538,6 +6834,7 @@ fn process_segments_mixed(
         compact_map,
         compact_storage,
         mixed_keys,
+        cd_sidecar,
         segments_processed,
         rows_processed,
         decompress_us,
@@ -6931,6 +7228,7 @@ mod tests {
             col_types: col_names.iter().map(|_| pg_sys::Oid::from(23u32)).collect(),
             col_typmods: col_names.iter().map(|_| -1).collect(),
             segment_by: Vec::new(),
+            order_by: Vec::new(),
             time_column: "ts".to_string(),
         }
     }

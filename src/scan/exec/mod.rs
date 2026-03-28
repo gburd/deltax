@@ -689,9 +689,9 @@ mod tests {
             decompress_blob_to_datums_truncated(&blob, "boolean", pg_sys::BOOLOID, -1, 2)
         };
         assert_eq!(result.len(), 3);
-        assert_eq!(result[0].0.value() != 0, true);
-        assert_eq!(result[1].0.value() != 0, false);
-        assert_eq!(result[2].0.value() != 0, true);
+        assert!(result[0].0.value() != 0);
+        assert!(result[1].0.value() == 0);
+        assert!(result[2].0.value() != 0);
     }
 
     #[pg_test]

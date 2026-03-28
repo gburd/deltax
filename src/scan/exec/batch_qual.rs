@@ -779,6 +779,8 @@ pub(super) unsafe fn extract_batch_quals(
                 let varlena_ptr = (*const_node).constvalue.cast_mut_ptr::<pg_sys::varlena>();
                 let len = pgrx::varsize_any_exhdr(varlena_ptr);
                 let data = pgrx::vardata_any(varlena_ptr);
+                // Cast needed: vardata_any returns *const i8 on Linux, *const u8 on macOS
+                #[allow(clippy::unnecessary_cast)]
                 let pattern_bytes = std::slice::from_raw_parts(data as *const u8, len);
                 let pattern = match std::str::from_utf8(pattern_bytes) {
                     Ok(s) => s,
@@ -805,6 +807,7 @@ pub(super) unsafe fn extract_batch_quals(
                 let varlena_ptr = (*const_node).constvalue.cast_mut_ptr::<pg_sys::varlena>();
                 let len = pgrx::varsize_any_exhdr(varlena_ptr);
                 let data = pgrx::vardata_any(varlena_ptr);
+                #[allow(clippy::unnecessary_cast)]
                 let const_bytes = std::slice::from_raw_parts(data as *const u8, len);
                 let const_str = match std::str::from_utf8(const_bytes) {
                     Ok(s) => s.to_string(),

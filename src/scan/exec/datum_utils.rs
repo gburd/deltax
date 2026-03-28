@@ -376,13 +376,17 @@ pub(super) unsafe fn decompress_text_blob_with_like_filter(
     typmod: i32,
     strategy: &LikeStrategy,
     negate: bool,
+    max_rows: Option<usize>,
 ) -> (Vec<(pg_sys::Datum, bool)>, Vec<bool>) {
     if blob.is_empty() {
         return (Vec::new(), Vec::new());
     }
 
     let cc = CompressedColumnRef::from_bytes(blob);
-    let total_count = cc.row_count as usize;
+    let total_count = match max_rows {
+        Some(mr) => mr.min(cc.row_count as usize),
+        None => cc.row_count as usize,
+    };
     let non_null_count = count_non_null(cc.null_bitmap, total_count);
 
     // Match a &str against the LikeStrategy, applying negation.
@@ -706,13 +710,17 @@ pub(super) unsafe fn decompress_text_blob_with_eq_filter(
     typmod: i32,
     const_str: &str,
     is_ne: bool,
+    max_rows: Option<usize>,
 ) -> (Vec<(pg_sys::Datum, bool)>, Vec<bool>) {
     if blob.is_empty() {
         return (Vec::new(), Vec::new());
     }
 
     let cc = CompressedColumnRef::from_bytes(blob);
-    let total_count = cc.row_count as usize;
+    let total_count = match max_rows {
+        Some(mr) => mr.min(cc.row_count as usize),
+        None => cc.row_count as usize,
+    };
     let non_null_count = count_non_null(cc.null_bitmap, total_count);
 
     let matches_eq = |text: &str| -> bool {

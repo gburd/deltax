@@ -12,3 +12,4 @@ pg_deltax_design_v03.md
 tests/.data/
 tests/.bench_results/
 clickbench/results/
+clickbench/data.generated.js.new

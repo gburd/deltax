@@ -836,6 +836,7 @@ fn flush_with_splitting(
 /// guarded by `if !seg_col_indices.is_empty()` and naturally skipped when empty).
 /// Returns (compressed_size, row_count). ndistinct is tracked per-segment via HLL
 /// and stored in the companion table.
+#[allow(clippy::too_many_arguments)]
 fn compress_partition_streaming(
     client: &mut SpiClient,
     part_fqn: &str,

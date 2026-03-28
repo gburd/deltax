@@ -218,6 +218,7 @@ pub(super) struct MetadataInfo {
     pub(super) col_types: Vec<pg_sys::Oid>,
     pub(super) col_typmods: Vec<i32>,
     pub(super) segment_by: Vec<String>,
+    pub(super) order_by: Vec<String>,
     pub(super) time_column: String,
 }
 
@@ -247,6 +248,12 @@ pub(super) fn load_metadata(
 
     let segment_by: Vec<String> = ht_row
         .get_datum_by_ordinal(1)
+        .unwrap()
+        .value::<Vec<String>>()
+        .unwrap()
+        .unwrap_or_default();
+    let order_by: Vec<String> = ht_row
+        .get_datum_by_ordinal(2)
         .unwrap()
         .value::<Vec<String>>()
         .unwrap()
@@ -305,6 +312,7 @@ pub(super) fn load_metadata(
         col_types,
         col_typmods,
         segment_by,
+        order_by,
         time_column,
     }
 }
@@ -606,6 +614,8 @@ pub(super) unsafe fn load_segments_heap(
                                 let detoasted = pg_sys::pg_detoast_datum(varlena_ptr);
                                 let len = pgrx::varsize_any_exhdr(detoasted);
                                 let data = pgrx::vardata_any(detoasted);
+                                // Cast needed: vardata_any returns *const i8 on Linux, *const u8 on macOS
+                                #[allow(clippy::unnecessary_cast)]
                                 let bytes = std::slice::from_raw_parts(
                                     data as *const u8,
                                     len,
@@ -691,6 +701,33 @@ pub(super) unsafe fn detoast_lazy_blobs(seg: &mut SegmentData) {
             let detoasted = pg_sys::pg_detoast_datum(ptr);
             let len = pgrx::varsize_any_exhdr(detoasted);
             let data = pgrx::vardata_any(detoasted);
+            #[allow(clippy::unnecessary_cast)]
+            let bytes = std::slice::from_raw_parts(data as *const u8, len).to_vec();
+            if detoasted != ptr {
+                pg_sys::pfree(detoasted as *mut _);
+            }
+            seg.compressed_blobs[bi] = bytes;
+            seg.toast_pointers[bi].clear();
+        }
+    }
+}
+
+/// Materialize deferred TOAST pointers for specific blob indices only.
+///
+/// Like `detoast_lazy_blobs` but only processes the given blob indices,
+/// leaving other blobs lazy. Used in top-N Phase 1 to detoast only
+/// filter + sort column blobs while deferring Phase 2 columns.
+pub(super) unsafe fn detoast_lazy_blobs_selective(seg: &mut SegmentData, blob_indices: &[usize]) {
+    unsafe {
+        for &bi in blob_indices {
+            if bi >= seg.toast_pointers.len() || seg.toast_pointers[bi].is_empty() {
+                continue;
+            }
+            let ptr = seg.toast_pointers[bi].as_ptr() as *mut pg_sys::varlena;
+            let detoasted = pg_sys::pg_detoast_datum(ptr);
+            let len = pgrx::varsize_any_exhdr(detoasted);
+            let data = pgrx::vardata_any(detoasted);
+            #[allow(clippy::unnecessary_cast)]
             let bytes = std::slice::from_raw_parts(data as *const u8, len).to_vec();
             if detoasted != ptr {
                 pg_sys::pfree(detoasted as *mut _);
