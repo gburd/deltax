@@ -21,7 +21,7 @@ use super::datum_utils::{
 };
 use super::segments::{
     SegmentData, load_metadata, load_segments_heap,
-    segment_skippable_by_dict_like, extract_segment_filters,
+    segment_skippable_by_dict, extract_segment_filters,
 };
 
 /// Compute a 128-bit hash of a byte slice for COUNT(DISTINCT) on strings.
@@ -2928,7 +2928,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
             }
 
             // Dictionary-based LIKE pruning: skip segment if no dict entry matches
-            if segment_skippable_by_dict_like(
+            if segment_skippable_by_dict(
                 &batch_quals, &meta.col_names, &meta.segment_by, &seg.compressed_blobs,
             ) {
                 continue;
@@ -5503,7 +5503,7 @@ fn process_segments_compact(
         }
 
         // Dictionary-based LIKE pruning
-        if segment_skippable_by_dict_like(
+        if segment_skippable_by_dict(
             config.batch_quals, config.col_names, config.segment_by, &seg.compressed_blobs,
         ) {
             continue;
@@ -6453,7 +6453,7 @@ fn process_segments_mixed(
         }
 
         // Dictionary-based LIKE pruning
-        if segment_skippable_by_dict_like(
+        if segment_skippable_by_dict(
             config.batch_quals, config.col_names, config.segment_by, &seg.compressed_blobs,
         ) {
             continue;

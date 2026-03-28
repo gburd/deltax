@@ -6,6 +6,10 @@ use crate::compression;
 use super::batch_qual::{BatchQual, BatchCompareOp, LikeStrategy, sql_like_match};
 use super::datum_utils::{pg_type_oid, tupdesc_get_attr};
 
+/// Which dict check to perform in `segment_skippable_by_dict`.
+#[derive(Clone, Copy, PartialEq)]
+enum DictCheck { Eq, Ne, Like, NotLike }
+
 /// Filter for pruning segments based on min/max metadata in the companion table.
 /// Built from batch quals with orderable types (int, float, timestamp, date).
 pub(super) struct MinMaxFilter {
@@ -112,21 +116,29 @@ pub(super) struct ColSum {
 ///
 /// For each LIKE/NOT LIKE batch qual, finds the corresponding compressed blob and
 /// checks if it's dictionary-encoded. If so, tests dictionary entries against the
-/// LIKE pattern. If no entry matches (for LIKE) or all entries match (for NOT LIKE),
-/// the segment definitely has zero matching rows and can be skipped entirely.
+/// Check whether a segment can be skipped based on dictionary pruning for text quals.
+///
+/// For each LIKE/NOT LIKE/Eq/Ne batch qual on dict-encoded text columns, finds the
+/// corresponding compressed blob and checks dictionary entries:
+/// - **Like**: skip if NO dict entry matches the pattern (no row can match)
+/// - **NotLike**: skip if ALL dict entries match the pattern (every row is filtered)
+/// - **Eq**: skip if NO dict entry equals the constant (no row can match)
+/// - **Ne**: skip if ALL dict entries equal the constant (every row is filtered)
 ///
 /// Returns `true` if the segment should be skipped.
-pub(super) fn segment_skippable_by_dict_like(
+pub(super) fn segment_skippable_by_dict(
     batch_quals: &[BatchQual],
     col_names: &[String],
     segment_by: &[String],
     compressed_blobs: &[Vec<u8>],
 ) -> bool {
-    // Find LIKE/NOT LIKE quals
     for bq in batch_quals {
-        let (strategy, negate) = match (&bq.op, &bq.like_strategy) {
-            (BatchCompareOp::Like, Some(s)) => (s, false),
-            (BatchCompareOp::NotLike, Some(s)) => (s, true),
+        // Determine which operation we're checking
+        let check = match (&bq.op, &bq.like_strategy) {
+            (BatchCompareOp::Like, Some(_)) => DictCheck::Like,
+            (BatchCompareOp::NotLike, Some(_)) => DictCheck::NotLike,
+            (BatchCompareOp::Eq, _) if bq.text_const.is_some() => DictCheck::Eq,
+            (BatchCompareOp::Ne, _) if bq.text_const.is_some() => DictCheck::Ne,
             _ => continue,
         };
 
@@ -168,16 +180,23 @@ pub(super) fn segment_skippable_by_dict_like(
             cc.data
         };
 
-        // Check if any dictionary entry matches the LIKE pattern
+        // Check dictionary entries against the predicate
         let any_match = compression::dictionary::any_entry_matches(dict_data, |text| {
-            let matched = match strategy {
-                LikeStrategy::Contains(s) => text.contains(s.as_str()),
-                LikeStrategy::StartsWith(s) => text.starts_with(s.as_str()),
-                LikeStrategy::EndsWith(s) => text.ends_with(s.as_str()),
-                LikeStrategy::Exact(s) => text == s.as_str(),
-                LikeStrategy::General(p) => sql_like_match(text, p),
-            };
-            if negate { !matched } else { matched }
+            match check {
+                DictCheck::Eq => text == bq.text_const.as_ref().unwrap().as_str(),
+                DictCheck::Ne => text != bq.text_const.as_ref().unwrap().as_str(),
+                DictCheck::Like | DictCheck::NotLike => {
+                    let strategy = bq.like_strategy.as_ref().unwrap();
+                    let matched = match strategy {
+                        LikeStrategy::Contains(s) => text.contains(s.as_str()),
+                        LikeStrategy::StartsWith(s) => text.starts_with(s.as_str()),
+                        LikeStrategy::EndsWith(s) => text.ends_with(s.as_str()),
+                        LikeStrategy::Exact(s) => text == s.as_str(),
+                        LikeStrategy::General(p) => sql_like_match(text, p),
+                    };
+                    if check == DictCheck::NotLike { !matched } else { matched }
+                }
+            }
         });
 
         if !any_match {

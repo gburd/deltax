@@ -15,7 +15,7 @@ use super::datum_utils::{
 };
 use super::segments::{
     SegmentData, load_metadata, load_segments_heap,
-    detoast_lazy_blobs, detoast_lazy_blobs_selective, segment_skippable_by_dict_like,
+    detoast_lazy_blobs, detoast_lazy_blobs_selective, segment_skippable_by_dict,
     extract_segment_filters,
 };
 
@@ -837,7 +837,7 @@ unsafe fn exec_topn_two_pass(
             let seg = &state.segments_data[seg_idx];
 
             // Dictionary-based LIKE pruning
-            if segment_skippable_by_dict_like(
+            if segment_skippable_by_dict(
                 &state.batch_quals, &state.col_names, &state.segment_by, &seg.compressed_blobs,
             ) {
                 state.timing.segments_skipped += 1;
@@ -1641,7 +1641,7 @@ unsafe fn load_next_segment(
             }
 
             // Dictionary-based LIKE pruning
-            if segment_skippable_by_dict_like(
+            if segment_skippable_by_dict(
                 &state.batch_quals, &state.col_names, &state.segment_by, &seg.compressed_blobs,
             ) {
                 state.timing.segments_skipped += 1;
