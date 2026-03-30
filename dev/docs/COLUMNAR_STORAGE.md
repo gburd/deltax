@@ -1,56 +1,16 @@
-# Proposal: Columnar Blob Storage for Cold I/O Performance
+# Columnar Blob Storage Architecture
 
-## Problem Statement
+## Overview
 
-DeltaX stores compressed column blobs alongside segment metadata in the same
-companion table row. Each segment occupies one row with ~N `BYTEA` columns
-(one per non-segment-by column). PostgreSQL automatically TOASTs these blobs
-into a shared TOAST heap.
+DeltaX splits each compressed partition into three tables:
 
-For the ClickBench `hits` table (105 compressed columns, ~3338 segments across
-7 partitions), the TOAST table for a single partition is ~2.8 GB. The chunks
-for different columns are interleaved in insertion order:
+1. **Meta table** — scalar per-segment metadata (no BYTEA, no TOAST)
+2. **Blob table** — compressed column data, inserted in column-major order for sequential I/O
+3. **Blooms table** — per-segment packed bloom filters for equality predicate pushdown
 
-```
-TOAST heap physical layout (current):
-  seg1_col0_chunks  seg1_col1_chunks  ...  seg1_col104_chunks
-  seg2_col0_chunks  seg2_col1_chunks  ...  seg2_col104_chunks
-  ...
-  segN_col0_chunks  segN_col1_chunks  ...  segN_col104_chunks
-```
-
-When a query needs only one column (e.g., Q7: `AdvEngineID`), PostgreSQL
-detoasts that column's blob from each segment independently. Each detoast is
-an index lookup on the TOAST B-tree followed by chunk page reads. Because the
-chunks for one column are scattered across the entire TOAST table (spaced
-every 1/105th), the I/O pattern is random.
-
-**Measured impact on gp2 EBS (ClickBench 100M rows, r7i.4xlarge, cold cache):**
-
-We instrumented `load_segments_heap` to separately measure `heap_getnext`
-(reading companion table heap pages), `heap_deform_tuple` (extracting
-datums), and `pg_detoast_datum` (TOAST I/O). Results across all 43 queries:
-
-- **`heap_getnext` + `heap_deform_tuple`**: ~1-2ms per partition — negligible
-- **`pg_detoast_datum`**: 99-100% of `heap_scan` time for every DeltaXAgg query
-- **All blobs are TOASTed** (0 inline blobs observed)
-
-The entire cold-run bottleneck is TOAST random I/O. See "Appendix: Full Cold
-Run Measurements" for the complete per-query breakdown.
-
-Example queries:
-
-| Query | Columns | Cold Total | detoast | detoast % of total |
-|-------|---------|------------|---------|-------------------|
-| Q7    | 1       | 3.3s       | 3131ms  | 96%               |
-| Q21   | 3       | 30.1s      | 28679ms | 95%               |
-| Q22   | 5       | 53.4s      | 50308ms | 94%               |
-| Q32   | 4       | 36.8s      | 27905ms | 76%               |
-
-**`posix_fadvise` does not help**: We tested prefetching TOAST table files
-and TOAST indexes. On gp2, prefetching 12 GB at 250 MB/s takes ~48s —
-slower than the random reads themselves. The fundamental issue is that
-sequential prefetch reads 100× more data than needed.
+This layout replaces the original single companion table design where all
+compressed column blobs were stored as BYTEA columns in one row per segment.
+The motivation and measurements behind this change are in the appendix.
 
 ## How Data is Organized into Segments
 
@@ -63,84 +23,29 @@ Original table: hits (100M rows, 105 columns)
 │
 ├── Partition 1 (2013-07-01 to 2013-07-08) ── ~20M rows
 │   ├── Segment 1 ── 30,000 rows, ordered by EventTime
-│   │   ├── _advengineid_compressed  BYTEA  (~14 KB)
-│   │   ├── _searchphrase_compressed BYTEA  (~95 KB)
-│   │   ├── _url_compressed          BYTEA  (~1 MB)
-│   │   ├── ... (105 columns total)
-│   │   ├── _row_count = 30000
-│   │   ├── _min_eventtime, _max_eventtime
-│   │   └── _min_<col>, _max_<col> for each column
-│   │
 │   ├── Segment 2 ── 30,000 rows
-│   │   └── ... (same structure)
-│   │
 │   ├── ... (~667 segments per partition)
-│   │
 │   └── Segment 667 ── remaining rows
 │
-├── Partition 2 (2013-07-08 to 2013-07-15) ── ~20M rows
+├── Partition 2 (2013-07-08 to 2013-07-15)
 │   └── ... (~667 segments)
 │
 ├── ... (5 partitions total)
 │
 └── Partition 5
     └── ...
-
-Current companion table layout (one row per segment):
-┌──────────────────────────────────────────────────────────────────────┐
-│ Row 1: seg_by | _row_count | _min/max_time | _min/max_col0..104 |  │
-│        _col0_compressed (BYTEA→TOAST) | ... | _col104_compressed   │
-├──────────────────────────────────────────────────────────────────────┤
-│ Row 2: ... same 105 BYTEA blobs, all TOASTed ...                   │
-├──────────────────────────────────────────────────────────────────────┤
-│ ...                                                                 │
-└──────────────────────────────────────────────────────────────────────┘
-
-TOAST table (physical disk order = insertion order):
-┌─────────────────────────────────────────────────────────┐
-│ seg1_col0 | seg1_col1 | ... | seg1_col104 |            │  ← all cols
-│ seg2_col0 | seg2_col1 | ... | seg2_col104 |            │    interleaved
-│ ...                                                     │
-│ seg667_col0 | seg667_col1 | ... | seg667_col104 |      │
-└─────────────────────────────────────────────────────────┘
-  ↑ Reading AdvEngineID = every 105th blob = random I/O
 ```
 
-Each segment's compressed blobs are stored as BYTEA columns in one companion
-table row. PostgreSQL TOASTs them into a shared TOAST heap. The segment size
-defaults to 30,000 rows (configurable via `segment_size` parameter).
+Each segment's compressed blobs are stored in the blob table (one row per
+column per segment). The segment size defaults to 30,000 rows (configurable
+via `segment_size` parameter).
 
-For ClickBench: 100M rows / 30K rows per segment ≈ 3,338 segments total,
-distributed across 5 partitions (~667 segments each).
+## Table Layout
 
-## ClickBench Query Patterns
+### 1. Segment Metadata Table (`<partition>_meta`)
 
-Analysis of all 43 ClickBench queries shows most queries are highly selective
-in which columns they read:
-
-| Columns Referenced | Queries     | Fraction |
-|-------------------|-------------|----------|
-| 1–3 columns       | 21 queries  | 49%      |
-| 4–10 columns      | 20 queries  | 47%      |
-| All columns       | 1 query     | 2%       |
-
-The 10 most-referenced columns (SearchPhrase, EventDate, CounterID, URL,
-UserID, IsRefresh, ResolutionWidth, AdvEngineID, ClientIP, EventTime) account
-for the vast majority of column accesses. Most queries use a small fraction
-of the ~105 available columns.
-
-**Key insight**: The current layout optimizes for reading all columns (single
-row = single heap tuple → sequential TOAST per row). But nearly all real
-queries read a small subset of columns. The layout should optimize for the
-common case: reading one or a few columns across many segments.
-
-## Proposed Layout
-
-Split the current monolithic companion table into two tables per partition:
-
-### 1. Segment Metadata Table
-
-Stores all scalar per-segment metadata. No BYTEA columns, so no TOAST I/O.
+Stores all scalar per-segment metadata. No BYTEA columns, so scanning it
+involves zero TOAST I/O.
 
 ```sql
 CREATE TABLE "_deltax_compressed"."<partition>_meta" (
@@ -161,7 +66,7 @@ CREATE TABLE "_deltax_compressed"."<partition>_meta" (
     _max_<col>    <type>,
 
     -- Per-column sum + nonnull count (numeric types only)
-    _sum_<col>    DOUBLE PRECISION,  -- or NUMERIC
+    _sum_<col>    DOUBLE PRECISION,
     _nonnull_count_<col> INT,
 
     -- Per-column cardinality estimate
@@ -173,14 +78,14 @@ For ClickBench (105 columns): each row is ~2 KB (all small scalars). With
 ~667 segments per partition, the entire metadata table fits in ~1.3 MB. A full
 sequential scan takes <1 ms even on cold storage.
 
-### 2. Column Blob Table
+### 2. Column Blob Table (`<partition>_blobs`)
 
 Stores compressed column data. One row per (column, segment) pair.
 
 ```sql
 CREATE TABLE "_deltax_compressed"."<partition>_blobs" (
     _col_idx     SMALLINT NOT NULL,
-    _segment_id  INT NOT NULL REFERENCES "<partition>_meta"(_segment_id),
+    _segment_id  INT NOT NULL,
     _data        BYTEA,
     PRIMARY KEY (_col_idx, _segment_id)
 );
@@ -192,8 +97,6 @@ chunks in insertion order, this naturally produces a columnar physical layout
 with no post-processing:
 
 ```
-Proposed layout (two tables):
-
 Metadata table (no TOAST, ~1.3 MB):
 ┌──────────────────────────────────────────────────────┐
 │ seg 1: seg_by | _row_count | _min/max_time | min/max │
@@ -225,13 +128,46 @@ Reading one column = sequential I/O on a contiguous ~1/105th slice of the
 TOAST table. The kernel's readahead (128 KB default on Linux) prefetches
 upcoming chunks automatically.
 
+### 3. Bloom Filter Table (`<partition>_blooms`)
+
+Stores per-segment packed bloom filters for equality predicate pushdown.
+Kept in a separate table (rather than inline in meta) to avoid adding TOAST
+overhead to the meta table, which must stay fast for all queries.
+
+```sql
+CREATE TABLE "_deltax_compressed"."<partition>_blooms" (
+    _segment_id  INT PRIMARY KEY,
+    _data        BYTEA NOT NULL
+);
+```
+
+The `_data` column contains a packed binary format with variable-size bloom
+filters for each numeric/date/timestamp column in the segment:
+
+```
+Wire format (repeated per column):
+┌─────────────┬────────────┬───────────┬──────────────────────┐
+│ col_idx: u16 │ num_hashes: u8 │ size: u16 │ bloom_bits: [u8; size] │
+└─────────────┴────────────┴───────────┴──────────────────────┘
+```
+
+**Dynamic sizing**: Bloom filter size scales with `ndistinct` for each
+column: `bloom_size = ndistinct × 10 bits / 8 bytes`, clamped to 64 B – 8 KB.
+The optimal number of hash functions is `k = (m/n) × ln(2)`, clamped to
+[1, 10]. This gives a false positive rate of ~0.8% at ~2-3% storage overhead.
+
+Bloom filters are built during compression for numeric, date, and timestamp
+columns. Building can be disabled via the `pg_deltax.bloom_filters` GUC
+(default: on). The read path gracefully handles missing bloom data — if the
+blooms table doesn't exist, the bloom phase is skipped.
+
 ## Read Path
 
-The read path becomes a two-phase process:
+The read path is a three-phase process in `load_segments_heap`:
 
-### Phase 1: Metadata Scan (unchanged pattern, faster execution)
+### Phase 1: Metadata Scan (zero TOAST I/O)
 
-Scan the metadata table with `heap_getnext()`. Apply pruning:
+Scan the meta table with `heap_getnext()`. Apply pruning:
 
 1. **Segment-by filters**: skip segments with non-matching segment_by values
 2. **Time range filters**: skip segments outside query time range
@@ -241,29 +177,42 @@ Scan the metadata table with `heap_getnext()`. Apply pruning:
 Collect surviving `_segment_id` values into an array. This phase involves
 zero TOAST I/O — the metadata table has no BYTEA columns.
 
-### Phase 2: Column Blob Reads (new, sequential I/O)
+### Bloom Phase: Equality Predicate Pushdown
 
-For each needed column, read blobs from the blob table:
+Only runs when the query has equality (`=`) or `IN` predicates on numeric,
+date, or timestamp columns. Scans the blooms table for surviving segments:
+
+1. Open the blooms table and scan via `scan_getnextslot`
+2. For each row, check if the segment survived Phase 1 (HashSet lookup)
+3. Detoast the packed bloom data, look up the target column's bloom filter
+4. If the bloom filter says the value is definitely not present, mark the
+   segment for pruning
+
+Pruned segments are removed from the surviving set before Phase 2, avoiding
+unnecessary blob I/O.
+
+**Performance**: On ClickBench Q19 (`WHERE UserID = <value>`), bloom filters
+prune ~97.5% of segments, reducing query time from ~8s to ~0.2s.
+
+### Phase 2: Column Blob Reads (sequential TOAST I/O)
+
+For each needed column, read blobs from the blob table via PK index scan:
 
 ```
 For each needed col_idx:
-    Index scan: _col_idx = X AND _segment_id = ANY(surviving_ids)
-    Detoast each blob → sequential TOAST I/O (contiguous region)
+    Index scan: _col_idx = X (scans all segment_ids for this column)
+    For each row: check if segment_id is in surviving set
+    If yes: detoast blob → sequential TOAST I/O (contiguous region)
     Store in SegmentData.compressed_blobs[blob_idx]
 ```
 
 Because blobs were inserted in column-major order, the TOAST chunks for one
 column are contiguous on disk.
 
-**Index scan vs sequential scan**: For columns needed across all segments,
-a sequential scan with `_col_idx = X` filter is optimal. For selective
-queries (many segments pruned), an index scan on the PK is better. The query
-planner handles this automatically.
-
 ### Parallel Workers
 
 The current parallel dispatch pattern is preserved:
-1. Main thread: Phase 1 (metadata) + Phase 2 (blob reads) → `Vec<SegmentData>`
+1. Main thread: Phase 1 + Bloom + Phase 2 → `Vec<SegmentData>`
 2. Dispatch segments to parallel workers for decompression + aggregation
 
 Phase 2 runs on the main thread because `pg_detoast_datum` requires a valid
@@ -274,28 +223,33 @@ so the main thread can saturate the storage bandwidth.
 
 ### During Compression
 
-Compression currently processes one segment at a time (all columns for
-segment 1, then all columns for segment 2, etc.). To achieve column-major
-insertion into the blob table, we buffer compressed blobs in memory and flush
-them after all segments are processed.
+Compression processes one segment at a time (all columns for segment 1, then
+all columns for segment 2, etc.). To achieve column-major insertion into the
+blob table, compressed blobs are buffered in memory and flushed after all
+segments are processed.
 
 ```
-Phase 1: Compress all segments, buffer blobs in memory
+Phase 1: Compress all segments, buffer blobs and blooms
 
 for each batch of 30,000 rows:
     compress all columns → 105 blobs
-    INSERT metadata into meta table immediately
-    buffer compressed blobs in memory (keyed by segment_id)
+    compute bloom filters for numeric/date/timestamp columns
+    INSERT metadata into meta table immediately (returns _segment_id)
+    buffer compressed blobs in memory (keyed by col_idx, segment_id)
+    buffer packed bloom data in memory (keyed by segment_id)
 
 Phase 2: Flush blobs in column-major order
 
-for col_idx in 0..num_cols:
-    for seg_id in segment_order:
-        INSERT INTO blobs (_col_idx, _segment_id, _data)
-        VALUES (col_idx, seg_id, buffered_blob)
+sort blob_buffer by (col_idx, segment_id)
+for each (col_idx, segment_id, blob) in blob_buffer:
+    INSERT INTO blobs (_col_idx, _segment_id, _data)
 
-ANALYZE blobs
-ANALYZE meta
+Phase 3: Flush bloom filters
+
+for each (segment_id, bloom_data) in bloom_buffer:
+    INSERT INTO blooms (_segment_id, _data)
+
+ANALYZE meta, blobs, blooms
 ```
 
 ### Memory Impact
@@ -314,108 +268,11 @@ This is acceptable because:
   segments are compressed, iterate columns and flush each column's blobs,
   freeing them immediately after insertion
 
-## Performance Projections
+### During Decompression
 
-### gp2 EBS (500 GB, ~3000 IOPS, ~250 MB/s sequential)
-
-Projections based on measured data. Current detoast times are from cold runs
-on r7i.4xlarge. Projected times assume sequential reads at ~250 MB/s after
-columnar storage eliminates random I/O.
-
-**Single-column queries:**
-
-| Query | Cols | Current Cold | Measured detoast | Data read | Projected detoast | Projected Total | Speedup |
-|-------|------|-------------|------------------|-----------|-------------------|-----------------|---------|
-| Q7  | 1 | 3.3s  | 3131ms  | ~14MB  | ~56ms  | ~0.2s  | **16×** |
-| Q1  | 1 | 3.7s  | 3119ms  | ~14MB  | ~56ms  | ~0.6s  | **6×** |
-| Q4  | 1 | 15.6s | 10160ms | ~95MB  | ~380ms | ~5.8s  | **3×** |
-| Q5  | 1 | 14.5s | 11319ms | ~95MB  | ~380ms | ~3.6s  | **4×** |
-| Q15 | 1 | 11.5s | 10220ms | ~95MB  | ~380ms | ~1.7s  | **7×** |
-
-**Multi-column queries:**
-
-| Query | Cols | Current Cold | Measured detoast | Projected detoast | Projected Total | Speedup |
-|-------|------|-------------|------------------|-------------------|-----------------|---------|
-| Q9  | 5 | 21.7s | 20452ms | ~400ms  | ~1.6s  | **14×** |
-| Q22 | 5 | 53.4s | 50308ms | ~1000ms | ~4.1s  | **13×** |
-| Q32 | 4 | 36.8s | 27905ms | ~600ms  | ~9.5s  | **4×** |
-| Q33 | 1 | 25.1s | 21673ms | ~380ms  | ~3.8s  | **7×** |
-
-**Filtered queries (segment pruning reduces data):**
-
-| Query | Cols | Current Cold | Measured detoast | Projected Total | Speedup |
-|-------|------|-------------|------------------|-----------------|---------|
-| Q36 | 5 | 0.6s | 494ms  | ~0.2s | **3×** |
-| Q37 | 3 | 0.5s | 399ms  | ~0.1s | **5×** |
-| Q42 | 3 | 0.5s | 380ms  | ~0.2s | **3×** |
-
-**Metadata-only queries (Q0, Q2, Q3, Q6, Q29): no change** — already fast (<0.2s).
-
-### Metadata scan improvement
-
-| Metric              | Current            | Proposed             |
-|---------------------|--------------------|--------------------- |
-| Metadata table size | ~2 MB + TOAST pointers | ~1.3 MB (no TOAST) |
-| Cold metadata scan  | ~15-20ms           | ~5 ms                |
-| Pruning I/O cost    | Essentially free (inline metadata) | Essentially free |
-
-## Implementation Plan
-
-### Step 0: Instrument TOAST I/O timing ✓ DONE
-
-Instrumentation added to `load_segments_heap` in `segments.rs`. Separately
-measures `heap_getnext`, `heap_deform_tuple`, and `pg_detoast_datum` timing,
-plus blob counts (toasted vs inline) and total bytes. The `detoast_us` field
-is propagated through `AggScanState` and surfaced in both logs and EXPLAIN
-ANALYZE output (`[detoast=X.XXX]` in the DeltaX Timing line).
-
-**Key finding**: TOAST I/O accounts for 99%+ of `heap_scan` time on every
-DeltaXAgg query. The companion table heap pages themselves load in ~1-2ms
-per partition. See appendix for full data.
-
-### Step 1: Schema changes in compress.rs
-
-Modify companion table creation (`compress_partition`) to create two tables:
-- `<partition>_meta`: all metadata columns (no BYTEA)
-- `<partition>_blobs`: `(_col_idx, _segment_id, _data)`
-
-Update the INSERT path:
-- Phase 1: compress segments sequentially, INSERT metadata immediately,
-  buffer compressed blobs in memory
-- Phase 2: after all segments are compressed, INSERT blobs in column-major
-  order (`_col_idx` ascending, then `_segment_id` ascending within each column)
-- Run ANALYZE on both tables
-
-### Step 2: Read path changes in segments.rs
-
-Split `load_segments_heap` into two functions:
-
-- `load_segment_metadata(meta_oid, ...)` → scan metadata table, apply
-  pruning, return `(Vec<SegmentMetadata>, skipped, minmax_skipped)` where
-  `SegmentMetadata` contains segment_id, segment_by values, row_count,
-  min/max, sums.
-
-- `load_segment_blobs(blob_oid, segment_ids, needed_cols, col_names, ...)` →
-  read blobs for needed columns for surviving segments. Return blobs indexed
-  by (segment_idx, col_idx).
-
-Assemble `SegmentData` from metadata + blobs.
-
-### Step 3: Update callers in agg.rs and decompress.rs
-
-Update all `load_segments_heap` call sites to use the new two-phase API.
-The callers already separate metadata usage from blob usage, so the
-refactoring is mechanical.
-
-### Step 4: Catalog changes
-
-Update `catalog.rs` to track both table OIDs (meta + blobs) per partition.
-Update `deltax_partition_info` to report the new schema.
-
-### Step 5: Decompression/cleanup path
-
-Update `deltax_decompress_partition` to drop both tables.
-Update the background worker's `drop_after` logic if applicable.
+`deltax_decompress_partition` reads from all three tables (meta for segment
+metadata, blobs for column data) and drops all three tables after restoring
+data to the original partition.
 
 ## Alternatives Considered
 
@@ -449,6 +306,13 @@ Would give full control over I/O layout but breaks PostgreSQL replication,
 pg_dump, and crash recovery. Incompatible with the requirement that standard
 PostgreSQL replication must work.
 
+### Bloom filters inline in meta table
+The initial implementation stored packed bloom data as a `_blooms BYTEA`
+column in the meta table. This caused 5-15% regression on all queries because
+the meta table rows became TOAST-heavy — even queries with no equality
+predicates paid the cost of larger heap pages. Moving blooms to a separate
+table keeps the meta table TOAST-free.
+
 ## Open Questions
 
 1. **TOAST chunk size**: PostgreSQL's default TOAST chunk size is ~2000 bytes.
@@ -470,18 +334,69 @@ PostgreSQL replication must work.
    re-guarantee ordering (e.g., after a pg_dump/restore), we could add a
    `CLUSTER` as a repair step.
 
-4. **Backward compatibility**: Existing compressed partitions use the old
-   single-table layout. We need a migration path or version flag to handle
-   both layouts during the transition period.
+## Appendix: Motivation — TOAST I/O Analysis
 
-## Appendix: Full Cold Run Measurements
+The columnar layout was motivated by measuring TOAST I/O overhead with the
+original single companion table design. In that design, all compressed column
+blobs (~105 BYTEA columns) were stored in one row per segment. PostgreSQL
+TOASTed these blobs into a shared TOAST heap where chunks from different
+columns were interleaved in insertion order.
+
+```
+Original single-table layout:
+┌──────────────────────────────────────────────────────────────────────┐
+│ Row 1: seg_by | _row_count | _min/max_time | _min/max_col0..104 |  │
+│        _col0_compressed (BYTEA→TOAST) | ... | _col104_compressed   │
+├──────────────────────────────────────────────────────────────────────┤
+│ Row 2: ... same 105 BYTEA blobs, all TOASTed ...                   │
+├──────────────────────────────────────────────────────────────────────┤
+│ ...                                                                 │
+└──────────────────────────────────────────────────────────────────────┘
+
+TOAST heap (physical disk order = insertion order):
+┌─────────────────────────────────────────────────────────┐
+│ seg1_col0 | seg1_col1 | ... | seg1_col104 |            │  ← all cols
+│ seg2_col0 | seg2_col1 | ... | seg2_col104 |            │    interleaved
+│ ...                                                     │
+│ seg667_col0 | seg667_col1 | ... | seg667_col104 |      │
+└─────────────────────────────────────────────────────────┘
+  ↑ Reading AdvEngineID = every 105th blob = random I/O
+```
+
+When a query needed only one column, PostgreSQL detoasted that column's blob
+from each segment independently. Because the chunks for one column were
+scattered across the entire TOAST table, the I/O pattern was random.
+
+**Measured on gp2 EBS (ClickBench 100M rows, r7i.4xlarge, cold cache):**
+
+We instrumented `load_segments_heap` to separately measure `heap_getnext`
+(reading companion table heap pages), `heap_deform_tuple` (extracting
+datums), and `pg_detoast_datum` (TOAST I/O). Results across all 43 queries:
+
+- **`heap_getnext` + `heap_deform_tuple`**: ~1-2ms per partition — negligible
+- **`pg_detoast_datum`**: 99-100% of `heap_scan` time for every DeltaXAgg query
+- **All blobs were TOASTed** (0 inline blobs observed)
+
+Example queries:
+
+| Query | Columns | Cold Total | detoast | detoast % of total |
+|-------|---------|------------|---------|-------------------|
+| Q7    | 1       | 3.3s       | 3131ms  | 96%               |
+| Q21   | 3       | 30.1s      | 28679ms | 95%               |
+| Q22   | 5       | 53.4s      | 50308ms | 94%               |
+| Q32   | 4       | 36.8s      | 27905ms | 76%               |
+
+The entire cold-run bottleneck was TOAST random I/O. The median detoast % of
+total execution time across DeltaXAgg queries was **86%**.
+
+### Full Cold Run Measurements (Original Layout)
 
 Measured on r7i.4xlarge, gp2 500GB EBS, ClickBench 100M rows, PostgreSQL 18.
 Each query run after `systemctl restart postgresql && echo 3 > /proc/sys/vm/drop_caches`.
 
 Sorted by detoast % of total execution time (descending).
 
-### DeltaXAgg Path (32 queries — detoast instrumented)
+#### DeltaXAgg Path (32 queries)
 
 | Query | Total (s) | heap_scan (ms) | detoast (ms) | detoast % of heap_scan | detoast % of total | Description |
 |-------|-----------|----------------|--------------|------------------------|--------------------|-------------|
@@ -518,7 +433,7 @@ Sorted by detoast % of total execution time (descending).
 | Q28 | 33.1 | 20788 | 20761 | 100% | 63% | REGEXP_REPLACE(Referer), AVG(length), HAVING >100K |
 | Q35 | 32.6 | 9310 | 9284 | 100% | 29% | ClientIP expressions, COUNT(*) (agg-heavy) |
 
-### DeltaXAgg — Sum/Count Pushdown (3 queries — no TOAST, uses metadata only)
+#### DeltaXAgg — Sum/Count Pushdown (3 queries — no TOAST, metadata only)
 
 | Query | Total (s) | heap_scan (ms) | Description |
 |-------|-----------|----------------|-------------|
@@ -526,14 +441,14 @@ Sorted by detoast % of total execution time (descending).
 | Q3 | 0.1 | 99 | AVG(UserID) |
 | Q29 | 0.2 | 101 | 90 × SUM(ResolutionWidth + N) |
 
-### DeltaXCount / DeltaXMinMax (2 queries — metadata only)
+#### DeltaXCount / DeltaXMinMax (2 queries — metadata only)
 
 | Query | Total (s) | heap_scan (ms) | Description |
 |-------|-----------|----------------|-------------|
 | Q0 | 0.1 | 82 | COUNT(*) |
 | Q6 | 0.1 | 100 | MIN(EventDate), MAX(EventDate) |
 
-### DeltaXDecompress Path (6 queries — detoast not yet instrumented separately)
+#### DeltaXDecompress Path (6 queries)
 
 | Query | Total (s) | heap_scan (ms) | Description |
 |-------|-----------|----------------|-------------|
@@ -543,11 +458,3 @@ Sorted by detoast % of total execution time (descending).
 | Q25 | 16.9 | 11335 | WHERE SearchPhrase <> '' ORDER BY SearchPhrase LIMIT 10 |
 | Q26 | 0.3 | 239 | WHERE SearchPhrase <> '' ORDER BY EventTime, SearchPhrase LIMIT 10 |
 | Q39 | 1.8 | 922 | Filtered: CounterID=62, CASE expression, multi-GROUP BY |
-
-### Summary
-
-- **32 of 43 queries** go through DeltaXAgg and have detoast instrumentation
-- Of those, **29 queries** spend 63-98% of total execution time in TOAST I/O
-- Only 3 queries (Q2, Q3, Q29) avoid TOAST entirely via sum/count pushdown
-- The median detoast % of total is **86%**
-- Total cold-run time across all 43 queries: **~636s**, of which **~520s** is TOAST I/O
