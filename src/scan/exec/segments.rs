@@ -456,9 +456,6 @@ pub(super) unsafe fn load_segments_heap(
             }
         }
 
-        // Discover _blooms attno for bloom filter pruning
-        let blooms_attno = attno_map.get("_blooms").copied();
-
         // Build min/max predicate filters from batch quals
         let mut minmax_filters: Vec<MinMaxFilter> = Vec::new();
         for bq in batch_quals {
@@ -538,42 +535,40 @@ pub(super) unsafe fn load_segments_heap(
             hashes: Vec<u64>,
         }
         let mut bloom_checks: Vec<BloomCheck> = Vec::new();
-        if blooms_attno.is_some() {
-            for bq in batch_quals {
-                match bq.op {
-                    BatchCompareOp::Eq | BatchCompareOp::InList => {}
-                    _ => continue,
-                }
-                match bq.type_oid {
-                    pg_sys::INT2OID | pg_sys::INT4OID | pg_sys::INT8OID
-                    | pg_sys::FLOAT4OID | pg_sys::FLOAT8OID
-                    | pg_sys::DATEOID | pg_sys::TIMESTAMPOID | pg_sys::TIMESTAMPTZOID => {}
-                    _ => continue,
-                }
-                let col_name = &col_names[bq.col_idx];
-                if segment_by.contains(col_name) {
+        for bq in batch_quals {
+            match bq.op {
+                BatchCompareOp::Eq | BatchCompareOp::InList => {}
+                _ => continue,
+            }
+            match bq.type_oid {
+                pg_sys::INT2OID | pg_sys::INT4OID | pg_sys::INT8OID
+                | pg_sys::FLOAT4OID | pg_sys::FLOAT8OID
+                | pg_sys::DATEOID | pg_sys::TIMESTAMPOID | pg_sys::TIMESTAMPTZOID => {}
+                _ => continue,
+            }
+            let col_name = &col_names[bq.col_idx];
+            if segment_by.contains(col_name) {
+                continue;
+            }
+            let ci = match col_idx_map[bq.col_idx] {
+                Some(ci) => ci,
+                None => continue,
+            };
+            let hashes = if bq.op == BatchCompareOp::InList {
+                if let Some(ref vals) = bq.in_list_i64 {
+                    vals.iter().map(|&v| crate::bloom::hash_datum_i64(v)).collect()
+                } else {
                     continue;
                 }
-                let ci = match col_idx_map[bq.col_idx] {
-                    Some(ci) => ci,
-                    None => continue,
+            } else {
+                let val_i64 = match bq.type_oid {
+                    pg_sys::FLOAT4OID => (bq.const_datum.value() as u32) as i64,
+                    pg_sys::FLOAT8OID => bq.const_datum.value() as i64,
+                    _ => bq.const_datum.value() as i64,
                 };
-                let hashes = if bq.op == BatchCompareOp::InList {
-                    if let Some(ref vals) = bq.in_list_i64 {
-                        vals.iter().map(|&v| crate::bloom::hash_datum_i64(v)).collect()
-                    } else {
-                        continue;
-                    }
-                } else {
-                    let val_i64 = match bq.type_oid {
-                        pg_sys::FLOAT4OID => (bq.const_datum.value() as u32) as i64,
-                        pg_sys::FLOAT8OID => bq.const_datum.value() as i64,
-                        _ => bq.const_datum.value() as i64,
-                    };
-                    vec![crate::bloom::hash_datum_i64(val_i64)]
-                };
-                bloom_checks.push(BloomCheck { col_idx: ci, hashes });
-            }
+                vec![crate::bloom::hash_datum_i64(val_i64)]
+            };
+            bloom_checks.push(BloomCheck { col_idx: ci, hashes });
         }
         let mut segments_bloom_skipped: u64 = 0;
 
@@ -674,44 +669,7 @@ pub(super) unsafe fn load_segments_heap(
                 }
             }
 
-            // Bloom filter pruning: check _blooms column for Eq/InList predicates
-            if !bloom_checks.is_empty()
-                && let Some(blooms_att) = blooms_attno
-                && !nulls[blooms_att]
-            {
-                // Detoast the _blooms BYTEA (only for segments surviving minmax)
-                let blooms_datum = values[blooms_att];
-                let detoasted = pg_sys::pg_detoast_datum(
-                    blooms_datum.cast_mut_ptr::<pg_sys::varlena>()
-                );
-                let data_ptr = pgrx::vardata_any(detoasted);
-                let data_len = pgrx::varsize_any_exhdr(detoasted);
-                #[allow(clippy::unnecessary_cast)]
-                let bloom_bytes = std::slice::from_raw_parts(data_ptr as *const u8, data_len);
-
-                let mut bloom_skip = false;
-                for bc in &bloom_checks {
-                    if let Some(bf) = crate::bloom::lookup_packed_bloom(bloom_bytes, bc.col_idx) {
-                        let any_match = bc.hashes.iter().any(|&h| bf.might_contain(h));
-                        if !any_match {
-                            bloom_skip = true;
-                            break;
-                        }
-                    }
-                }
-
-                if detoasted != blooms_datum.cast_mut_ptr::<pg_sys::varlena>() {
-                    pg_sys::pfree(detoasted as *mut _);
-                }
-
-                if bloom_skip {
-                    segments_skipped += 1;
-                    segments_bloom_skipped += 1;
-                    continue;
-                }
-            }
-
-            // --- Segment survived pruning ---
+            // --- Segment survived minmax pruning ---
 
             // Extract per-column min/max
             let mut col_minmax = HashMap::new();
@@ -759,6 +717,125 @@ pub(super) unsafe fn load_segments_heap(
         // End meta scan
         (*(*rel).rd_tableam).scan_end.unwrap()(scan);
         pg_sys::table_close(rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+
+        // ================================================================
+        // Bloom phase: scan separate blooms table to prune surviving segments
+        // ================================================================
+        if !bloom_checks.is_empty() && !segments.is_empty() {
+            let meta_name_ptr = pg_sys::get_rel_name(meta_oid);
+            let meta_name_str = std::ffi::CStr::from_ptr(meta_name_ptr)
+                .to_string_lossy()
+                .into_owned();
+            let meta_ns_oid = pg_sys::get_rel_namespace(meta_oid);
+            let partition_name = meta_name_str.strip_suffix("_meta").unwrap_or(&meta_name_str);
+            let blooms_name = format!("{}_blooms", partition_name);
+            let blooms_cname = std::ffi::CString::new(blooms_name).unwrap();
+            let blooms_oid = pg_sys::get_relname_relid(blooms_cname.as_ptr(), meta_ns_oid);
+
+            if blooms_oid != pg_sys::InvalidOid {
+                // Build set of surviving segment_ids for quick lookup
+                let surviving_set: std::collections::HashSet<i32> =
+                    surviving_segment_ids.iter().copied().collect();
+
+                let blooms_rel = pg_sys::table_open(blooms_oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+                let blooms_tupdesc = (*blooms_rel).rd_att;
+                let blooms_natts = (*blooms_tupdesc).natts as usize;
+
+                // Find _segment_id and _data attnos
+                let mut seg_id_att: Option<usize> = None;
+                let mut data_att: Option<usize> = None;
+                for i in 0..blooms_natts {
+                    let attr = &*tupdesc_get_attr(blooms_tupdesc, i);
+                    let name = std::ffi::CStr::from_ptr(attr.attname.data.as_ptr())
+                        .to_string_lossy();
+                    if name == "_segment_id" { seg_id_att = Some(i); }
+                    if name == "_data" { data_att = Some(i); }
+                }
+
+                if let (Some(sid_att), Some(dat_att)) = (seg_id_att, data_att) {
+                    let snapshot = pg_sys::GetActiveSnapshot();
+                    let blooms_flags: u32 = pg_sys::ScanOptions::SO_TYPE_SEQSCAN
+                        | pg_sys::ScanOptions::SO_ALLOW_STRAT
+                        | pg_sys::ScanOptions::SO_ALLOW_SYNC
+                        | pg_sys::ScanOptions::SO_ALLOW_PAGEMODE;
+                    let blooms_scan = (*(*blooms_rel).rd_tableam).scan_begin.unwrap()(
+                        blooms_rel, snapshot, 0, std::ptr::null_mut(), std::ptr::null_mut(),
+                        blooms_flags,
+                    );
+
+                    // Use a TupleTableSlot for safe access to buffer-resident tuples
+                    let slot = pg_sys::table_slot_create(blooms_rel, std::ptr::null_mut());
+                    let mut bloom_pruned_ids: std::collections::HashSet<i32> = std::collections::HashSet::new();
+
+                    loop {
+                        let got_tuple = (*(*blooms_rel).rd_tableam).scan_getnextslot.unwrap()(
+                            blooms_scan,
+                            pg_sys::ScanDirection::ForwardScanDirection,
+                            slot,
+                        );
+                        if !got_tuple { break; }
+
+                        pg_sys::slot_getallattrs(slot);
+                        let tts_values = (*slot).tts_values;
+                        let tts_isnull = (*slot).tts_isnull;
+
+                        if *tts_isnull.add(sid_att) || *tts_isnull.add(dat_att) { continue; }
+                        let seg_id = (*tts_values.add(sid_att)).value() as i32;
+
+                        // Only check segments that survived Phase 1
+                        if !surviving_set.contains(&seg_id) { continue; }
+
+                        // Detoast bloom data
+                        let varlena_ptr = (*tts_values.add(dat_att)).cast_mut_ptr::<pg_sys::varlena>();
+                        let detoasted = pg_sys::pg_detoast_datum(varlena_ptr);
+                        let data_ptr = pgrx::vardata_any(detoasted);
+                        let data_len = pgrx::varsize_any_exhdr(detoasted);
+                        #[allow(clippy::unnecessary_cast)]
+                        let bloom_bytes = std::slice::from_raw_parts(data_ptr as *const u8, data_len);
+
+                        let mut skip = false;
+                        for bc in &bloom_checks {
+                            if let Some(bf) = crate::bloom::lookup_packed_bloom(bloom_bytes, bc.col_idx)
+                                && !bc.hashes.iter().any(|&h| bf.might_contain(h))
+                            {
+                                skip = true;
+                                break;
+                            }
+                        }
+
+                        if detoasted != varlena_ptr {
+                            pg_sys::pfree(detoasted as *mut _);
+                        }
+
+                        if skip {
+                            bloom_pruned_ids.insert(seg_id);
+                        }
+                    }
+
+                    pg_sys::ExecDropSingleTupleTableSlot(slot);
+                    (*(*blooms_rel).rd_tableam).scan_end.unwrap()(blooms_scan);
+
+                    // Remove bloom-pruned segments (segments and surviving_segment_ids are parallel)
+                    if !bloom_pruned_ids.is_empty() {
+                        let before = segments.len();
+                        let mut i = 0;
+                        while i < segments.len() {
+                            if bloom_pruned_ids.contains(&surviving_segment_ids[i]) {
+                                segments.swap_remove(i);
+                                surviving_segment_ids.swap_remove(i);
+                            } else {
+                                i += 1;
+                            }
+                        }
+                        let pruned = before - segments.len();
+                        segments_skipped += pruned as u64;
+                        segments_bloom_skipped += pruned as u64;
+                    }
+                }
+
+                pg_sys::table_close(blooms_rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+            }
+        }
 
         pgrx::log!(
             "load_segments_heap phase1: segments={} skipped={} (minmax={} bloom={}) heap_getnext={:.1}ms deform={:.1}ms",

@@ -272,7 +272,6 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
         }
     }
     meta_cols.push("_row_count INT".to_string());
-    meta_cols.push("_blooms BYTEA".to_string());
 
     let meta_ddl = format!(
         "CREATE TABLE {} ({})",
@@ -284,6 +283,13 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
     let blobs_ddl = format!(
         "CREATE TABLE {} (_col_idx SMALLINT NOT NULL, _segment_id INT NOT NULL, _data BYTEA, PRIMARY KEY (_col_idx, _segment_id))",
         blobs_fqn
+    );
+
+    // Blooms table: per-segment packed bloom filters, separate from meta to avoid TOAST overhead
+    let blooms_fqn = format!("\"{}\".\"{}_blooms\"", companion_schema, part_table);
+    let blooms_ddl = format!(
+        "CREATE TABLE {} (_segment_id INT PRIMARY KEY, _data BYTEA NOT NULL)",
+        blooms_fqn
     );
     // NOTE: table creation is deferred until we confirm data exists.
     // Creating it early would cause the scan hook to intercept queries on the partition
@@ -299,8 +305,10 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
         &part_fqn,
         &meta_fqn,
         &blobs_fqn,
+        &blooms_fqn,
         &meta_ddl,
         &blobs_ddl,
+        &blooms_ddl,
         &columns,
         &ht.order_by,
         &ht.segment_by,
@@ -315,6 +323,9 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
         client
             .update(&format!("DROP TABLE IF EXISTS {}", blobs_fqn), None, &[])
             .expect("failed to drop empty blobs table");
+        client
+            .update(&format!("DROP TABLE IF EXISTS {}", blooms_fqn), None, &[])
+            .expect("failed to drop empty blooms table");
         return format!("Partition {}.{} has no rows to compress", schema, part_table);
     }
 
@@ -620,7 +631,8 @@ fn flush_segment_metadata(
     ndistinct_values: &[i64],
     row_count: u32,
     segment_id: i32,
-) -> (i64, Vec<(u16, Vec<u8>)>) {
+) -> (i64, Vec<(u16, Vec<u8>)>, Vec<u8>) {
+    // Returns (compressed_size, blobs, bloom_data)
     // Compress each non-segment column, collect blobs for caller
     let mut blobs: Vec<(u16, Vec<u8>)> = Vec::new(); // (col_idx, compressed_data)
     let mut col_minmax: std::collections::HashMap<String, (Option<String>, Option<String>)> =
@@ -729,20 +741,12 @@ fn flush_segment_metadata(
     insert_cols.push("_row_count".to_string());
     insert_vals.push(row_count.to_string());
 
-    // Compute and insert packed bloom filters (if enabled via GUC)
+    // Compute packed bloom filters (if enabled via GUC) — stored separately
     let bloom_data = if crate::BLOOM_FILTERS.get() {
         compute_segment_blooms(typed_cols, columns, ndistinct_values)
     } else {
         Vec::new()
     };
-    insert_cols.push("_blooms".to_string());
-    if bloom_data.is_empty() {
-        insert_vals.push("NULL".to_string());
-    } else {
-        // Encode as hex bytea literal: E'\\x...'
-        let hex: String = bloom_data.iter().map(|b| format!("{:02x}", b)).collect();
-        insert_vals.push(format!("E'\\\\x{}'", hex));
-    }
 
     let insert_sql = format!(
         "INSERT INTO {} ({}) VALUES ({})",
@@ -754,7 +758,7 @@ fn flush_segment_metadata(
         .update(&insert_sql, None, &[])
         .expect("failed to insert segment metadata");
 
-    (total_size, blobs)
+    (total_size, blobs, bloom_data)
 }
 
 /// Slice a TypedColumn to a sub-range [start..end).
@@ -882,7 +886,7 @@ fn compute_segment_blooms(
 }
 
 /// Flush typed column data, splitting into segment_size chunks if needed.
-/// Returns (compressed_size, blobs) where blobs are buffered for column-major insertion.
+/// Returns compressed_size. Blobs and blooms are buffered for batch insertion.
 fn flush_with_splitting(
     client: &mut SpiClient,
     meta_fqn: &str,
@@ -893,6 +897,7 @@ fn flush_with_splitting(
     segment_size: usize,
     next_segment_id: &mut i32,
     blob_buffer: &mut Vec<(u16, i32, Vec<u8>)>,
+    bloom_buffer: &mut Vec<(i32, Vec<u8>)>,
 ) -> i64 {
     let mut total_size = 0i64;
     let mut offset = 0;
@@ -903,11 +908,14 @@ fn flush_with_splitting(
         *next_segment_id += 1;
         if offset == 0 && chunk_end == total_rows {
             let ndistinct = compute_segment_ndistinct(typed_cols, columns);
-            let (size, blobs) =
+            let (size, blobs, bloom_data) =
                 flush_segment_metadata(client, meta_fqn, columns, typed_cols, seg_values, &ndistinct, chunk_rows, seg_id);
             total_size += size;
             for (col_idx, blob) in blobs {
                 blob_buffer.push((col_idx, seg_id, blob));
+            }
+            if !bloom_data.is_empty() {
+                bloom_buffer.push((seg_id, bloom_data));
             }
         } else {
             let chunk_cols: Vec<TypedColumn> = typed_cols
@@ -915,11 +923,14 @@ fn flush_with_splitting(
                 .map(|tc| slice_typed_column(tc, offset, chunk_end))
                 .collect();
             let ndistinct = compute_segment_ndistinct(&chunk_cols, columns);
-            let (size, blobs) =
+            let (size, blobs, bloom_data) =
                 flush_segment_metadata(client, meta_fqn, columns, &chunk_cols, seg_values, &ndistinct, chunk_rows, seg_id);
             total_size += size;
             for (col_idx, blob) in blobs {
                 blob_buffer.push((col_idx, seg_id, blob));
+            }
+            if !bloom_data.is_empty() {
+                bloom_buffer.push((seg_id, bloom_data));
             }
         }
         offset = chunk_end;
@@ -941,8 +952,10 @@ fn compress_partition_streaming(
     part_fqn: &str,
     meta_fqn: &str,
     blobs_fqn: &str,
+    blooms_fqn: &str,
     meta_ddl: &str,
     blobs_ddl: &str,
+    blooms_ddl: &str,
     columns: &[ColumnMeta],
     order_by: &[String],
     segment_by: &[String],
@@ -1021,6 +1034,7 @@ fn compress_partition_streaming(
     let mut meta_created = false;
     let mut next_segment_id: i32 = 1;
     let mut blob_buffer: Vec<(u16, i32, Vec<u8>)> = Vec::new(); // (col_idx, segment_id, blob)
+    let mut bloom_buffer: Vec<(i32, Vec<u8>)> = Vec::new(); // (segment_id, packed_bloom_data)
 
     loop {
         let result = client
@@ -1067,6 +1081,7 @@ fn compress_partition_streaming(
                             segment_size,
                             &mut next_segment_id,
                             &mut blob_buffer,
+                            &mut bloom_buffer,
                         );
                         typed_cols = init_typed_columns(columns, &kinds);
                         rows_in_segment = 0;
@@ -1092,7 +1107,7 @@ fn compress_partition_streaming(
                 let seg_id = next_segment_id;
                 next_segment_id += 1;
                 let ndistinct = compute_segment_ndistinct(&typed_cols, columns);
-                let (size, blobs) = flush_segment_metadata(
+                let (size, blobs, bloom_data) = flush_segment_metadata(
                     client,
                     meta_fqn,
                     columns,
@@ -1105,6 +1120,9 @@ fn compress_partition_streaming(
                 total_compressed_size += size;
                 for (col_idx, blob) in blobs {
                     blob_buffer.push((col_idx, seg_id, blob));
+                }
+                if !bloom_data.is_empty() {
+                    bloom_buffer.push((seg_id, bloom_data));
                 }
                 typed_cols = init_typed_columns(columns, &kinds);
                 rows_in_segment = 0;
@@ -1140,6 +1158,7 @@ fn compress_partition_streaming(
             segment_size,
             &mut next_segment_id,
             &mut blob_buffer,
+            &mut bloom_buffer,
         );
     }
 
@@ -1170,7 +1189,29 @@ fn compress_partition_streaming(
                 .expect("failed to insert blob");
         }
 
-        // ANALYZE both tables for planner statistics
+        // Flush bloom filters into separate blooms table
+        if !bloom_buffer.is_empty() {
+            client.update(blooms_ddl, None, &[]).expect("failed to create blooms table");
+            for (seg_id, bloom_data) in bloom_buffer {
+                use pgrx::datum::DatumWithOid;
+                let insert_sql = format!(
+                    "INSERT INTO {} (_segment_id, _data) VALUES ($1, $2)",
+                    blooms_fqn
+                );
+                let args: Vec<DatumWithOid> = vec![
+                    seg_id.into(),
+                    DatumWithOid::from(bloom_data),
+                ];
+                client
+                    .update(&insert_sql, None, &args)
+                    .expect("failed to insert bloom data");
+            }
+            client
+                .update(&format!("ANALYZE {}", blooms_fqn), None, &[])
+                .expect("failed to analyze blooms table");
+        }
+
+        // ANALYZE meta and blobs tables for planner statistics
         client
             .update(&format!("ANALYZE {}", meta_fqn), None, &[])
             .expect("failed to analyze meta table");
@@ -1455,6 +1496,7 @@ fn decompress_partition_inner(client: &mut SpiClient, partition: &str) -> String
     let companion_schema = "_deltax_compressed";
     let meta_fqn = format!("\"{}\".\"{}_meta\"", companion_schema, part_table);
     let blobs_fqn = format!("\"{}\".\"{}_blobs\"", companion_schema, part_table);
+    let blooms_fqn = format!("\"{}\".\"{}_blooms\"", companion_schema, part_table);
     let part_fqn = crate::partition::fqn(&schema, &part_table);
 
     // 3. Read compressed segments from meta + blobs tables
@@ -1608,10 +1650,13 @@ fn decompress_partition_inner(client: &mut SpiClient, partition: &str) -> String
         total_rows_restored += segment_row_count as i64;
     }
 
-    // 4. Drop meta + blobs tables
+    // 4. Drop meta + blobs + blooms tables
     client
         .update(&format!("DROP TABLE IF EXISTS {}", blobs_fqn), None, &[])
         .expect("failed to drop blobs table");
+    client
+        .update(&format!("DROP TABLE IF EXISTS {}", blooms_fqn), None, &[])
+        .expect("failed to drop blooms table");
     client
         .update(&format!("DROP TABLE IF EXISTS {}", meta_fqn), None, &[])
         .expect("failed to drop meta table");
