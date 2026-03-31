@@ -619,9 +619,13 @@ fn apply_permutation<T: Clone>(v: &mut Vec<T>, perm: &[usize]) {
     *v = reordered;
 }
 
+/// Return type for flush_segment_metadata: (compressed_size, column blobs, bloom data).
+type FlushResult = (i64, Vec<(u16, Vec<u8>)>, Vec<u8>);
+
 /// Compress accumulated typed column data and INSERT metadata into the meta table.
 /// Returns (compressed_size, vec of (col_idx, compressed_blob)) — blobs are NOT inserted,
 /// they are returned for column-major buffering by the caller.
+#[allow(clippy::too_many_arguments)]
 fn flush_segment_metadata(
     client: &mut SpiClient,
     meta_fqn: &str,
@@ -631,7 +635,7 @@ fn flush_segment_metadata(
     ndistinct_values: &[i64],
     row_count: u32,
     segment_id: i32,
-) -> (i64, Vec<(u16, Vec<u8>)>, Vec<u8>) {
+) -> FlushResult {
     // Returns (compressed_size, blobs, bloom_data)
     // Compress each non-segment column, collect blobs for caller
     let mut blobs: Vec<(u16, Vec<u8>)> = Vec::new(); // (col_idx, compressed_data)
@@ -859,7 +863,7 @@ fn compute_segment_blooms(
             }
             TypedColumn::Int64(v) => {
                 for x in v.iter().flatten() {
-                    bf.insert(hash_datum_i64(*x as i64));
+                    bf.insert(hash_datum_i64(*x));
                 }
             }
             TypedColumn::Float32(v) => {
@@ -887,6 +891,7 @@ fn compute_segment_blooms(
 
 /// Flush typed column data, splitting into segment_size chunks if needed.
 /// Returns compressed_size. Blobs and blooms are buffered for batch insertion.
+#[allow(clippy::too_many_arguments)]
 fn flush_with_splitting(
     client: &mut SpiClient,
     meta_fqn: &str,

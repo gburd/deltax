@@ -152,17 +152,21 @@ pub unsafe extern "C-unwind" fn explain_agg_scan(
             if !state_ptr.is_null() {
                 let state = &*state_ptr;
                 let total_ms =
-                    (state.metadata_us + state.heap_scan_us + state.decompress_us + state.agg_us)
+                    (state.metadata_us + state.heap_scan_us + state.decompress_us + state.agg_us
+                     + state.merge_us + state.finalize_us + state.topn_select_us)
                         as f64 / 1000.0;
 
                 let timing_str = std::ffi::CString::new(format!(
-                    "{:.3} ms (metadata={:.3} heap_scan={:.3} [detoast={:.3}] decompress={:.3} agg={:.3})",
+                    "{:.3} ms (metadata={:.3} heap_scan={:.3} [detoast={:.3}] decompress={:.3} agg={:.3} merge={:.3} finalize={:.3} topn_select={:.3})",
                     total_ms,
                     state.metadata_us as f64 / 1000.0,
                     state.heap_scan_us as f64 / 1000.0,
                     state.detoast_us as f64 / 1000.0,
                     state.decompress_us as f64 / 1000.0,
                     state.agg_us as f64 / 1000.0,
+                    state.merge_us as f64 / 1000.0,
+                    state.finalize_us as f64 / 1000.0,
+                    state.topn_select_us as f64 / 1000.0,
                 ))
                 .unwrap();
                 pg_sys::ExplainPropertyText(

@@ -45,7 +45,7 @@ fn optimal_k(num_bits: usize, ndistinct: usize) -> u8 {
 /// Compute bloom filter size in bytes for a given ndistinct.
 pub fn bloom_size_for_ndistinct(ndistinct: usize) -> usize {
     let bits = ndistinct.saturating_mul(BITS_PER_ELEMENT);
-    let bytes = (bits + 7) / 8;
+    let bytes = bits.div_ceil(8);
     bytes.clamp(MIN_BLOOM_BYTES, MAX_BLOOM_BYTES)
 }
 
@@ -92,8 +92,8 @@ impl BloomFilter {
         let h1 = (hash >> 32) as u32;
         let h2 = hash as u32;
         let k = self.num_hashes as usize;
-        for i in 0..k {
-            out[i] = h1.wrapping_add(h2.wrapping_mul(i as u32)) as usize % num_bits;
+        for (i, slot) in out[..k].iter_mut().enumerate() {
+            *slot = h1.wrapping_add(h2.wrapping_mul(i as u32)) as usize % num_bits;
         }
         k
     }

@@ -85,6 +85,7 @@ thread_local! {
 }
 
 /// Add a DeltaXDecompress custom path to the relation's pathlist.
+#[allow(clippy::too_many_arguments)]
 pub unsafe fn add_decompress_path(
     _root: *mut pg_sys::PlannerInfo,
     rel: *mut pg_sys::RelOptInfo,
@@ -1360,6 +1361,7 @@ thread_local! {
 ///
 /// This replaces the Append node with a single CustomScan that internally
 /// iterates all compressed companion tables.
+#[allow(clippy::too_many_arguments)]
 pub unsafe fn add_deltax_append_path(
     _root: *mut pg_sys::PlannerInfo,
     rel: *mut pg_sys::RelOptInfo,
