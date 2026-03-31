@@ -78,9 +78,10 @@ static CUSTOM_SCAN_METHODS: SyncStatic<pg_sys::CustomScanMethods> =
     });
 
 // Thread-local to pass Top-N info from add_decompress_path to plan_custom_path.
-// Stored as (effective_limit, sort_ascending, multi_col_sort).
+// Stored as (effective_limit, sort_ascending, multi_col_sort, sort_col_attno).
+// sort_col_attno is 1-based PG attribute number of the ORDER BY column.
 thread_local! {
-    static TOPN_INFO: std::cell::Cell<(i64, bool, bool)> = const { std::cell::Cell::new((0, true, false)) };
+    static TOPN_INFO: std::cell::Cell<(i64, bool, bool, i32)> = const { std::cell::Cell::new((0, true, false, 0)) };
 }
 
 /// Add a DeltaXDecompress custom path to the relation's pathlist.
@@ -92,6 +93,7 @@ pub unsafe fn add_decompress_path(
     effective_limit: i64,
     sort_ascending: bool,
     multi_col_sort: bool,
+    sort_col_attno: i32,
 ) {
     unsafe {
         let cpath =
@@ -120,11 +122,10 @@ pub unsafe fn add_decompress_path(
         (*cpath).methods = &CUSTOM_PATH_METHODS.0;
 
         // Store Top-N info for plan_custom_path.
-        // Caller already validated that ORDER BY matches the time column.
         if effective_limit > 0 {
-            TOPN_INFO.with(|cell| cell.set((effective_limit, sort_ascending, multi_col_sort)));
+            TOPN_INFO.with(|cell| cell.set((effective_limit, sort_ascending, multi_col_sort, sort_col_attno)));
         } else {
-            TOPN_INFO.with(|cell| cell.set((0, true, false)));
+            TOPN_INFO.with(|cell| cell.set((0, true, false, 0)));
         }
 
         // Clear existing paths — the partition is truncated so any SeqScan
@@ -188,13 +189,14 @@ pub unsafe extern "C-unwind" fn plan_custom_path(
             }
         }
 
-        // Append Top-N info: [-2, effective_limit, sort_ascending_flag, multi_col_sort_flag]
-        let (effective_limit, sort_ascending, multi_col_sort) = TOPN_INFO.with(|cell| cell.replace((0, true, false)));
+        // Append Top-N info: [-2, effective_limit, sort_ascending_flag, multi_col_sort_flag, sort_col_attno]
+        let (effective_limit, sort_ascending, multi_col_sort, sort_col_attno) = TOPN_INFO.with(|cell| cell.replace((0, true, false, 0)));
         if effective_limit > 0 {
             private_list = pg_sys::lappend_int(private_list, -2);
             private_list = pg_sys::lappend_int(private_list, effective_limit as i32);
             private_list = pg_sys::lappend_int(private_list, if sort_ascending { 1 } else { 0 });
             private_list = pg_sys::lappend_int(private_list, if multi_col_sort { 1 } else { 0 });
+            private_list = pg_sys::lappend_int(private_list, sort_col_attno);
         }
 
         (*cscan).custom_private = private_list;
@@ -1351,7 +1353,7 @@ unsafe fn extract_quals_from_baserestrictinfo(
 
 // Thread-local to pass Top-N info from add_deltax_append_path to plan_deltax_append_path.
 thread_local! {
-    static APPEND_TOPN_INFO: std::cell::Cell<(i64, bool, bool)> = const { std::cell::Cell::new((0, true, false)) };
+    static APPEND_TOPN_INFO: std::cell::Cell<(i64, bool, bool, i32)> = const { std::cell::Cell::new((0, true, false, 0)) };
 }
 
 /// Add a DeltaXAppend custom path to the parent relation's pathlist.
@@ -1366,6 +1368,7 @@ pub unsafe fn add_deltax_append_path(
     effective_limit: i64,
     sort_ascending: bool,
     multi_col_sort: bool,
+    sort_col_attno: i32,
 ) {
     unsafe {
         let cpath =
@@ -1405,11 +1408,11 @@ pub unsafe fn add_deltax_append_path(
         (*cpath).custom_restrictinfo = std::ptr::null_mut();
         (*cpath).methods = &DELTAX_APPEND_PATH_METHODS.0;
 
-        // Store Top-N info. Caller validates ORDER BY matches time column.
+        // Store Top-N info.
         if effective_limit > 0 {
-            APPEND_TOPN_INFO.with(|cell| cell.set((effective_limit, sort_ascending, multi_col_sort)));
+            APPEND_TOPN_INFO.with(|cell| cell.set((effective_limit, sort_ascending, multi_col_sort, sort_col_attno)));
         } else {
-            APPEND_TOPN_INFO.with(|cell| cell.set((0, true, false)));
+            APPEND_TOPN_INFO.with(|cell| cell.set((0, true, false, 0)));
         }
 
         // Clear existing paths (removes Append paths)
@@ -1485,13 +1488,14 @@ pub unsafe extern "C-unwind" fn plan_deltax_append_path(
             }
         }
 
-        // Append Top-N info: [-2, effective_limit, sort_ascending_flag, multi_col_sort_flag]
-        let (effective_limit, sort_ascending, multi_col_sort) = APPEND_TOPN_INFO.with(|cell| cell.replace((0, true, false)));
+        // Append Top-N info: [-2, effective_limit, sort_ascending_flag, multi_col_sort_flag, sort_col_attno]
+        let (effective_limit, sort_ascending, multi_col_sort, sort_col_attno) = APPEND_TOPN_INFO.with(|cell| cell.replace((0, true, false, 0)));
         if effective_limit > 0 {
             private_list = pg_sys::lappend_int(private_list, -2);
             private_list = pg_sys::lappend_int(private_list, effective_limit as i32);
             private_list = pg_sys::lappend_int(private_list, if sort_ascending { 1 } else { 0 });
             private_list = pg_sys::lappend_int(private_list, if multi_col_sort { 1 } else { 0 });
+            private_list = pg_sys::lappend_int(private_list, sort_col_attno);
         }
 
         (*cscan).custom_private = private_list;

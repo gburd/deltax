@@ -247,31 +247,25 @@ unsafe fn check_time_pathkey(
     }
 }
 
-/// Check if the first query pathkey matches a given column attno.
-/// Unlike `check_time_pathkey`, this does NOT require varno to match a specific
-/// relation, so it works for both parent and child relations. It only checks
-/// that the EC contains a Var with the given attno and that the pathkey is
-/// ASC or DESC.
-unsafe fn order_by_matches_column(
-    root: *mut pg_sys::PlannerInfo,
-    col_attno: i16,
-) -> bool {
+/// Extract the first ORDER BY column's attribute number from pathkeys.
+/// Returns the 1-based attno, or None if ORDER BY is not a simple column reference.
+unsafe fn extract_order_by_attno(root: *mut pg_sys::PlannerInfo) -> Option<i16> {
     unsafe {
         let query_pathkeys = (*root).query_pathkeys;
         if query_pathkeys.is_null() || (*query_pathkeys).length == 0 {
-            return false;
+            return None;
         }
         let first_pk = pg_sys::list_nth(query_pathkeys, 0) as *mut pg_sys::PathKey;
         if first_pk.is_null() {
-            return false;
+            return None;
         }
         let eclass = (*first_pk).pk_eclass;
         if eclass.is_null() {
-            return false;
+            return None;
         }
         let members = (*eclass).ec_members;
         if members.is_null() {
-            return false;
+            return None;
         }
         let nmembers = (*members).length;
         for i in 0..nmembers {
@@ -287,11 +281,9 @@ unsafe fn order_by_matches_column(
                 continue;
             }
             let var = expr as *const pg_sys::Var;
-            if (*var).varattno == col_attno {
-                return true;
-            }
+            return Some((*var).varattno);
         }
-        false
+        None
     }
 }
 
@@ -307,6 +299,13 @@ unsafe fn extract_topn_info(
 ) -> (i64, bool, bool) {
     unsafe {
         if parse.is_null() {
+            return (0, true, false);
+        }
+
+        // Scan-level top-N makes no sense for aggregate queries — the aggregate
+        // needs all rows from the scan.  (The DeltaXAgg upper path has its own
+        // top-N logic.)
+        if (*parse).hasAggs || !(*parse).groupClause.is_null() {
             return (0, true, false);
         }
 
@@ -421,22 +420,19 @@ pub unsafe extern "C-unwind" fn deltax_set_rel_pathlist(
             && (*rte).inh
             && let Some(companion_oids) = collect_compressed_children(root, rti)
         {
-            // For Top-N, validate ORDER BY matches the time column
-            let append_topn_limit = if effective_limit > 0 {
-                get_time_column_attno((*rte).relid)
-                    .map(|attno| {
-                        if order_by_matches_column(root, attno) {
-                            effective_limit
-                        } else {
-                            0
-                        }
-                    })
-                    .unwrap_or(0)
+            // For Top-N, validate ORDER BY is a simple column reference.
+            // Works for any column (time, text, numeric).
+            let (append_topn_limit, append_sort_col_attno) = if effective_limit > 0 {
+                if let Some(attno) = extract_order_by_attno(root) {
+                    (effective_limit, attno as i32)
+                } else {
+                    (0, 0)
+                }
             } else {
-                0
+                (0, 0)
             };
             let append_multi_col = if append_topn_limit > 0 { multi_col_sort } else { false };
-            path::add_deltax_append_path(root, rel, &companion_oids, std::ptr::null_mut(), append_topn_limit, sort_ascending, append_multi_col);
+            path::add_deltax_append_path(root, rel, &companion_oids, std::ptr::null_mut(), append_topn_limit, sort_ascending, append_multi_col, append_sort_col_attno);
             return;
         }
 
@@ -484,25 +480,21 @@ pub unsafe extern "C-unwind" fn deltax_set_rel_pathlist(
             (std::ptr::null_mut(), true)
         };
 
-        // Top-N: enabled when ORDER BY matches time column (works for both
-        // parent and child rels, and regardless of segment_by)
-        let topn_effective_limit = if effective_limit > 0 {
-            time_col_attno_opt
-                .map(|attno| {
-                    if order_by_matches_column(root, attno) {
-                        effective_limit
-                    } else {
-                        0
-                    }
-                })
-                .unwrap_or(0)
+        // Top-N: enabled when ORDER BY is a simple column reference.
+        // Works for any column (time, text, numeric).
+        let (topn_effective_limit, topn_sort_col_attno) = if effective_limit > 0 {
+            if let Some(attno) = extract_order_by_attno(root) {
+                (effective_limit, attno as i32)
+            } else {
+                (0, 0)
+            }
         } else {
-            0
+            (0, 0)
         };
 
         // Add the custom decompress path
         let topn_multi_col = if topn_effective_limit > 0 { multi_col_sort } else { false };
-        path::add_decompress_path(root, rel, companion_oid, pathkeys, topn_effective_limit, sort_ascending, topn_multi_col);
+        path::add_decompress_path(root, rel, companion_oid, pathkeys, topn_effective_limit, sort_ascending, topn_multi_col, topn_sort_col_attno);
     }
 }
 

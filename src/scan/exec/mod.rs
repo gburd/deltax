@@ -4,6 +4,7 @@ mod segments;
 mod count_minmax;
 mod agg;
 mod decompress;
+mod text_col;
 
 use pgrx::pg_sys;
 

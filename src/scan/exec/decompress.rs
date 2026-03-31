@@ -18,6 +18,7 @@ use super::segments::{
     detoast_lazy_blobs, detoast_lazy_blobs_selective, segment_skippable_by_dict,
     extract_segment_filters,
 };
+use super::text_col::{TextQualInfo, decompress_text_to_seg_col, apply_text_eq_filter, apply_text_like_filter, strcoll_cmp};
 
 /// Decompression state stored as a raw pointer in the CustomScanState.
 pub(crate) struct DecompressState {
@@ -89,6 +90,8 @@ pub(crate) struct DecompressState {
     topn_cursor: usize,
     /// Whether the Top-N pass has been executed.
     topn_done: bool,
+    /// Whether the Top-N sort column is a text type (uses byte comparison).
+    topn_sort_is_text: bool,
 }
 
 /// Wall-clock timing for the decompress scan phases.
@@ -185,6 +188,7 @@ pub(super) unsafe extern "C-unwind" fn begin_custom_scan(
         let mut topn_limit: i64 = 0;
         let mut topn_ascending: bool = true;
         let mut topn_multi_col_sort: bool = false;
+        let mut topn_sort_col_attno: i32 = 0;
         for i in 1..list_len {
             let val = pg_sys::list_nth_int(custom_private, i);
             if val == -1 && !found_sentinel {
@@ -192,13 +196,16 @@ pub(super) unsafe extern "C-unwind" fn begin_custom_scan(
                 continue;
             }
             if val == -2 && found_sentinel {
-                // Top-N sentinel: next values are effective_limit, sort_ascending, multi_col_sort
+                // Top-N sentinel: next values are effective_limit, sort_ascending, multi_col_sort, sort_col_attno
                 if i + 2 < list_len {
                     topn_limit = pg_sys::list_nth_int(custom_private, i + 1) as i64;
                     topn_ascending = pg_sys::list_nth_int(custom_private, i + 2) != 0;
                 }
                 if i + 3 < list_len {
                     topn_multi_col_sort = pg_sys::list_nth_int(custom_private, i + 3) != 0;
+                }
+                if i + 4 < list_len {
+                    topn_sort_col_attno = pg_sys::list_nth_int(custom_private, i + 4);
                 }
                 break;
             }
@@ -236,7 +243,15 @@ pub(super) unsafe extern "C-unwind" fn begin_custom_scan(
         state.topn_ascending = topn_ascending;
         state.topn_multi_col_sort = topn_multi_col_sort;
         state.timing.topn_limit = if topn_limit > 0 { topn_limit as u64 } else { 0 };
-        if topn_limit > 0 {
+        if topn_limit > 0 && topn_sort_col_attno > 0 {
+            // Use the sort column attno from the planner (1-based → 0-based)
+            let sort_col_idx = (topn_sort_col_attno - 1) as usize;
+            if sort_col_idx < state.col_names.len() {
+                state.topn_sort_col = Some(sort_col_idx);
+                state.topn_sort_is_text = is_text_type(state.col_types[sort_col_idx]);
+            }
+        } else if topn_limit > 0 {
+            // Fallback: assume time column (backward compat)
             state.topn_sort_col = state.col_names.iter().position(|n| n == &state._time_column);
         }
 
@@ -302,6 +317,7 @@ pub(super) unsafe extern "C-unwind" fn begin_deltax_append(
         let mut topn_limit: i64 = 0;
         let mut topn_ascending: bool = true;
         let mut topn_multi_col_sort: bool = false;
+        let mut topn_sort_col_attno: i32 = 0;
         for i in 0..list_len {
             let val = pg_sys::list_nth_int(custom_private, i);
             if val == -1 && !found_sentinel {
@@ -309,13 +325,16 @@ pub(super) unsafe extern "C-unwind" fn begin_deltax_append(
                 continue;
             }
             if val == -2 && found_sentinel {
-                // Top-N sentinel: next values are effective_limit, sort_ascending, multi_col_sort
+                // Top-N sentinel: next values are effective_limit, sort_ascending, multi_col_sort, sort_col_attno
                 if i + 2 < list_len {
                     topn_limit = pg_sys::list_nth_int(custom_private, i + 1) as i64;
                     topn_ascending = pg_sys::list_nth_int(custom_private, i + 2) != 0;
                 }
                 if i + 3 < list_len {
                     topn_multi_col_sort = pg_sys::list_nth_int(custom_private, i + 3) != 0;
+                }
+                if i + 4 < list_len {
+                    topn_sort_col_attno = pg_sys::list_nth_int(custom_private, i + 4);
                 }
                 break;
             }
@@ -428,11 +447,17 @@ pub(super) unsafe extern "C-unwind" fn begin_deltax_append(
             .sum();
 
         // Compute topn_sort_col before moving meta fields
-        let topn_sort_col = if topn_limit > 0 {
+        let topn_sort_col = if topn_limit > 0 && topn_sort_col_attno > 0 {
+            let idx = (topn_sort_col_attno - 1) as usize;
+            if idx < meta.col_names.len() { Some(idx) } else { None }
+        } else if topn_limit > 0 {
             meta.col_names.iter().position(|n| n == &meta.time_column)
         } else {
             None
         };
+        let topn_sort_is_text = topn_sort_col
+            .map(|ci| is_text_type(meta.col_types[ci]))
+            .unwrap_or(false);
         // Rows within a segment are sorted by order_by[0]. If that's the time column
         // (or order_by is empty, which defaults to time column), we can exploit
         // intra-segment row ordering for top-N early exit.
@@ -493,6 +518,7 @@ pub(super) unsafe extern "C-unwind" fn begin_deltax_append(
             topn_buffer: Vec::new(),
             topn_cursor: 0,
             topn_done: false,
+            topn_sort_is_text,
         };
 
         // Create per-segment memory context
@@ -651,6 +677,32 @@ fn load_decompress_state(
         topn_buffer: Vec::new(),
         topn_cursor: 0,
         topn_done: false,
+        topn_sort_is_text: false,
+    }
+}
+
+/// Candidate row for Top-N selection (text sort keys).
+struct TextTopNCandidate {
+    segment_idx: usize,
+    row_idx: usize,
+    /// Sort key datum (points into phase1_persist_mcxt, survives segment resets).
+    sort_datum: pg_sys::Datum,
+    /// Datums for Phase 1 columns (filter + sort), keyed by col_idx.
+    phase1_datums: Vec<(usize, pg_sys::Datum, bool)>,
+}
+
+/// Compare two text datums using PG's collation-aware comparison.
+#[inline]
+unsafe fn cmp_text_datums(a: pg_sys::Datum, b: pg_sys::Datum) -> std::cmp::Ordering {
+    unsafe {
+        let a_vl = a.cast_mut_ptr::<pg_sys::varlena>();
+        let b_vl = b.cast_mut_ptr::<pg_sys::varlena>();
+        let a_ptr = pgrx::vardata_any(a_vl) as *const std::ffi::c_char;
+        let a_len = pgrx::varsize_any_exhdr(a_vl) as i32;
+        let b_ptr = pgrx::vardata_any(b_vl) as *const std::ffi::c_char;
+        let b_len = pgrx::varsize_any_exhdr(b_vl) as i32;
+        let result = pg_sys::varstr_cmp(a_ptr, a_len, b_ptr, b_len, pg_sys::DEFAULT_COLLATION_OID);
+        result.cmp(&0)
     }
 }
 
@@ -697,6 +749,10 @@ unsafe fn exec_topn_two_pass(
                     num_plan_quals,
                     num_batch_quals,
                 );
+                // Detoast lazy blobs since normal scan path needs them
+                for seg in state.segments_data.iter_mut() {
+                    detoast_lazy_blobs(seg);
+                }
                 state.topn_limit = 0;
                 state.segment_index = 0;
                 return;
@@ -748,6 +804,12 @@ unsafe fn exec_topn_two_pass(
         };
 
         // === Pass 1: Phase 1 with early stop ===
+        // Check if sort column is the time column — time-based optimizations
+        // (segment ordering, threshold-based skipping, cutoff_row) only apply
+        // when sorting by the time column.
+        let sort_is_time_col = state.col_names.get(sort_col)
+            .is_some_and(|name| name == &state._time_column);
+
         // Sort segments by time for early stop: ASC by min_time, DESC by max_time.
         // After collecting >= effective_limit candidates, skip segments whose
         // entire time range is beyond our worst candidate's sort key.
@@ -755,10 +817,12 @@ unsafe fn exec_topn_two_pass(
         let num_segments = state.segments_data.len();
 
         let mut seg_order: Vec<usize> = (0..num_segments).collect();
-        if state.topn_ascending {
-            seg_order.sort_by_key(|&i| state.segments_data[i].min_time.unwrap_or(i64::MAX));
-        } else {
-            seg_order.sort_by_key(|&i| std::cmp::Reverse(state.segments_data[i].max_time.unwrap_or(i64::MIN)));
+        if sort_is_time_col {
+            if state.topn_ascending {
+                seg_order.sort_by_key(|&i| state.segments_data[i].min_time.unwrap_or(i64::MAX));
+            } else {
+                seg_order.sort_by_key(|&i| std::cmp::Reverse(state.segments_data[i].max_time.unwrap_or(i64::MIN)));
+            }
         }
 
         // Persistent memory context for Phase 1 text datums that must survive
@@ -779,7 +843,9 @@ unsafe fn exec_topn_two_pass(
         for &seg_idx in &seg_order {
             // Early stop: if we have enough candidates, check if this segment's
             // time range can possibly contain rows better than our worst candidate.
-            if candidates.len() >= effective_limit
+            // Only valid when sorting by the time column (we have min/max metadata).
+            if sort_is_time_col
+                && candidates.len() >= effective_limit
                 && let Some(threshold) = topn_threshold
             {
                 let dominated = if state.topn_ascending {
@@ -868,7 +934,7 @@ unsafe fn exec_topn_two_pass(
             // truncates from the end. For DESC, the rows we want are at the end
             // of the ascending-sorted data, and our decompress infrastructure
             // doesn't support "skip from beginning" truncation.
-            if let (true, true, Some(threshold)) = (state.rows_sorted_by_time, state.topn_ascending, topn_threshold) {
+            if let (true, true, true, Some(threshold)) = (sort_is_time_col, state.rows_sorted_by_time, state.topn_ascending, topn_threshold) {
                 // Compute sort column's blob index
                 let mut sort_blob_idx: Option<usize> = None;
                 let mut bi: usize = 0;
@@ -1098,10 +1164,12 @@ unsafe fn exec_topn_two_pass(
             // For DESC: rows we want are at the END of ascending data (highest
             // values). We can't break early, but we can skip individual rows
             // below threshold.
-            let can_row_early_exit = state.rows_sorted_by_time
+            let can_row_early_exit = sort_is_time_col
+                && state.rows_sorted_by_time
                 && state.topn_ascending
                 && topn_threshold.is_some();
-            let can_row_skip_desc = state.rows_sorted_by_time
+            let can_row_skip_desc = sort_is_time_col
+                && state.rows_sorted_by_time
                 && !state.topn_ascending
                 && topn_threshold.is_some();
             let row_threshold = topn_threshold.unwrap_or(0);
@@ -1386,6 +1454,1083 @@ unsafe fn exec_topn_two_pass(
     }
 }
 
+/// Configuration for parallel top-N text scan (read-only, shared across threads).
+struct ParallelTopNTextConfig<'a> {
+    segments_data: &'a [SegmentData],
+    col_names: &'a [String],
+    col_types: &'a [pg_sys::Oid],
+    segment_by: &'a [String],
+    batch_quals: &'a [BatchQual],
+    text_qual_infos: Vec<TextQualInfo>,
+    sort_col: usize,
+    sort_blob_idx: usize,
+    ascending: bool,
+    prune_limit: usize,
+    /// Blob indices for columns that have batch quals (non-text, for evaluate_batch_quals)
+    phase1_blob_col_map: Vec<(usize, usize)>, // (col_idx, blob_idx) for non-segby qual columns
+}
+
+/// Result of parallel top-N text worker.
+struct ParallelTopNTextResult {
+    /// (global_seg_idx, row_idx, sort_string)
+    candidates: Vec<(usize, usize, String)>,
+    segments_decompressed: u64,
+    decompress_us: u64,
+    batch_eval_us: u64,
+}
+
+/// Worker function for parallel top-N text scan.
+/// Processes a chunk of segment indices, returning candidate rows with sort strings.
+fn process_topn_text_chunk(
+    seg_indices: &[usize],
+    config: &ParallelTopNTextConfig,
+) -> ParallelTopNTextResult {
+    let mut candidates: Vec<(usize, usize, String)> = Vec::new();
+    let mut threshold: Option<String> = None;
+    let mut segments_decompressed: u64 = 0;
+    let mut decompress_us: u64 = 0;
+    let mut batch_eval_us: u64 = 0;
+
+    for &seg_idx in seg_indices {
+        let seg = &config.segments_data[seg_idx];
+
+        let t_decompress = Instant::now();
+
+        // Decompress sort column
+        let sort_blob = &seg.compressed_blobs[config.sort_blob_idx];
+        let sort_seg_col = match decompress_text_to_seg_col(sort_blob) {
+            Some(c) => c,
+            None => continue,
+        };
+        let row_count = seg.row_count as usize;
+
+        // Decompress filter columns and build selection
+        let mut selection: Vec<bool> = Vec::new();
+
+        // Apply text quals via SegTextColumn
+        for tqi in &config.text_qual_infos {
+            match tqi {
+                TextQualInfo::EqNe { col_idx, const_str, is_ne } => {
+                    // Check if this is a segment_by column
+                    let col_name = &config.col_names[*col_idx];
+                    if config.segment_by.contains(col_name) {
+                        let seg_val_idx = config.segment_by.iter()
+                            .position(|sb| sb == col_name).unwrap();
+                        let passes = match &seg.segment_values[seg_val_idx] {
+                            Some(s) => if *is_ne { s != const_str } else { s == const_str },
+                            None => false,
+                        };
+                        if !passes {
+                            selection = vec![false; row_count];
+                            break;
+                        }
+                        continue;
+                    }
+                    // Non-segby text column — decompress and filter
+                    let blob_idx = col_to_blob_idx(config.col_names, config.segment_by, *col_idx);
+                    let blob = &seg.compressed_blobs[blob_idx];
+                    let seg_col = if *col_idx == config.sort_col {
+                        // Reuse already-decompressed sort column
+                        &sort_seg_col
+                    } else {
+                        // Need to decompress this column — use a temporary
+                        // Since we can't store the temp and reference it, decompress inline
+                        let text_sel = match decompress_text_to_seg_col(blob) {
+                            Some(ref sc) => apply_text_eq_filter(sc, const_str, *is_ne, row_count),
+                            None => vec![false; row_count],
+                        };
+                        if selection.is_empty() {
+                            selection = text_sel;
+                        } else {
+                            for (s, t) in selection.iter_mut().zip(text_sel.iter()) {
+                                *s = *s && *t;
+                            }
+                        }
+                        continue;
+                    };
+                    let text_sel = apply_text_eq_filter(seg_col, const_str, *is_ne, row_count);
+                    if selection.is_empty() {
+                        selection = text_sel;
+                    } else {
+                        for (s, t) in selection.iter_mut().zip(text_sel.iter()) {
+                            *s = *s && *t;
+                        }
+                    }
+                }
+                TextQualInfo::Like { col_idx, strategy, negate } => {
+                    let col_name = &config.col_names[*col_idx];
+                    if config.segment_by.contains(col_name) {
+                        continue; // segment_by LIKE is handled by dict pruning
+                    }
+                    let seg_col = if *col_idx == config.sort_col {
+                        &sort_seg_col
+                    } else {
+                        let blob_idx = col_to_blob_idx(config.col_names, config.segment_by, *col_idx);
+                        let blob = &seg.compressed_blobs[blob_idx];
+                        let text_sel = match decompress_text_to_seg_col(blob) {
+                            Some(ref sc) => apply_text_like_filter(sc, strategy, *negate, row_count),
+                            None => vec![false; row_count],
+                        };
+                        if selection.is_empty() {
+                            selection = text_sel;
+                        } else {
+                            for (s, t) in selection.iter_mut().zip(text_sel.iter()) {
+                                *s = *s && *t;
+                            }
+                        }
+                        continue;
+                    };
+                    let text_sel = apply_text_like_filter(seg_col, strategy, *negate, row_count);
+                    if selection.is_empty() {
+                        selection = text_sel;
+                    } else {
+                        for (s, t) in selection.iter_mut().zip(text_sel.iter()) {
+                            *s = *s && *t;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Apply numeric batch quals
+        let has_numeric_quals = config.batch_quals.iter().any(|bq| {
+            !matches!(bq.type_oid, pg_sys::TEXTOID | pg_sys::VARCHAROID | pg_sys::BPCHAROID)
+                && !config.segment_by.contains(&config.col_names[bq.col_idx])
+        });
+        if has_numeric_quals {
+            let t_batch = Instant::now();
+            // Build a sparse decompressed array for evaluate_batch_quals
+            let mut decompressed: Vec<Vec<(pg_sys::Datum, bool)>> =
+                (0..config.col_names.len()).map(|_| Vec::new()).collect();
+            for &(col_idx, blob_idx) in &config.phase1_blob_col_map {
+                let blob = &seg.compressed_blobs[blob_idx];
+                let type_name = super::datum_utils::pg_type_name(config.col_types[col_idx]);
+                // Safety: numeric decompression is thread-safe (no PG API calls)
+                let datums = unsafe {
+                    super::datum_utils::decompress_blob_to_datums(
+                        blob, &type_name, config.col_types[col_idx], -1,
+                    )
+                };
+                decompressed[col_idx] = datums;
+            }
+            let sv = evaluate_batch_quals(
+                &decompressed, row_count, config.batch_quals, selection,
+            );
+            selection = sv;
+            batch_eval_us += t_batch.elapsed().as_micros() as u64;
+        }
+
+        let elapsed = t_decompress.elapsed().as_micros() as u64;
+        decompress_us += elapsed;
+        segments_decompressed += 1;
+
+        // Check if any rows pass
+        let any_selected = selection.is_empty() || selection.iter().any(|&s| s);
+        if !any_selected {
+            continue;
+        }
+
+        // Collect qualifying rows
+        for row_idx in 0..row_count {
+            let passes = selection.is_empty() || selection[row_idx];
+            if !passes {
+                continue;
+            }
+            let sort_str = match sort_seg_col.get_str(row_idx) {
+                Some(s) => s,
+                None => continue, // NULL sort key
+            };
+
+            // Byte-order threshold pruning
+            if let Some(ref thr) = threshold {
+                let dominated = if config.ascending {
+                    sort_str > thr.as_str()
+                } else {
+                    sort_str < thr.as_str()
+                };
+                if dominated {
+                    continue;
+                }
+            }
+
+            candidates.push((seg_idx, row_idx, sort_str.to_string()));
+        }
+
+        // Update byte-order threshold
+        if candidates.len() >= config.prune_limit {
+            let k = config.prune_limit - 1;
+            if config.ascending {
+                candidates.select_nth_unstable_by(k, |a, b| a.2.cmp(&b.2));
+            } else {
+                candidates.select_nth_unstable_by(k, |a, b| b.2.cmp(&a.2));
+            }
+            candidates.truncate(config.prune_limit);
+            threshold = Some(candidates[k].2.clone());
+        }
+    }
+
+    ParallelTopNTextResult {
+        candidates,
+        segments_decompressed,
+        decompress_us,
+        batch_eval_us,
+    }
+}
+
+/// Compute blob index for a non-segment-by column.
+fn col_to_blob_idx(col_names: &[String], segment_by: &[String], target_col: usize) -> usize {
+    let mut bi = 0;
+    for (ci, cn) in col_names.iter().enumerate() {
+        if segment_by.contains(cn) {
+            continue;
+        }
+        if ci == target_col {
+            return bi;
+        }
+        bi += 1;
+    }
+    panic!("col_to_blob_idx: column {} not found in blobs", target_col);
+}
+
+/// Execute Top-N for text sort columns (e.g. ORDER BY SearchPhrase LIMIT 10).
+///
+/// When parallel workers > 1 and enough surviving segments, uses parallel
+/// decompress + byte-order pruning in threads, then strcoll sort on merge.
+/// Falls back to sequential path otherwise.
+unsafe fn exec_topn_text(
+    _node: *mut pg_sys::CustomScanState,
+    state: &mut DecompressState,
+    instrument: bool,
+    plan_qual: *mut pg_sys::List,
+) {
+    unsafe {
+        let sort_col = match state.topn_sort_col {
+            Some(c) => c,
+            None => return,
+        };
+        let effective_limit = state.topn_limit;
+
+        // Safety check: all plan quals must be batch-handled
+        if !plan_qual.is_null() {
+            let num_plan_quals = (*plan_qual).length as usize;
+            let num_batch_quals = state.batch_quals.len();
+            if num_plan_quals > num_batch_quals {
+                pgrx::log!(
+                    "pg_deltax topn_text: disabled (plan_quals={} > batch_quals={})",
+                    num_plan_quals,
+                    num_batch_quals,
+                );
+                for seg in state.segments_data.iter_mut() {
+                    detoast_lazy_blobs(seg);
+                }
+                state.topn_limit = 0;
+                state.segment_index = 0;
+                return;
+            }
+        }
+
+        pgrx::log!(
+            "pg_deltax topn_text: limit={} ascending={} sort_col={} segments={}",
+            effective_limit,
+            state.topn_ascending,
+            sort_col,
+            state.segments_data.len(),
+        );
+
+        // Identify Phase 1 columns (filter + sort)
+        let mut phase1_col_indices: Vec<usize> = Vec::new();
+        for (col_idx, col_name) in state.col_names.iter().enumerate() {
+            if !state.needed_cols[col_idx] && col_idx != sort_col {
+                continue;
+            }
+            if state.segment_by.contains(col_name) {
+                if state.batch_quals.iter().any(|bq| bq.col_idx == col_idx) {
+                    phase1_col_indices.push(col_idx);
+                }
+            } else {
+                let has_batch_qual = state.batch_quals.iter().any(|bq| bq.col_idx == col_idx);
+                if has_batch_qual || col_idx == sort_col {
+                    phase1_col_indices.push(col_idx);
+                }
+            }
+        }
+
+        // Compute Phase 1 blob indices for selective detoasting
+        let phase1_blob_indices: Vec<usize> = {
+            let mut indices = Vec::new();
+            let mut bi: usize = 0;
+            for (col_idx, col_name) in state.col_names.iter().enumerate() {
+                if state.segment_by.contains(col_name) {
+                    continue;
+                }
+                if phase1_col_indices.contains(&col_idx) {
+                    indices.push(bi);
+                }
+                bi += 1;
+            }
+            indices
+        };
+
+        // Compute sort column's blob index
+        let sort_blob_idx = col_to_blob_idx(&state.col_names, &state.segment_by, sort_col);
+
+        // ===== Phase 0: Main thread — detoast + segment pruning =====
+        let mut surviving_seg_indices: Vec<usize> = Vec::new();
+        let num_segments = state.segments_data.len();
+
+        for seg_idx in 0..num_segments {
+            let seg = &state.segments_data[seg_idx];
+            if seg.row_count == 0 {
+                continue;
+            }
+            if !state.segment_by_filters.is_empty() {
+                let mut skip = false;
+                for &(svi, ref filter_val) in &state.segment_by_filters {
+                    match &seg.segment_values[svi] {
+                        Some(val) if val == filter_val => {}
+                        _ => { skip = true; break; }
+                    }
+                }
+                if skip {
+                    state.timing.segments_skipped += 1;
+                    continue;
+                }
+            }
+            if let (Some(seg_min), Some(seg_max)) = (seg.min_time, seg.max_time) {
+                if state.time_min.is_some_and(|query_min| seg_max < query_min) {
+                    state.timing.segments_skipped += 1;
+                    continue;
+                }
+                if state.time_max.is_some_and(|query_max| seg_min > query_max) {
+                    state.timing.segments_skipped += 1;
+                    continue;
+                }
+            }
+
+            // Detoast Phase 1 blobs (PG API — must be main thread)
+            let t_detoast = if instrument { Some(Instant::now()) } else { None };
+            detoast_lazy_blobs_selective(&mut state.segments_data[seg_idx], &phase1_blob_indices);
+            if let Some(t) = t_detoast {
+                state.timing.heap_scan_us += t.elapsed().as_micros() as u64;
+            }
+
+            // Dictionary-based pruning (reads compressed blobs, no PG calls)
+            if segment_skippable_by_dict(
+                &state.batch_quals, &state.col_names, &state.segment_by,
+                &state.segments_data[seg_idx].compressed_blobs,
+            ) {
+                state.timing.segments_skipped += 1;
+                continue;
+            }
+
+            surviving_seg_indices.push(seg_idx);
+        }
+
+        let n_workers = crate::get_parallel_workers();
+        let use_parallel = n_workers > 1 && surviving_seg_indices.len() >= 2;
+
+        if use_parallel {
+            // ===== Parallel path =====
+            let prune_limit = std::cmp::max(effective_limit * 100, 10000);
+
+            // Build text qual infos for worker threads
+            let mut text_qual_infos: Vec<TextQualInfo> = Vec::new();
+            for bq in &state.batch_quals {
+                let t = bq.type_oid;
+                if t == pg_sys::TEXTOID || t == pg_sys::VARCHAROID || t == pg_sys::BPCHAROID {
+                    match bq.op {
+                        BatchCompareOp::Eq | BatchCompareOp::Ne => {
+                            if let Some(ref cs) = bq.text_const {
+                                text_qual_infos.push(TextQualInfo::EqNe {
+                                    col_idx: bq.col_idx,
+                                    const_str: cs.clone(),
+                                    is_ne: bq.op == BatchCompareOp::Ne,
+                                });
+                            }
+                        }
+                        BatchCompareOp::Like | BatchCompareOp::NotLike => {
+                            if let Some(ref strat) = bq.like_strategy {
+                                text_qual_infos.push(TextQualInfo::Like {
+                                    col_idx: bq.col_idx,
+                                    strategy: strat.clone(),
+                                    negate: bq.op == BatchCompareOp::NotLike,
+                                });
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            // Build numeric qual blob map for workers
+            let mut phase1_blob_col_map: Vec<(usize, usize)> = Vec::new();
+            for bq in &state.batch_quals {
+                let t = bq.type_oid;
+                if matches!(t, pg_sys::TEXTOID | pg_sys::VARCHAROID | pg_sys::BPCHAROID) {
+                    continue;
+                }
+                let col_name = &state.col_names[bq.col_idx];
+                if state.segment_by.contains(col_name) {
+                    continue;
+                }
+                let blob_idx = col_to_blob_idx(&state.col_names, &state.segment_by, bq.col_idx);
+                if !phase1_blob_col_map.iter().any(|&(ci, _)| ci == bq.col_idx) {
+                    phase1_blob_col_map.push((bq.col_idx, blob_idx));
+                }
+            }
+
+            let config = ParallelTopNTextConfig {
+                segments_data: &state.segments_data,
+                col_names: &state.col_names,
+                col_types: &state.col_types,
+                segment_by: &state.segment_by,
+                batch_quals: &state.batch_quals,
+                text_qual_infos,
+                sort_col,
+                sort_blob_idx,
+                ascending: state.topn_ascending,
+                prune_limit,
+                phase1_blob_col_map,
+            };
+
+            let chunk_size = surviving_seg_indices.len().div_ceil(n_workers);
+            let results: Vec<ParallelTopNTextResult> = std::thread::scope(|s| {
+                surviving_seg_indices
+                    .chunks(chunk_size)
+                    .map(|chunk| {
+                        let cfg = &config;
+                        s.spawn(move || process_topn_text_chunk(chunk, cfg))
+                    })
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|h| h.join().unwrap())
+                    .collect()
+            });
+
+            // Accumulate timing
+            for result in &results {
+                state.timing.segments_decompressed += result.segments_decompressed;
+                state.timing.decompress_us += result.decompress_us;
+                state.timing.phase1_us += result.decompress_us;
+                state.timing.batch_eval_us += result.batch_eval_us;
+            }
+
+            // Merge all candidates
+            let mut all_candidates: Vec<(usize, usize, String)> = Vec::new();
+            for result in results {
+                all_candidates.extend(result.candidates);
+            }
+
+            state.timing.topn_candidates = all_candidates.len() as u64;
+
+            if all_candidates.is_empty() || all_candidates.len() <= effective_limit {
+                for seg in state.segments_data.iter_mut() {
+                    detoast_lazy_blobs(seg);
+                }
+                state.topn_limit = 0;
+                state.segment_index = 0;
+                return;
+            }
+
+            // Byte-order pre-prune if too many candidates
+            if all_candidates.len() > prune_limit {
+                if state.topn_ascending {
+                    all_candidates.select_nth_unstable_by(prune_limit - 1, |a, b| a.2.cmp(&b.2));
+                } else {
+                    all_candidates.select_nth_unstable_by(prune_limit - 1, |a, b| b.2.cmp(&a.2));
+                }
+                all_candidates.truncate(prune_limit);
+            }
+
+            // Collation-aware final sort using strcoll_cmp
+            if state.topn_ascending {
+                all_candidates.sort_by(|a, b| strcoll_cmp(&a.2, &b.2));
+            } else {
+                all_candidates.sort_by(|a, b| strcoll_cmp(&b.2, &a.2));
+            }
+
+            // Truncate to effective_limit (handle multi_col_sort ties)
+            if state.topn_multi_col_sort {
+                let threshold_idx = std::cmp::min(effective_limit - 1, all_candidates.len() - 1);
+                let threshold_str = all_candidates[threshold_idx].2.clone();
+                if state.topn_ascending {
+                    all_candidates.retain(|c| strcoll_cmp(&c.2, &threshold_str) != std::cmp::Ordering::Greater);
+                } else {
+                    all_candidates.retain(|c| strcoll_cmp(&c.2, &threshold_str) != std::cmp::Ordering::Less);
+                }
+            } else {
+                all_candidates.truncate(effective_limit);
+            }
+
+            // Phase 2: decompress ALL needed columns for winning segments
+            let mut segment_topn_rows: HashMap<usize, Vec<usize>> = HashMap::new();
+            for &(seg_idx, row_idx, _) in &all_candidates {
+                segment_topn_rows.entry(seg_idx).or_default().push(row_idx);
+            }
+
+            state.timing.topn_phase2_segments = segment_topn_rows.len() as u64;
+
+            // Detoast lazy blobs for winning segments
+            let t_lazy = if instrument { Some(Instant::now()) } else { None };
+            for &seg_idx in segment_topn_rows.keys() {
+                detoast_lazy_blobs(&mut state.segments_data[seg_idx]);
+            }
+            if let Some(t) = t_lazy {
+                state.timing.heap_scan_us += t.elapsed().as_micros() as u64;
+            }
+
+            pg_sys::MemoryContextReset(state.segment_mcxt);
+
+            // Build a lookup: (seg_idx, row_idx) -> sort_string for final ordering
+            let candidate_sort_strings: HashMap<(usize, usize), String> = all_candidates.iter()
+                .map(|(si, ri, s)| ((*si, *ri), s.clone()))
+                .collect();
+
+            struct RowData {
+                sort_string: String,
+                datums: Vec<(pg_sys::Datum, bool)>,
+            }
+            let mut result_rows: Vec<RowData> = Vec::with_capacity(effective_limit);
+
+            for (&seg_idx, row_indices) in &segment_topn_rows {
+                let seg = &state.segments_data[seg_idx];
+                let old_ctx = pg_sys::MemoryContextSwitchTo(state.segment_mcxt);
+
+                let max_row = *row_indices.iter().max().unwrap_or(&0);
+
+                let mut narrowed_selection = vec![false; seg.row_count as usize];
+                for &ri in row_indices {
+                    narrowed_selection[ri] = true;
+                }
+
+                let t_phase2 = if instrument { Some(Instant::now()) } else { None };
+
+                let mut decompressed: Vec<Vec<(pg_sys::Datum, bool)>> = Vec::new();
+                let mut blob_idx: usize = 0;
+                let mut seg_val_idx: usize = 0;
+
+                for (col_idx, col_name) in state.col_names.iter().enumerate() {
+                    let type_oid = state.col_types[col_idx];
+
+                    if !state.needed_cols[col_idx] {
+                        if state.segment_by.contains(col_name) {
+                            seg_val_idx += 1;
+                        } else {
+                            blob_idx += 1;
+                        }
+                        decompressed.push(Vec::new());
+                        continue;
+                    }
+
+                    if state.segment_by.contains(col_name) {
+                        let val = &seg.segment_values[seg_val_idx];
+                        let (datum, is_null) = match val {
+                            Some(s) => (string_to_datum(s, type_oid), false),
+                            None => (pg_sys::Datum::from(0), true),
+                        };
+                        let repeated: Vec<(pg_sys::Datum, bool)> =
+                            (0..seg.row_count).map(|_| (datum, is_null)).collect();
+                        decompressed.push(repeated);
+                        seg_val_idx += 1;
+                    } else {
+                        let blob = &seg.compressed_blobs[blob_idx];
+                        let typmod = state.col_typmods[col_idx];
+                        let is_text = is_text_type(type_oid);
+                        let datums = if is_text {
+                            decompress_text_blob_with_selection(
+                                blob, type_oid, typmod, &narrowed_selection,
+                            )
+                        } else {
+                            let type_name = pg_type_name(type_oid);
+                            decompress_blob_to_datums_truncated(
+                                blob, &type_name, type_oid, typmod, max_row,
+                            )
+                        };
+                        decompressed.push(datums);
+                        blob_idx += 1;
+                    }
+                }
+
+                if let Some(t) = t_phase2 {
+                    let elapsed = t.elapsed().as_micros() as u64;
+                    state.timing.decompress_us += elapsed;
+                    state.timing.phase2_us += elapsed;
+                }
+
+                pg_sys::MemoryContextSwitchTo(old_ctx);
+
+                for &ri in row_indices {
+                    let mut row_datums = vec![(pg_sys::Datum::from(0), true); state.col_names.len()];
+                    for &col_idx in &state.needed_col_indices {
+                        if !decompressed[col_idx].is_empty() && ri < decompressed[col_idx].len() {
+                            row_datums[col_idx] = decompressed[col_idx][ri];
+                        }
+                    }
+                    let sort_string = candidate_sort_strings
+                        .get(&(seg_idx, ri))
+                        .cloned()
+                        .unwrap_or_default();
+                    result_rows.push(RowData { sort_string, datums: row_datums });
+                }
+            }
+
+            // Sort result rows (collation-aware)
+            if !state.topn_multi_col_sort {
+                if state.topn_ascending {
+                    result_rows.sort_by(|a, b| strcoll_cmp(&a.sort_string, &b.sort_string));
+                } else {
+                    result_rows.sort_by(|a, b| strcoll_cmp(&b.sort_string, &a.sort_string));
+                }
+            }
+
+            state.topn_buffer = result_rows.into_iter().map(|r| r.datums).collect();
+            state.topn_cursor = 0;
+
+            pgrx::log!(
+                "pg_deltax topn_text: parallel candidates={} top_n={} phase2_segments={} workers={}",
+                state.timing.topn_candidates,
+                state.topn_buffer.len(),
+                state.timing.topn_phase2_segments,
+                n_workers,
+            );
+        } else {
+            // ===== Sequential fallback =====
+            exec_topn_text_sequential(state, instrument, &phase1_col_indices, &phase1_blob_indices,
+                                       &surviving_seg_indices, sort_col, effective_limit);
+        }
+    }
+}
+
+/// Sequential Top-N text implementation (fallback when parallel not beneficial).
+unsafe fn exec_topn_text_sequential(
+    state: &mut DecompressState,
+    instrument: bool,
+    phase1_col_indices: &[usize],
+    _phase1_blob_indices: &[usize],
+    surviving_seg_indices: &[usize],
+    sort_col: usize,
+    effective_limit: usize,
+) {
+    unsafe {
+        // Persistent memory context for Phase 1 text datums
+        let phase1_persist_mcxt = pg_sys::AllocSetContextCreateInternal(
+            (*state.segment_mcxt).parent,
+            c"TopN Text Persist".as_ptr(),
+            pg_sys::ALLOCSET_DEFAULT_MINSIZE as usize,
+            pg_sys::ALLOCSET_DEFAULT_INITSIZE as usize,
+            pg_sys::ALLOCSET_DEFAULT_MAXSIZE as usize,
+        );
+
+        let mut candidates: Vec<TextTopNCandidate> = Vec::new();
+        let mut threshold_datum: Option<pg_sys::Datum> = None;
+
+        for &seg_idx in surviving_seg_indices {
+            let seg = &state.segments_data[seg_idx];
+
+            let t_decompress = if instrument { Some(Instant::now()) } else { None };
+
+            // Reset segment memory context for Phase 1
+            pg_sys::MemoryContextReset(state.segment_mcxt);
+            let old_ctx = pg_sys::MemoryContextSwitchTo(state.segment_mcxt);
+
+            // Phase 1: Decompress filter + sort columns
+            let mut decompressed: Vec<Vec<(pg_sys::Datum, bool)>> = Vec::new();
+            let mut blob_idx: usize = 0;
+            let mut seg_val_idx: usize = 0;
+            let mut pre_selection: Vec<bool> = Vec::new();
+
+            for (col_idx, col_name) in state.col_names.iter().enumerate() {
+                let type_oid = state.col_types[col_idx];
+
+                if !state.needed_cols[col_idx] && col_idx != sort_col {
+                    if state.segment_by.contains(col_name) {
+                        seg_val_idx += 1;
+                    } else {
+                        blob_idx += 1;
+                    }
+                    decompressed.push(Vec::new());
+                    continue;
+                }
+
+                if state.segment_by.contains(col_name) {
+                    let val = &seg.segment_values[seg_val_idx];
+                    let (datum, is_null) = match val {
+                        Some(s) => (string_to_datum(s, type_oid), false),
+                        None => (pg_sys::Datum::from(0), true),
+                    };
+                    let repeat_count = seg.row_count as usize;
+                    let repeated: Vec<(pg_sys::Datum, bool)> =
+                        (0..repeat_count).map(|_| (datum, is_null)).collect();
+                    decompressed.push(repeated);
+
+                    // Evaluate text Eq/Ne batch quals on segment_by columns
+                    if let Some(bq) = state.batch_quals.iter().find(|bq| {
+                        bq.col_idx == col_idx
+                            && bq.text_const.is_some()
+                            && matches!(bq.op, BatchCompareOp::Eq | BatchCompareOp::Ne)
+                    }) {
+                        let const_str = bq.text_const.as_ref().unwrap();
+                        let is_ne = bq.op == BatchCompareOp::Ne;
+                        let matches = match val {
+                            Some(s) => if is_ne { s != const_str } else { s == const_str },
+                            None => false,
+                        };
+                        if !matches {
+                            let fail_sel = vec![false; repeat_count];
+                            if pre_selection.is_empty() {
+                                pre_selection = fail_sel;
+                            } else {
+                                for (ps, fs) in pre_selection.iter_mut().zip(fail_sel.iter()) {
+                                    *ps = *ps && *fs;
+                                }
+                            }
+                        }
+                    }
+
+                    seg_val_idx += 1;
+                } else {
+                    let blob = &seg.compressed_blobs[blob_idx];
+                    let typmod = state.col_typmods[col_idx];
+
+                    let like_qual = state.batch_quals.iter().find(|bq| {
+                        bq.col_idx == col_idx
+                            && matches!(bq.op, BatchCompareOp::Like | BatchCompareOp::NotLike)
+                    });
+                    let text_eq_qual = state.batch_quals.iter().find(|bq| {
+                        bq.col_idx == col_idx
+                            && bq.text_const.is_some()
+                            && matches!(bq.op, BatchCompareOp::Eq | BatchCompareOp::Ne)
+                    });
+                    let has_any_batch_qual = state.batch_quals.iter().any(|bq| bq.col_idx == col_idx);
+
+                    if let Some(bq) = like_qual {
+                        let strat = bq.like_strategy.as_ref().unwrap();
+                        let neg = bq.op == BatchCompareOp::NotLike;
+                        let (datums, like_sel) =
+                            decompress_text_blob_with_like_filter(blob, type_oid, typmod, strat, neg, None);
+                        decompressed.push(datums);
+                        if pre_selection.is_empty() {
+                            pre_selection = like_sel;
+                        } else {
+                            for (ps, ls) in pre_selection.iter_mut().zip(like_sel.iter()) {
+                                *ps = *ps && *ls;
+                            }
+                        }
+                    } else if let Some(bq) = text_eq_qual {
+                        let const_str = bq.text_const.as_ref().unwrap();
+                        let is_ne = bq.op == BatchCompareOp::Ne;
+                        let (datums, eq_sel) = decompress_text_blob_with_eq_filter(
+                            blob, type_oid, typmod, const_str, is_ne, None,
+                        );
+                        decompressed.push(datums);
+                        if pre_selection.is_empty() {
+                            pre_selection = eq_sel;
+                        } else {
+                            for (ps, es) in pre_selection.iter_mut().zip(eq_sel.iter()) {
+                                *ps = *ps && *es;
+                            }
+                        }
+                    } else if has_any_batch_qual || col_idx == sort_col {
+                        let type_name = pg_type_name(type_oid);
+                        let datums = decompress_blob_to_datums(blob, &type_name, type_oid, typmod);
+                        decompressed.push(datums);
+                    } else {
+                        decompressed.push(Vec::new());
+                    }
+                    blob_idx += 1;
+                }
+            }
+
+            pg_sys::MemoryContextSwitchTo(old_ctx);
+
+            if let Some(t) = t_decompress {
+                let elapsed = t.elapsed().as_micros() as u64;
+                state.timing.decompress_us += elapsed;
+                state.timing.phase1_us += elapsed;
+            }
+            state.timing.segments_decompressed += 1;
+
+            let effective_row_count = seg.row_count as usize;
+
+            // Evaluate batch quals
+            let selection_vector = if !state.batch_quals.is_empty() || !pre_selection.is_empty() {
+                let t_batch = if instrument { Some(Instant::now()) } else { None };
+                let sv = evaluate_batch_quals(
+                    &decompressed,
+                    effective_row_count,
+                    &state.batch_quals,
+                    pre_selection,
+                );
+                if let Some(t) = t_batch {
+                    state.timing.batch_eval_us += t.elapsed().as_micros() as u64;
+                }
+                sv
+            } else {
+                Vec::new()
+            };
+
+            let any_selected = selection_vector.is_empty()
+                || selection_vector.iter().any(|&s| s);
+            if !any_selected {
+                continue;
+            }
+
+            // Collect candidates from passing rows
+            let sort_datums = &decompressed[sort_col];
+            if sort_datums.is_empty() {
+                continue;
+            }
+
+            for row_idx in 0..effective_row_count {
+                let passes = selection_vector.is_empty() || selection_vector[row_idx];
+                if !passes {
+                    continue;
+                }
+                let (datum, is_null) = sort_datums[row_idx];
+                if is_null {
+                    continue;
+                }
+
+                // Skip if worse than threshold (collation-aware comparison)
+                if let Some(threshold) = threshold_datum {
+                    let cmp = cmp_text_datums(datum, threshold);
+                    let dominated = if state.topn_ascending {
+                        cmp == std::cmp::Ordering::Greater
+                    } else {
+                        cmp == std::cmp::Ordering::Less
+                    };
+                    if dominated {
+                        continue;
+                    }
+                }
+
+                // Store Phase 1 datums for this candidate.
+                // Copy text datums to persistent context so they survive segment resets.
+                let mut p1_datums: Vec<(usize, pg_sys::Datum, bool)> =
+                    Vec::with_capacity(phase1_col_indices.len());
+                let mut sort_datum_copy = datum;
+                for &ci in phase1_col_indices {
+                    if decompressed[ci].is_empty() {
+                        continue;
+                    }
+                    let (d, isnull) = decompressed[ci][row_idx];
+                    if isnull {
+                        p1_datums.push((ci, pg_sys::Datum::from(0), true));
+                    } else if is_text_type(state.col_types[ci]) {
+                        let vl_ptr = d.cast_mut_ptr::<pg_sys::varlena>();
+                        let size = pgrx::varsize_any(vl_ptr);
+                        let old_mc = pg_sys::MemoryContextSwitchTo(phase1_persist_mcxt);
+                        let copy_ptr = pg_sys::palloc(size) as *mut u8;
+                        std::ptr::copy_nonoverlapping(vl_ptr as *const u8, copy_ptr, size);
+                        pg_sys::MemoryContextSwitchTo(old_mc);
+                        let copied_datum = pg_sys::Datum::from(copy_ptr as usize);
+                        p1_datums.push((ci, copied_datum, false));
+                        if ci == sort_col {
+                            sort_datum_copy = copied_datum;
+                        }
+                    } else {
+                        p1_datums.push((ci, d, false));
+                    }
+                }
+
+                candidates.push(TextTopNCandidate {
+                    segment_idx: seg_idx,
+                    row_idx,
+                    sort_datum: sort_datum_copy,
+                    phase1_datums: p1_datums,
+                });
+            }
+
+            // Update threshold
+            if candidates.len() >= effective_limit {
+                let n = effective_limit - 1;
+                if state.topn_ascending {
+                    candidates.select_nth_unstable_by(n, |a, b| cmp_text_datums(a.sort_datum, b.sort_datum));
+                    threshold_datum = Some(candidates[n].sort_datum);
+                } else {
+                    candidates.select_nth_unstable_by(n, |a, b| cmp_text_datums(b.sort_datum, a.sort_datum));
+                    threshold_datum = Some(candidates[n].sort_datum);
+                }
+            }
+        }
+
+        state.timing.topn_candidates = candidates.len() as u64;
+
+        // If no candidates or all fit in limit, fall back to normal path
+        if candidates.is_empty() || candidates.len() <= effective_limit {
+            for seg in state.segments_data.iter_mut() {
+                detoast_lazy_blobs(seg);
+            }
+            state.topn_limit = 0;
+            state.segment_index = 0;
+            pg_sys::MemoryContextDelete(phase1_persist_mcxt);
+            return;
+        }
+
+        // Sort and truncate to top-N (using collation-aware comparison)
+        if state.topn_ascending {
+            candidates.sort_by(|a, b| cmp_text_datums(a.sort_datum, b.sort_datum));
+        } else {
+            candidates.sort_by(|a, b| cmp_text_datums(b.sort_datum, a.sort_datum));
+        }
+        if state.topn_multi_col_sort {
+            let threshold_idx = std::cmp::min(effective_limit - 1, candidates.len() - 1);
+            let threshold_datum_val = candidates[threshold_idx].sort_datum;
+            if state.topn_ascending {
+                candidates.retain(|c| cmp_text_datums(c.sort_datum, threshold_datum_val) != std::cmp::Ordering::Greater);
+            } else {
+                candidates.retain(|c| cmp_text_datums(c.sort_datum, threshold_datum_val) != std::cmp::Ordering::Less);
+            }
+        } else {
+            candidates.truncate(effective_limit);
+        }
+
+        // Phase 2: decompress remaining columns for winning segments
+        let mut segment_topn_rows: HashMap<usize, Vec<usize>> = HashMap::new();
+        for c in &candidates {
+            segment_topn_rows.entry(c.segment_idx).or_default().push(c.row_idx);
+        }
+
+        state.timing.topn_phase2_segments = segment_topn_rows.len() as u64;
+
+        let phase1_col_set: std::collections::HashSet<usize> =
+            phase1_col_indices.iter().copied().collect();
+
+        struct RowData {
+            sort_datum: pg_sys::Datum,
+            datums: Vec<(pg_sys::Datum, bool)>,
+        }
+        let mut result_rows: Vec<RowData> = Vec::with_capacity(effective_limit);
+
+        // Detoast lazy blobs for winning segments only
+        let t_lazy = if instrument { Some(Instant::now()) } else { None };
+        for &seg_idx in segment_topn_rows.keys() {
+            detoast_lazy_blobs(&mut state.segments_data[seg_idx]);
+        }
+        if let Some(t) = t_lazy {
+            state.timing.heap_scan_us += t.elapsed().as_micros() as u64;
+        }
+
+        pg_sys::MemoryContextReset(state.segment_mcxt);
+
+        for (&seg_idx, row_indices) in &segment_topn_rows {
+            let seg = &state.segments_data[seg_idx];
+            let old_ctx = pg_sys::MemoryContextSwitchTo(state.segment_mcxt);
+
+            let max_row = *row_indices.iter().max().unwrap_or(&0);
+
+            let mut narrowed_selection = vec![false; seg.row_count as usize];
+            for &ri in row_indices {
+                narrowed_selection[ri] = true;
+            }
+
+            let t_phase2 = if instrument { Some(Instant::now()) } else { None };
+
+            let mut decompressed: Vec<Vec<(pg_sys::Datum, bool)>> = Vec::new();
+            let mut blob_idx: usize = 0;
+            let mut seg_val_idx: usize = 0;
+
+            for (col_idx, col_name) in state.col_names.iter().enumerate() {
+                let type_oid = state.col_types[col_idx];
+
+                if !state.needed_cols[col_idx] {
+                    if state.segment_by.contains(col_name) {
+                        seg_val_idx += 1;
+                    } else {
+                        blob_idx += 1;
+                    }
+                    decompressed.push(Vec::new());
+                    continue;
+                }
+
+                if state.segment_by.contains(col_name) {
+                    let val = &seg.segment_values[seg_val_idx];
+                    let (datum, is_null) = match val {
+                        Some(s) => (string_to_datum(s, type_oid), false),
+                        None => (pg_sys::Datum::from(0), true),
+                    };
+                    let repeated: Vec<(pg_sys::Datum, bool)> =
+                        (0..seg.row_count).map(|_| (datum, is_null)).collect();
+                    decompressed.push(repeated);
+                    seg_val_idx += 1;
+                } else {
+                    if phase1_col_set.contains(&col_idx) {
+                        decompressed.push(Vec::new());
+                        blob_idx += 1;
+                        continue;
+                    }
+
+                    let blob = &seg.compressed_blobs[blob_idx];
+                    let typmod = state.col_typmods[col_idx];
+                    let is_text = is_text_type(type_oid);
+                    let datums = if is_text {
+                        decompress_text_blob_with_selection(
+                            blob, type_oid, typmod, &narrowed_selection,
+                        )
+                    } else {
+                        let type_name = pg_type_name(type_oid);
+                        decompress_blob_to_datums_truncated(
+                            blob, &type_name, type_oid, typmod, max_row,
+                        )
+                    };
+                    decompressed.push(datums);
+                    blob_idx += 1;
+                }
+            }
+
+            if let Some(t) = t_phase2 {
+                let elapsed = t.elapsed().as_micros() as u64;
+                state.timing.decompress_us += elapsed;
+                state.timing.phase2_us += elapsed;
+            }
+
+            pg_sys::MemoryContextSwitchTo(old_ctx);
+
+            // Extract top-N rows, merging Phase 1 + Phase 2 datums
+            for &ri in row_indices {
+                let candidate = candidates.iter()
+                    .find(|c| c.segment_idx == seg_idx && c.row_idx == ri)
+                    .unwrap();
+
+                let mut row_datums = vec![(pg_sys::Datum::from(0), true); state.col_names.len()];
+
+                for &col_idx in &state.needed_col_indices {
+                    if !decompressed[col_idx].is_empty() && ri < decompressed[col_idx].len() {
+                        row_datums[col_idx] = decompressed[col_idx][ri];
+                    }
+                }
+
+                for &(ci, d, isnull) in &candidate.phase1_datums {
+                    row_datums[ci] = (d, isnull);
+                }
+
+                result_rows.push(RowData { sort_datum: candidate.sort_datum, datums: row_datums });
+            }
+        }
+
+        // Sort result rows (collation-aware)
+        if !state.topn_multi_col_sort {
+            if state.topn_ascending {
+                result_rows.sort_by(|a, b| cmp_text_datums(a.sort_datum, b.sort_datum));
+            } else {
+                result_rows.sort_by(|a, b| cmp_text_datums(b.sort_datum, a.sort_datum));
+            }
+        }
+
+        state.topn_buffer = result_rows.into_iter().map(|r| r.datums).collect();
+        state.topn_cursor = 0;
+
+        pg_sys::MemoryContextSetParent(phase1_persist_mcxt, state.segment_mcxt);
+
+        pgrx::log!(
+            "pg_deltax topn_text: candidates={} top_n={} phase2_segments={}",
+            state.timing.topn_candidates,
+            state.topn_buffer.len(),
+            state.timing.topn_phase2_segments,
+        );
+    }
+}
+
 /// ExecCustomScan callback: return the next tuple.
 ///
 /// PostgreSQL's ExecCustomScan wrapper does NOT apply qualification or
@@ -1483,7 +2628,11 @@ unsafe fn exec_topn(
         // re-enter exec_custom_scan to start emitting from the buffer.
         if state.topn_limit > 0 && !state.topn_done && state.topn_sort_col.is_some() {
             let plan_qual_list = (*(*node).ss.ps.plan).qual;
-            exec_topn_two_pass(node, state, instrument, plan_qual_list);
+            if state.topn_sort_is_text {
+                exec_topn_text(node, state, instrument, plan_qual_list);
+            } else {
+                exec_topn_two_pass(node, state, instrument, plan_qual_list);
+            }
             state.topn_done = true;
 
             if state.topn_limit == 0 {

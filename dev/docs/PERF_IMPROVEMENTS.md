@@ -735,41 +735,40 @@ hash table union).
 **Files:** `src/scan/exec/agg.rs` (two-level wrapper around hashbrown in
 compact and mixed aggregation paths)
 
-### 37. Non-time column sort pushdown via min/max
+### 37. Parallel Top-N text scan with byte-order pruning [DONE]
 
-**Target: Q26 4.9s -> ~0.3s (ClickBench Q25:
-`SELECT SearchPhrase WHERE <> '' ORDER BY SearchPhrase LIMIT 10`)**
-**Complexity: Medium**
+**Impact: Q25 5.6s -> ~2.0s (2.8x improvement)**
 
-Top-N pushdown (#20) currently only works for the time column, because
-segments are sorted by `min_time`. For non-time orderable columns,
-per-segment `_min_`/`_max_` metadata exists (#6) but is not used for
-scan ordering or early termination.
+Parallelizes the text Top-N scan (`ORDER BY text_col LIMIT N`) using
+`std::thread::scope`. The key insight: `varstr_cmp`/`strcoll` costs ~2μs
+per call, dominating execution when ~1.5M rows pass the WHERE filter.
+Byte-order comparison (`str::cmp`) costs ~10ns and is used for aggressive
+pruning in worker threads, with `strcoll_cmp` applied only on the small
+merged candidate set for correct collation-aware final ordering.
 
-**Approach:**
+**Architecture:**
 
-1. **Sort segments by target column's min value:** For `ORDER BY col ASC
-   LIMIT N`, sort segments by `_min_col` ascending before processing.
-2. **Threshold-based pruning:** Maintain a Top-N heap. Once the heap is
-   full with threshold `T`, skip all segments where `_min_col > T` (for
-   ASC) or `_max_col < T` (for DESC).
-3. **Advertise pathkeys** for the sorted column so PG eliminates the Sort
-   node above the custom scan.
+- **Phase 0 (main thread):** Detoast + segment pruning → surviving segment
+  indices. PG API calls (detoast) must stay on the main thread.
+- **Phase 1 (parallel):** Workers decompress text columns to `SegTextColumn`
+  (pure Rust, thread-safe), evaluate text quals via `apply_text_eq_filter`/
+  `apply_text_like_filter`, and collect candidates with byte-order threshold
+  pruning. Each worker keeps `max(limit * 100, 10000)` candidates.
+- **Merge (main thread):** Byte-order pre-prune → `strcoll_cmp` final sort
+  → truncate to limit.
+- **Phase 2 (main thread):** Detoast + decompress ALL needed columns for
+  winning segments only.
 
-For Q26 (`ORDER BY SearchPhrase LIMIT 10`), most segments' `_min_`
-SearchPhrase exceeds the 10th-smallest value across all segments. After
-processing a handful of segments with the lowest min values, the threshold
-prunes all remaining segments.
+Shared text primitives (`SegTextColumn`, `TextQualInfo`, `decompress_text_to_seg_col`,
+`apply_text_eq_filter`, `apply_text_like_filter`, `strcoll_cmp`) extracted to
+`src/scan/exec/text_col.rs` for reuse by both the agg and decompress paths.
 
-**Constraint:** Unlike time-sorted segments where intra-segment order is
-guaranteed, non-time columns are not sorted within segments. The Top-N
-heap must collect all candidates from each processed segment and may need
-to process more segments than for time-ordered queries. Still, the segment
-count reduction from ~3300 to ~10-50 dominates.
+Falls back to sequential execution when `n_workers <= 1` or fewer than 2
+surviving segments.
 
-**Files:** `src/scan/path.rs` (detect non-time ORDER BY, advertise
-pathkeys), `src/scan/exec/decompress.rs` (segment sort + threshold
-pruning generalized beyond time column)
+**Files:** `src/scan/exec/text_col.rs` (new, shared primitives),
+`src/scan/exec/decompress.rs` (parallel `exec_topn_text`),
+`src/scan/exec/agg.rs` (imports from text_col)
 
 ### 38. Reduce per-partition SPI overhead
 
