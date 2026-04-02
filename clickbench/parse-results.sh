@@ -5,6 +5,8 @@
 set -euo pipefail
 
 MACHINE="${1:-c6a.4xlarge}"
+LOAD_TIME="${LOAD_TIME:-0}"
+DATA_SIZE="${DATA_SIZE:-0}"
 
 # Collect timings: 3 per query, in milliseconds → seconds
 timings=()
@@ -30,8 +32,8 @@ cat <<EOF
     "hardware": "cpu",
     "tuned": "no",
     "tags": ["Rust", "PostgreSQL compatible", "column-oriented", "time-series", "lukewarm-cold-run"],
-    "load_time": 0,
-    "data_size": 0,
+    "load_time": ${LOAD_TIME},
+    "data_size": ${DATA_SIZE},
     "result": [
 EOF
 

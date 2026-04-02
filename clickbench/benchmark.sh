@@ -13,7 +13,7 @@ DB=test
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SPLIT_DIR=/tmp/hits_chunks
 LOAD_WORKERS=8
-COMPRESS_WORKERS=8
+COMPRESS_WORKERS=16
 
 # Install PostgreSQL 18
 export DEBIAN_FRONTEND=noninteractive
@@ -118,9 +118,17 @@ echo "Vacuum time: $((VACUUM_END - VACUUM_START))s"
 
 # Keep chunks for potential re-runs (they're ~14GB but save 5+ min of re-splitting)
 
-# Report data size
-echo -n "Data size: "
-sudo -u postgres psql "$DB" -t -c "SELECT pg_total_relation_size('hits')"
+# Capture data size (bytes)
+DATA_SIZE=$(sudo -u postgres psql "$DB" -t -A -c "SELECT pg_database_size('$DB')")
+echo "Data size: $DATA_SIZE bytes ($(echo "$DATA_SIZE / 1024 / 1024 / 1024" | bc -l | xargs printf '%.2f') GB)"
+
+# Save load stats for the bench target to pick up later
+LOAD_TIME=$((LOAD_END - LOAD_START + COMPRESS_END - COMPRESS_START + VACUUM_END - VACUUM_START))
+cat > ~/clickbench/load_stats.env <<STATS
+LOAD_TIME=$LOAD_TIME
+DATA_SIZE=$DATA_SIZE
+STATS
+echo "Saved load stats to ~/clickbench/load_stats.env (load_time=${LOAD_TIME}s, data_size=${DATA_SIZE})"
 
 # Lower work_mem and disable JIT for the query phase
 sudo -u postgres psql -c "ALTER DATABASE $DB SET work_mem TO '256MB'"

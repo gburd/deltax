@@ -94,7 +94,7 @@ bench:
 	@echo "=== Running ClickBench ==="
 	$(EC2_SSH) 'cd ~/clickbench && bash run.sh | tee /tmp/bench_output.txt'
 	@echo "=== Parsing results ==="
-	$(EC2_SSH) 'cd ~/clickbench && bash parse-results.sh < /tmp/bench_output.txt > /tmp/pg_deltax.json'
+	$(EC2_SSH) 'cd ~/clickbench && source load_stats.env 2>/dev/null; LOAD_TIME=$${LOAD_TIME:-0} DATA_SIZE=$${DATA_SIZE:-0} bash parse-results.sh < /tmp/bench_output.txt > /tmp/pg_deltax.json'
 	@mkdir -p $(RESULTS_DIR) $(HISTORY_DIR)
 	$(EC2_SCP) $(EC2_USER)@$(EC2):/tmp/pg_deltax.json $(RESULTS_DIR)/pg_deltax.json
 	$(eval TS := $(shell date +%Y%m%d_%H%M%S))
