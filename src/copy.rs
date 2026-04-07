@@ -501,16 +501,43 @@ fn handle_copy_from_inner(copy_stmt: *mut pg_sys::CopyStmt, format_idx: i32) {
         let filename = unsafe { CStr::from_ptr(cs.filename) }
             .to_str()
             .unwrap_or_else(|_| pgrx::error!("pg_deltax: filename is not valid UTF-8"));
-        let copy_opts = extract_copy_text_options(cs.options, format_idx);
-        handle_copy_from_file(
-            filename,
-            copy_opts,
-            &state,
-            &mut part_buffers,
-            &partitions,
-            &range_starts,
-            &range_ends,
-        );
+        let files = expand_file_glob(filename);
+        let is_parquet = files[0].ends_with(".parquet") || files[0].ends_with(".parq");
+
+        if is_parquet {
+            let n_workers = crate::get_parallel_workers();
+            if n_workers <= 1 || files.len() <= 1 {
+                for file in &files {
+                    handle_copy_from_parquet(
+                        file,
+                        &state,
+                        &mut part_buffers,
+                        &range_starts,
+                        &range_ends,
+                    );
+                }
+            } else {
+                handle_copy_from_parquet_parallel(
+                    &files,
+                    &state,
+                    &mut part_buffers,
+                    &range_starts,
+                    &range_ends,
+                );
+            }
+        } else {
+            // Existing TSV path (single file, no glob support for TSV)
+            let copy_opts = extract_copy_text_options(cs.options, format_idx);
+            handle_copy_from_file(
+                &files[0],
+                copy_opts,
+                &state,
+                &mut part_buffers,
+                &partitions,
+                &range_starts,
+                &range_ends,
+            );
+        }
     } else {
         handle_copy_from_legacy(
             cs,
@@ -1397,6 +1424,212 @@ struct ColResult {
     nonnull_count: i64,
 }
 
+/// A fully compressed segment ready for heap_insert on the main thread.
+/// Produced by compress workers, consumed by the main thread's flush loop.
+struct CompressedSegment {
+    partition_idx: usize,
+    seg_id: i32,
+    row_count: usize,
+    blobs: Vec<(u16, Vec<u8>)>,      // (col_idx, compressed_data)
+    bloom_data: Vec<u8>,              // empty if blooms disabled
+    meta_values_csv: String,          // pre-formatted VALUES clause innards
+    total_compressed_size: i64,
+}
+
+/// Sort, compress, and prepare metadata for a segment (pure Rust, no PG calls).
+/// Returns a CompressedSegment ready for heap_insert by the main thread.
+fn compress_segment(
+    mut typed_cols: Vec<TypedColumn>,
+    row_count: usize,
+    seg_id: i32,
+    partition_idx: usize,
+    columns: &[ColumnMeta],
+    order_col_indices: &[usize],
+    bloom_enabled: bool,
+    n_workers: usize,
+) -> CompressedSegment {
+    // Sort
+    sort_typed_columns(&mut typed_cols, order_col_indices, row_count);
+
+    // Ndistinct
+    let ndistinct = compute_segment_ndistinct(&typed_cols, columns);
+
+    // Segment_by values
+    let seg_values: Vec<Option<String>> = columns
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.is_segment_by)
+        .map(|(i, _)| {
+            if let TypedColumn::Text(v) = &typed_cols[i] {
+                if v.is_empty() { None } else { v[0].clone() }
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // Build non-segment-by column list
+    let non_segby: Vec<(u16, usize)> = {
+        let mut col_idx: u16 = 0;
+        let mut result = Vec::new();
+        for (i, col) in columns.iter().enumerate() {
+            if col.is_segment_by { continue; }
+            result.push((col_idx, i));
+            col_idx += 1;
+        }
+        result
+    };
+    let col_results: Vec<ColResult> = if n_workers > 1 && non_segby.len() > 1 {
+        let chunk_size = non_segby.len().div_ceil(n_workers);
+        let typed_cols_ref = &typed_cols;
+        let columns_ref = columns;
+        std::thread::scope(|s| {
+            non_segby
+                .chunks(chunk_size)
+                .map(|chunk| {
+                    s.spawn(move || {
+                        chunk.iter().map(|&(col_idx, col_i)| {
+                            let col = &columns_ref[col_i];
+                            let compressed = compress_typed_column(&typed_cols_ref[col_i], &col.data_type);
+                            let (min_val, max_val) = if supports_minmax(&col.data_type) {
+                                compute_typed_minmax(&typed_cols_ref[col_i], &col.data_type)
+                            } else {
+                                (None, None)
+                            };
+                            let (sum_val, nonnull_count) = if supports_sum(&col.data_type) {
+                                compute_typed_sum(&typed_cols_ref[col_i])
+                            } else {
+                                (None, 0)
+                            };
+                            ColResult { col_idx, col_i, compressed, min_val, max_val, sum_val, nonnull_count }
+                        }).collect::<Vec<_>>()
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .flat_map(|h| h.join().unwrap())
+                .collect()
+        })
+    } else {
+        non_segby.iter().map(|&(col_idx, col_i)| {
+            let col = &columns[col_i];
+            let compressed = compress_typed_column(&typed_cols[col_i], &col.data_type);
+            let (min_val, max_val) = if supports_minmax(&col.data_type) {
+                compute_typed_minmax(&typed_cols[col_i], &col.data_type)
+            } else {
+                (None, None)
+            };
+            let (sum_val, nonnull_count) = if supports_sum(&col.data_type) {
+                compute_typed_sum(&typed_cols[col_i])
+            } else {
+                (None, 0)
+            };
+            ColResult { col_idx, col_i, compressed, min_val, max_val, sum_val, nonnull_count }
+        }).collect()
+    };
+
+    // Build blobs and meta
+    let mut total_size: i64 = 0;
+    let mut blobs: Vec<(u16, Vec<u8>)> = Vec::new();
+    let mut col_minmax: std::collections::HashMap<usize, (Option<String>, Option<String>)> =
+        std::collections::HashMap::new();
+    let mut col_sums: std::collections::HashMap<usize, (Option<String>, i64)> =
+        std::collections::HashMap::new();
+
+    for cr in &col_results {
+        total_size += cr.compressed.len() as i64;
+        if supports_minmax(&columns[cr.col_i].data_type) {
+            col_minmax.insert(cr.col_i, (cr.min_val.clone(), cr.max_val.clone()));
+        }
+        if supports_sum(&columns[cr.col_i].data_type) {
+            col_sums.insert(cr.col_i, (cr.sum_val.clone(), cr.nonnull_count));
+        }
+    }
+    for cr in col_results {
+        blobs.push((cr.col_idx, cr.compressed));
+    }
+
+    // Build VALUES clause
+    let mut insert_vals = Vec::new();
+    insert_vals.push(seg_id.to_string());
+
+    // Segment-by columns
+    let mut seg_idx = 0;
+    for col in columns {
+        if col.is_segment_by && seg_idx < seg_values.len() {
+            match &seg_values[seg_idx] {
+                Some(v) => insert_vals.push(format!("'{}'", v.replace('\'', "''"))),
+                None => insert_vals.push("NULL".to_string()),
+            }
+            seg_idx += 1;
+        }
+    }
+
+    // Min/max columns
+    for (i, col) in columns.iter().enumerate() {
+        if !col.is_segment_by && supports_minmax(&col.data_type) {
+            match col_minmax.get(&i) {
+                Some((Some(min_val), Some(max_val))) => {
+                    insert_vals.push(format_minmax_for_insert(min_val, &col.data_type));
+                    insert_vals.push(format_minmax_for_insert(max_val, &col.data_type));
+                }
+                _ => {
+                    insert_vals.push("NULL".to_string());
+                    insert_vals.push("NULL".to_string());
+                }
+            }
+        }
+    }
+
+    // Sum and non-null count
+    for (i, col) in columns.iter().enumerate() {
+        if !col.is_segment_by && supports_sum(&col.data_type) {
+            match col_sums.get(&i) {
+                Some((Some(sum_val), nonnull_count)) => {
+                    insert_vals.push(sum_val.clone());
+                    insert_vals.push(nonnull_count.to_string());
+                }
+                _ => {
+                    insert_vals.push("NULL".to_string());
+                    insert_vals.push("0".to_string());
+                }
+            }
+        }
+    }
+
+    // Ndistinct
+    let mut nd_idx = 0;
+    for col in columns {
+        if !col.is_segment_by {
+            if nd_idx < ndistinct.len() {
+                insert_vals.push(ndistinct[nd_idx].to_string());
+            } else {
+                insert_vals.push("0".to_string());
+            }
+            nd_idx += 1;
+        }
+    }
+
+    insert_vals.push((row_count as u32).to_string());
+
+    // Bloom filters
+    let bloom_data = if bloom_enabled {
+        compute_segment_blooms(&typed_cols, columns, &ndistinct)
+    } else {
+        Vec::new()
+    };
+
+    CompressedSegment {
+        partition_idx,
+        seg_id,
+        row_count,
+        blobs,
+        bloom_data,
+        meta_values_csv: insert_vals.join(", "),
+        total_compressed_size: total_size,
+    }
+}
+
 /// Flush a full segment from a partition buffer, using parallel compression.
 fn flush_segment(
     buf: &mut PartitionBuffer,
@@ -1864,6 +2097,95 @@ fn flush_partition_blobs(
     buf.blobs_flushed = true;
 }
 
+/// Write a pre-compressed segment into the partition buffer and flush to PG when threshold is reached.
+/// This is the I/O-only counterpart to `compress_segment` (which does all the CPU work).
+fn write_compressed_segment(
+    cs: CompressedSegment,
+    buf: &mut PartitionBuffer,
+    state: &BackfillState,
+) {
+    // Ensure companion tables exist
+    if !buf.meta_table_created {
+        let (_, blobs_fqn, blooms_fqn, meta_ddl, _, _) =
+            build_companion_ddl(&buf.partition_table, &state.columns);
+        spi_exec(&meta_ddl);
+        spi_exec(&format!(
+            "CREATE TABLE {} (_col_idx SMALLINT NOT NULL, _segment_id INT NOT NULL, _data BYTEA COMPRESSION lz4)",
+            blobs_fqn
+        ));
+        if crate::BLOOM_FILTERS.get() {
+            spi_exec(&format!(
+                "CREATE TABLE {} (_segment_id INT NOT NULL, _data BYTEA COMPRESSION lz4 NOT NULL)",
+                blooms_fqn
+            ));
+        }
+        buf.meta_table_created = true;
+        buf.blobs_table_created = true;
+    }
+
+    // Cache meta column list
+    if buf.meta_fqn.is_none() {
+        let (meta_fqn, _, _, _, _, _) =
+            build_companion_ddl(&buf.partition_table, &state.columns);
+        buf.meta_fqn = Some(meta_fqn);
+
+        let mut cols = Vec::new();
+        cols.push("_segment_id".to_string());
+        for col in &state.columns {
+            if col.is_segment_by {
+                cols.push(format!("\"{}\"", col.name));
+            }
+        }
+        for col in &state.columns {
+            if !col.is_segment_by && supports_minmax(&col.data_type) {
+                cols.push(format!("\"_min_{}\"", col.name));
+                cols.push(format!("\"_max_{}\"", col.name));
+            }
+        }
+        for col in &state.columns {
+            if !col.is_segment_by && supports_sum(&col.data_type) {
+                cols.push(format!("\"_sum_{}\"", col.name));
+                cols.push(format!("\"_nonnull_count_{}\"", col.name));
+            }
+        }
+        for col in &state.columns {
+            if !col.is_segment_by {
+                cols.push(format!("\"_ndistinct_{}\"", col.name));
+            }
+        }
+        cols.push("_row_count".to_string());
+        buf.meta_insert_cols = Some(cols.join(", "));
+    }
+
+    // Buffer meta row
+    buf.meta_insert_rows.push(format!("({})", cs.meta_values_csv));
+    if buf.meta_insert_rows.len() >= META_BATCH_SIZE {
+        flush_meta_buffer(buf);
+    }
+
+    buf.total_compressed_size += cs.total_compressed_size;
+    buf.total_rows += cs.row_count as i64;
+
+    // Track segment_id for next allocation
+    if cs.seg_id >= buf.next_segment_id {
+        buf.next_segment_id = cs.seg_id + 1;
+    }
+
+    // Buffer blobs
+    for (col_idx, blob) in cs.blobs {
+        buf.blob_buffer_size += blob.len();
+        buf.blob_buffer.push((col_idx, cs.seg_id, blob));
+    }
+    if !cs.bloom_data.is_empty() {
+        buf.bloom_buffer.push((cs.seg_id, cs.bloom_data));
+    }
+
+    // Flush blobs when threshold reached
+    if buf.blob_buffer_size >= BLOB_BUFFER_THRESHOLD {
+        flush_partition_blobs(buf, &state.columns);
+    }
+}
+
 /// ANALYZE companion tables and mark partition as compressed in catalog.
 fn finalize_partition(
     buf: &mut PartitionBuffer,
@@ -1924,6 +2246,517 @@ fn find_partition(range_starts: &[i64], range_ends: &[i64], time_usec: i64) -> O
         Some(idx)
     } else {
         None
+    }
+}
+
+// ============================================================================
+// Glob expansion
+// ============================================================================
+
+fn expand_file_glob(pattern: &str) -> Vec<String> {
+    if pattern.contains('*') || pattern.contains('?') || pattern.contains('[') {
+        let mut files: Vec<String> = glob::glob(pattern)
+            .unwrap_or_else(|e| pgrx::error!("pg_deltax: invalid glob pattern: {}", e))
+            .map(|r| {
+                r.unwrap_or_else(|e| pgrx::error!("pg_deltax: glob error: {}", e))
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        if files.is_empty() {
+            pgrx::error!("pg_deltax: no files match pattern '{}'", pattern);
+        }
+        files.sort();
+        files
+    } else {
+        vec![pattern.to_string()]
+    }
+}
+
+// ============================================================================
+// Parquet loading
+// ============================================================================
+
+fn handle_copy_from_parquet(
+    filename: &str,
+    state: &BackfillState,
+    part_buffers: &mut [PartitionBuffer],
+    range_starts: &[i64],
+    range_ends: &[i64],
+) {
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+    use std::fs::File;
+
+    let file = File::open(filename)
+        .unwrap_or_else(|e| pgrx::error!("pg_deltax: cannot open '{}': {}", filename, e));
+    let reader = SerializedFileReader::new(file)
+        .unwrap_or_else(|e| pgrx::error!("pg_deltax: invalid parquet file '{}': {}", filename, e));
+    let col_mapping = crate::copyparquet::map_parquet_to_pg_columns(
+        reader.metadata().file_metadata().schema_descr(),
+        &state.columns,
+    ).unwrap_or_else(|e| pgrx::error!("{}", e));
+
+    let mut file_rows: i64 = 0;
+    let mut file_skipped: i64 = 0;
+    let total_parquet_rows: i64 = (0..reader.metadata().num_row_groups())
+        .map(|i| reader.metadata().row_group(i).num_rows())
+        .sum();
+
+    for rg_idx in 0..reader.metadata().num_row_groups() {
+        let num_rows = reader.metadata().row_group(rg_idx).num_rows() as usize;
+        if num_rows == 0 {
+            continue;
+        }
+        let rg_reader = reader
+            .get_row_group(rg_idx)
+            .unwrap_or_else(|e| pgrx::error!("pg_deltax: failed to read row group {}: {}", rg_idx, e));
+
+        let typed_cols = crate::copyparquet::read_row_group_columns(
+            &*rg_reader,
+            &col_mapping,
+            &state.kinds,
+            num_rows,
+            state.columns.len(),
+        ).unwrap_or_else(|e| pgrx::error!("{}", e));
+
+        let before = file_rows;
+        route_rows_to_partitions(
+            typed_cols,
+            num_rows,
+            state,
+            part_buffers,
+            range_starts,
+            range_ends,
+            &mut file_rows,
+        );
+        file_skipped += num_rows as i64 - (file_rows - before);
+    }
+
+    if file_skipped > 0 {
+        pgrx::warning!(
+            "pg_deltax: loaded {} rows, skipped {} rows (no matching partition) from parquet file '{}' ({} total in file)",
+            file_rows, file_skipped, filename, total_parquet_rows
+        );
+    } else {
+        pgrx::notice!(
+            "pg_deltax: loaded {} rows from parquet file '{}'",
+            file_rows,
+            filename
+        );
+    }
+}
+
+/// A batch of rows pre-routed to a single partition by a worker thread.
+struct RoutedBatch {
+    partition_idx: usize,
+    typed_cols: Vec<TypedColumn>,
+    num_rows: usize,
+}
+
+/// Shared state for parallel parquet decode+route workers.
+struct ParquetWorkerJob {
+    files: Vec<String>,
+    columns: Vec<ColumnMeta>,
+    kinds: Vec<ColumnKind>,
+    range_starts: Vec<i64>,
+    range_ends: Vec<i64>,
+    time_col_index: usize,
+    n_partitions: usize,
+    next_file: std::sync::atomic::AtomicUsize,
+}
+
+/// Decode one parquet file and route rows to per-partition batches (pure Rust, no PG calls).
+/// Sends one RoutedBatch per non-empty partition per row group through the channel.
+fn decode_and_route_parquet_file(
+    filename: &str,
+    job: &ParquetWorkerJob,
+    tx: &std::sync::mpsc::SyncSender<Result<RoutedBatch, String>>,
+) -> Result<(), String> {
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+    use std::fs::File;
+
+    let file = File::open(filename)
+        .map_err(|e| format!("pg_deltax: cannot open '{}': {}", filename, e))?;
+    let reader = SerializedFileReader::new(file)
+        .map_err(|e| format!("pg_deltax: invalid parquet '{}': {}", filename, e))?;
+    let col_mapping = crate::copyparquet::map_parquet_to_pg_columns(
+        reader.metadata().file_metadata().schema_descr(),
+        &job.columns,
+    )?;
+
+    for rg_idx in 0..reader.metadata().num_row_groups() {
+        let num_rows = reader.metadata().row_group(rg_idx).num_rows() as usize;
+        if num_rows == 0 {
+            continue;
+        }
+        let rg_reader = reader
+            .get_row_group(rg_idx)
+            .map_err(|e| format!("pg_deltax: row group {} error: {}", rg_idx, e))?;
+        let typed_cols = crate::copyparquet::read_row_group_columns(
+            &*rg_reader,
+            &col_mapping,
+            &job.kinds,
+            num_rows,
+            job.columns.len(),
+        )?;
+
+        // Route rows to partitions (pure Rust)
+        let time_vals = match &typed_cols[job.time_col_index] {
+            TypedColumn::Int64(v) => v,
+            _ => return Err("pg_deltax: time column must be Int64 (timestamp)".to_string()),
+        };
+
+        // Fast path: check if entire batch fits in one partition
+        let mut min_ts = i64::MAX;
+        let mut max_ts = i64::MIN;
+        for &ts in time_vals.iter().take(num_rows).flatten() {
+            if ts < min_ts { min_ts = ts; }
+            if ts > max_ts { max_ts = ts; }
+        }
+
+        let min_part = find_partition(&job.range_starts, &job.range_ends, min_ts);
+        let max_part = find_partition(&job.range_starts, &job.range_ends, max_ts);
+
+        if min_part == max_part {
+            if let Some(part_idx) = min_part {
+                let batch = RoutedBatch { partition_idx: part_idx, typed_cols, num_rows };
+                if tx.send(Ok(batch)).is_err() { return Ok(()); }
+            }
+            continue;
+        }
+
+        // Slow path: scatter rows into per-partition buffers
+        let mut part_cols: Vec<Option<Vec<TypedColumn>>> = (0..job.n_partitions).map(|_| None).collect();
+        let mut part_counts: Vec<usize> = vec![0; job.n_partitions];
+
+        for (row, ts_opt) in time_vals.iter().enumerate().take(num_rows) {
+            let ts = ts_opt.unwrap_or(0);
+            if let Some(part_idx) = find_partition(&job.range_starts, &job.range_ends, ts) {
+                let cols = part_cols[part_idx].get_or_insert_with(|| {
+                    job.kinds.iter().map(|k| new_typed_column(*k)).collect()
+                });
+                for (i, src_col) in typed_cols.iter().enumerate() {
+                    cols[i].push_from(src_col, row);
+                }
+                part_counts[part_idx] += 1;
+            }
+        }
+
+        // Send one RoutedBatch per non-empty partition
+        for (part_idx, cols_opt) in part_cols.into_iter().enumerate() {
+            if let Some(cols) = cols_opt {
+                let batch = RoutedBatch {
+                    partition_idx: part_idx,
+                    typed_cols: cols,
+                    num_rows: part_counts[part_idx],
+                };
+                if tx.send(Ok(batch)).is_err() { return Ok(()); }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Three-stage parallel parquet loading pipeline:
+///
+/// ```text
+/// Stage 1: Decode+Route workers (4 threads)
+///     Read parquet files, decode row groups, route rows to partitions
+///     → route_channel(4) →
+///
+/// Stage 2: Main thread accumulator
+///     Receive routed batches, extend partition buffers
+///     When buffer hits segment_size, ship typed_cols to compress pool
+///     → compress_channel(4) →
+///
+/// Stage 3: Compress workers (remaining threads)
+///     Sort, compute ndistinct/blooms, compress columns
+///     → flush_channel(4) →
+///
+/// Stage 4: Main thread flusher
+///     Receive CompressedSegments, heap_insert blobs (I/O only)
+/// ```
+///
+/// Stages 2 and 4 share the main thread: the main thread multiplexes between
+/// receiving routed batches and draining compressed segments ready for flush.
+///
+/// We use plain `std::thread::spawn` (not `thread::scope`) because the main
+/// thread calls PG functions that may `longjmp` (via `pgrx::error!`). With
+/// regular threads + Arc, a longjmp drops channels and workers exit cleanly.
+fn handle_copy_from_parquet_parallel(
+    files: &[String],
+    state: &BackfillState,
+    part_buffers: &mut [PartitionBuffer],
+    range_starts: &[i64],
+    range_ends: &[i64],
+) {
+    use std::sync::Arc;
+    use std::sync::mpsc::sync_channel;
+
+    let total_workers = crate::get_parallel_workers();
+    // Split workers: up to 4 for decode+route, remainder for compress
+    let n_decode = total_workers.min(files.len()).min(4);
+    let n_compress = total_workers.saturating_sub(n_decode).max(1);
+
+    let (route_tx, route_rx) = sync_channel::<Result<RoutedBatch, String>>(4);
+    let (compress_tx, compress_rx) = sync_channel::<CompressedSegment>(4);
+
+    let decode_job = Arc::new(ParquetWorkerJob {
+        files: files.to_vec(),
+        columns: state.columns.clone(),
+        kinds: state.kinds.clone(),
+        range_starts: range_starts.to_vec(),
+        range_ends: range_ends.to_vec(),
+        time_col_index: state.time_col_index,
+        n_partitions: part_buffers.len(),
+        next_file: std::sync::atomic::AtomicUsize::new(0),
+    });
+
+    // Shared state for compress workers
+    let compress_columns: Arc<Vec<ColumnMeta>> = Arc::new(state.columns.clone());
+    let compress_order: Arc<Vec<usize>> = Arc::new(state.order_col_indices.clone());
+    let bloom_enabled = crate::BLOOM_FILTERS.get();
+
+    // Channel for segments to compress: (typed_cols, row_count, seg_id, partition_idx)
+    let (seg_tx, seg_rx) = sync_channel::<(Vec<TypedColumn>, usize, i32, usize)>(4);
+    let seg_rx = Arc::new(std::sync::Mutex::new(seg_rx));
+
+    pgrx::notice!(
+        "pg_deltax: parallel parquet pipeline: {} decode + {} compress workers, {} files",
+        n_decode, n_compress, files.len()
+    );
+
+    // Stage 1: Decode+route workers
+    let mut handles = Vec::new();
+    for _ in 0..n_decode {
+        let tx = route_tx.clone();
+        let job = Arc::clone(&decode_job);
+        handles.push(std::thread::spawn(move || {
+            loop {
+                let idx = job.next_file.fetch_add(1, Ordering::Relaxed);
+                if idx >= job.files.len() { break; }
+                if let Err(e) = decode_and_route_parquet_file(&job.files[idx], &job, &tx) {
+                    let _ = tx.send(Err(e));
+                    return;
+                }
+            }
+        }));
+    }
+    drop(route_tx);
+
+    // Stage 3: Compress workers
+    for _ in 0..n_compress {
+        let seg_rx = Arc::clone(&seg_rx);
+        let compress_tx = compress_tx.clone();
+        let columns = Arc::clone(&compress_columns);
+        let order = Arc::clone(&compress_order);
+        handles.push(std::thread::spawn(move || {
+            loop {
+                let (typed_cols, row_count, seg_id, partition_idx) = {
+                    let rx = seg_rx.lock().unwrap();
+                    match rx.recv() {
+                        Ok(item) => item,
+                        Err(_) => break, // channel closed
+                    }
+                };
+                let cs = compress_segment(
+                    typed_cols, row_count, seg_id, partition_idx,
+                    &columns, &order, bloom_enabled, 1,
+                );
+                if compress_tx.send(cs).is_err() { return; }
+            }
+        }));
+    }
+    drop(compress_tx);
+
+    // Helper: drain all ready compressed segments (non-blocking).
+    // Must be called frequently to prevent deadlock: compress workers block on
+    // compress_tx.send() if its channel is full, which prevents them from consuming
+    // seg_rx, which prevents the main thread's seg_tx.try_send() from succeeding.
+    fn drain_compressed(
+        part_buffers: &mut [PartitionBuffer],
+        compress_rx: &std::sync::mpsc::Receiver<CompressedSegment>,
+        state: &BackfillState,
+    ) {
+        while let Ok(cs) = compress_rx.try_recv() {
+            let pi = cs.partition_idx;
+            write_compressed_segment(cs, &mut part_buffers[pi], state);
+        }
+    }
+
+    // Helper: send a segment to the compress pool, draining compressed results
+    // to avoid deadlock. If try_send fails because the channel is full, we drain
+    // compressed results first, then block on compress_rx.recv() to guarantee
+    // progress (avoids spinning at 100% CPU).
+    type SegItem = (Vec<TypedColumn>, usize, i32, usize);
+    fn send_to_compress(
+        mut item: SegItem,
+        seg_tx: &std::sync::mpsc::SyncSender<SegItem>,
+        part_buffers: &mut [PartitionBuffer],
+        compress_rx: &std::sync::mpsc::Receiver<CompressedSegment>,
+        state: &BackfillState,
+    ) {
+        loop {
+            match seg_tx.try_send(item) {
+                Ok(()) => return,
+                Err(std::sync::mpsc::TrySendError::Full(returned)) => {
+                    item = returned;
+                    // Drain any ready results first
+                    drain_compressed(part_buffers, compress_rx, state);
+                    // If still can't send, block until a compressed result arrives
+                    match seg_tx.try_send(item) {
+                        Ok(()) => return,
+                        Err(std::sync::mpsc::TrySendError::Full(returned)) => {
+                            item = returned;
+                            if let Ok(cs) = compress_rx.recv() {
+                                let pi = cs.partition_idx;
+                                write_compressed_segment(cs, &mut part_buffers[pi], state);
+                            }
+                        }
+                        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => return,
+                    }
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => return,
+            }
+        }
+    }
+
+    // Stages 2+4: Main thread — accumulate routed batches and drain compressed segments
+    let mut seg_tx = Some(seg_tx);
+    // Per-partition segment ID counters (workers need unique IDs)
+    let mut next_seg_ids: Vec<i32> = part_buffers.iter().map(|b| b.next_segment_id).collect();
+
+    // Phase A: receive routed batches, interleave with draining compressed segments
+    loop {
+        // Drain any ready compressed segments
+        drain_compressed(part_buffers, &compress_rx, state);
+
+        // Receive next routed batch (blocking with short timeout to interleave flush)
+        match route_rx.recv_timeout(std::time::Duration::from_millis(10)) {
+            Ok(msg) => {
+                let batch = msg.unwrap_or_else(|e| pgrx::error!("{}", e));
+                let part_idx = batch.partition_idx;
+                // Extend the partition buffer with the routed batch
+                {
+                    let pbuf = &mut part_buffers[part_idx];
+                    for (i, col) in batch.typed_cols.into_iter().enumerate() {
+                        pbuf.typed_cols[i].extend(col);
+                    }
+                    pbuf.row_count += batch.num_rows;
+                }
+                // Ship segment_size chunks to compress pool
+                while part_buffers[part_idx].row_count >= state.segment_size {
+                    let seg_size = state.segment_size;
+                    // Split off remainder, keep exactly seg_size rows
+                    let remainder: Vec<TypedColumn> = part_buffers[part_idx].typed_cols
+                        .iter_mut()
+                        .map(|col| col.split_off(seg_size))
+                        .collect();
+                    let typed_cols = std::mem::replace(
+                        &mut part_buffers[part_idx].typed_cols, remainder,
+                    );
+                    part_buffers[part_idx].row_count -= seg_size;
+                    let seg_id = next_seg_ids[part_idx];
+                    next_seg_ids[part_idx] += 1;
+                    send_to_compress(
+                        (typed_cols, seg_size, seg_id, part_idx),
+                        seg_tx.as_ref().unwrap(),
+                        part_buffers, &compress_rx, state,
+                    );
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    // Route channel closed — flush remaining partial segments to compress pool
+    for part_idx in 0..part_buffers.len() {
+        if part_buffers[part_idx].row_count > 0 {
+            let typed_cols = std::mem::replace(
+                &mut part_buffers[part_idx].typed_cols,
+                init_typed_columns(&state.columns, &state.kinds),
+            );
+            let row_count = part_buffers[part_idx].row_count;
+            part_buffers[part_idx].row_count = 0;
+            let seg_id = next_seg_ids[part_idx];
+            next_seg_ids[part_idx] += 1;
+            send_to_compress(
+                (typed_cols, row_count, seg_id, part_idx),
+                seg_tx.as_ref().unwrap(),
+                part_buffers, &compress_rx, state,
+            );
+        }
+    }
+    seg_tx.take(); // Drop sender to signal compress workers to finish
+
+    // Phase B: drain remaining compressed segments (blocking)
+    for cs in compress_rx {
+        let pi = cs.partition_idx;
+        write_compressed_segment(cs, &mut part_buffers[pi], state);
+    }
+
+    // Wait for all worker threads
+    for h in handles {
+        let _ = h.join();
+    }
+}
+
+/// Route rows from a batch of TypedColumns to the appropriate partition buffers.
+fn route_rows_to_partitions(
+    typed_cols: Vec<TypedColumn>,
+    num_rows: usize,
+    state: &BackfillState,
+    part_buffers: &mut [PartitionBuffer],
+    range_starts: &[i64],
+    range_ends: &[i64],
+    total_rows: &mut i64,
+) {
+    let time_vals = match &typed_cols[state.time_col_index] {
+        TypedColumn::Int64(v) => v,
+        _ => pgrx::error!("pg_deltax: time column must be Int64 (timestamp)"),
+    };
+
+    // Fast path: check min/max timestamps to see if entire batch fits in one partition.
+    // Scan all values (not just first/last) since parquet row groups may not be sorted.
+    let mut min_ts = i64::MAX;
+    let mut max_ts = i64::MIN;
+    for &ts in time_vals.iter().take(num_rows).flatten() {
+        if ts < min_ts { min_ts = ts; }
+        if ts > max_ts { max_ts = ts; }
+    }
+
+    let min_part = find_partition(range_starts, range_ends, min_ts);
+    let max_part = find_partition(range_starts, range_ends, max_ts);
+
+    if min_part == max_part && let Some(part_idx) = min_part {
+        // All rows fall in the same partition — bulk extend
+        let pbuf = &mut part_buffers[part_idx];
+        for (i, col) in typed_cols.into_iter().enumerate() {
+            pbuf.typed_cols[i].extend(col);
+        }
+        pbuf.row_count += num_rows;
+        *total_rows += num_rows as i64;
+        if pbuf.row_count >= state.segment_size {
+            flush_segment(pbuf, state);
+        }
+        return;
+    }
+
+    // Slow path: per-row scatter (multiple partitions, or some rows out of range)
+    for (row, ts_opt) in time_vals.iter().enumerate().take(num_rows) {
+        let ts = ts_opt.unwrap_or(0);
+        if let Some(part_idx) = find_partition(range_starts, range_ends, ts) {
+            let pbuf = &mut part_buffers[part_idx];
+            for (i, col) in typed_cols.iter().enumerate() {
+                pbuf.typed_cols[i].push_from(col, row);
+            }
+            pbuf.row_count += 1;
+            *total_rows += 1;
+            if pbuf.row_count >= state.segment_size {
+                flush_segment(pbuf, state);
+            }
+        }
     }
 }
 

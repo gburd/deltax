@@ -372,6 +372,7 @@ pub(crate) enum ColumnKind {
 }
 
 /// Column data stored in native types.
+#[derive(Debug, PartialEq)]
 pub(crate) enum TypedColumn {
     Text(Vec<Option<String>>),
     Int16(Vec<Option<i16>>),
@@ -383,6 +384,20 @@ pub(crate) enum TypedColumn {
 }
 
 impl TypedColumn {
+    /// Split off elements from index `at` onward, returning them as a new TypedColumn.
+    /// `self` retains elements `0..at`.
+    pub(crate) fn split_off(&mut self, at: usize) -> Self {
+        match self {
+            TypedColumn::Text(v) => TypedColumn::Text(v.split_off(at)),
+            TypedColumn::Int16(v) => TypedColumn::Int16(v.split_off(at)),
+            TypedColumn::Int32(v) => TypedColumn::Int32(v.split_off(at)),
+            TypedColumn::Int64(v) => TypedColumn::Int64(v.split_off(at)),
+            TypedColumn::Float32(v) => TypedColumn::Float32(v.split_off(at)),
+            TypedColumn::Float64(v) => TypedColumn::Float64(v.split_off(at)),
+            TypedColumn::Bool(v) => TypedColumn::Bool(v.split_off(at)),
+        }
+    }
+
     pub(crate) fn extend(&mut self, other: Self) {
         match (self, other) {
             (TypedColumn::Text(a), TypedColumn::Text(b)) => a.extend(b),
@@ -393,6 +408,20 @@ impl TypedColumn {
             (TypedColumn::Float64(a), TypedColumn::Float64(b)) => a.extend(b),
             (TypedColumn::Bool(a), TypedColumn::Bool(b)) => a.extend(b),
             _ => panic!("TypedColumn::extend: mismatched variants"),
+        }
+    }
+
+    /// Push a single row from `src` at index `idx` into `self`.
+    pub(crate) fn push_from(&mut self, src: &Self, idx: usize) {
+        match (self, src) {
+            (TypedColumn::Text(dst), TypedColumn::Text(s)) => dst.push(s[idx].clone()),
+            (TypedColumn::Int16(dst), TypedColumn::Int16(s)) => dst.push(s[idx]),
+            (TypedColumn::Int32(dst), TypedColumn::Int32(s)) => dst.push(s[idx]),
+            (TypedColumn::Int64(dst), TypedColumn::Int64(s)) => dst.push(s[idx]),
+            (TypedColumn::Float32(dst), TypedColumn::Float32(s)) => dst.push(s[idx]),
+            (TypedColumn::Float64(dst), TypedColumn::Float64(s)) => dst.push(s[idx]),
+            (TypedColumn::Bool(dst), TypedColumn::Bool(s)) => dst.push(s[idx]),
+            _ => panic!("TypedColumn::push_from: mismatched variants"),
         }
     }
 }
@@ -2083,4 +2112,112 @@ pub fn auto_compress_partitions(client: &mut SpiClient<'_>, ht: &catalog::Deltat
     }
 
     compressed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_split_off_int64() {
+        let mut col = TypedColumn::Int64(vec![Some(1), Some(2), Some(3), Some(4), Some(5)]);
+        let tail = col.split_off(3);
+        assert_eq!(col, TypedColumn::Int64(vec![Some(1), Some(2), Some(3)]));
+        assert_eq!(tail, TypedColumn::Int64(vec![Some(4), Some(5)]));
+    }
+
+    #[test]
+    fn test_split_off_text_with_nulls() {
+        let mut col = TypedColumn::Text(vec![
+            Some("a".into()), None, Some("c".into()), Some("d".into()),
+        ]);
+        let tail = col.split_off(2);
+        assert_eq!(col, TypedColumn::Text(vec![Some("a".into()), None]));
+        assert_eq!(tail, TypedColumn::Text(vec![Some("c".into()), Some("d".into())]));
+    }
+
+    #[test]
+    fn test_split_off_at_zero() {
+        let mut col = TypedColumn::Bool(vec![Some(true), Some(false)]);
+        let tail = col.split_off(0);
+        assert_eq!(col, TypedColumn::Bool(vec![]));
+        assert_eq!(tail, TypedColumn::Bool(vec![Some(true), Some(false)]));
+    }
+
+    #[test]
+    fn test_split_off_at_end() {
+        let mut col = TypedColumn::Int32(vec![Some(1), Some(2)]);
+        let tail = col.split_off(2);
+        assert_eq!(col, TypedColumn::Int32(vec![Some(1), Some(2)]));
+        assert_eq!(tail, TypedColumn::Int32(vec![]));
+    }
+
+    #[test]
+    fn test_extend_int64() {
+        let mut a = TypedColumn::Int64(vec![Some(1), Some(2)]);
+        let b = TypedColumn::Int64(vec![Some(3), None]);
+        a.extend(b);
+        assert_eq!(a, TypedColumn::Int64(vec![Some(1), Some(2), Some(3), None]));
+    }
+
+    #[test]
+    fn test_extend_empty() {
+        let mut a = TypedColumn::Float32(vec![]);
+        let b = TypedColumn::Float32(vec![Some(1.0)]);
+        a.extend(b);
+        assert_eq!(a, TypedColumn::Float32(vec![Some(1.0)]));
+    }
+
+    #[test]
+    #[should_panic(expected = "mismatched variants")]
+    fn test_extend_mismatched() {
+        let mut a = TypedColumn::Int32(vec![]);
+        let b = TypedColumn::Int64(vec![]);
+        a.extend(b);
+    }
+
+    #[test]
+    fn test_push_from_int64() {
+        let src = TypedColumn::Int64(vec![Some(10), Some(20), None]);
+        let mut dst = TypedColumn::Int64(vec![]);
+        dst.push_from(&src, 1);
+        dst.push_from(&src, 2);
+        assert_eq!(dst, TypedColumn::Int64(vec![Some(20), None]));
+    }
+
+    #[test]
+    fn test_push_from_text() {
+        let src = TypedColumn::Text(vec![Some("hello".into()), None, Some("world".into())]);
+        let mut dst = TypedColumn::Text(vec![]);
+        dst.push_from(&src, 0);
+        dst.push_from(&src, 1);
+        assert_eq!(dst, TypedColumn::Text(vec![Some("hello".into()), None]));
+    }
+
+    #[test]
+    #[should_panic(expected = "mismatched variants")]
+    fn test_push_from_mismatched() {
+        let src = TypedColumn::Int32(vec![Some(1)]);
+        let mut dst = TypedColumn::Int64(vec![]);
+        dst.push_from(&src, 0);
+    }
+
+    #[test]
+    fn test_split_off_all_variants() {
+        // Ensure split_off works for every TypedColumn variant
+        let mut f64_col = TypedColumn::Float64(vec![Some(1.0), Some(2.0)]);
+        let tail = f64_col.split_off(1);
+        assert_eq!(f64_col, TypedColumn::Float64(vec![Some(1.0)]));
+        assert_eq!(tail, TypedColumn::Float64(vec![Some(2.0)]));
+
+        let mut f32_col = TypedColumn::Float32(vec![Some(1.0), Some(2.0)]);
+        let tail = f32_col.split_off(1);
+        assert_eq!(f32_col, TypedColumn::Float32(vec![Some(1.0)]));
+        assert_eq!(tail, TypedColumn::Float32(vec![Some(2.0)]));
+
+        let mut i16_col = TypedColumn::Int16(vec![Some(1), Some(2)]);
+        let tail = i16_col.split_off(1);
+        assert_eq!(i16_col, TypedColumn::Int16(vec![Some(1)]));
+        assert_eq!(tail, TypedColumn::Int16(vec![Some(2)]));
+    }
 }

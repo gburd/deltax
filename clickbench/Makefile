@@ -2,7 +2,8 @@
 #
 # Lifecycle:
 #   make launch-ec2              # launch EC2 instance, prints export EC2=<ip>
-#   make setup EC2=<ip>          # install PG18, Rust, pgrx, build extension, load data, compress
+#   make setup EC2=<ip>          # install PG18, Rust, pgrx, build extension, load data (parquet)
+#   make setup EC2=<ip> PARQUET=0  # same but load from TSV instead
 #   make destroy-ec2             # terminate the instance
 #
 # Iterating on code changes:
@@ -17,6 +18,7 @@
 EC2 ?=
 EC2_KEY ?= ~/.ssh/tsg.pem
 EC2_USER ?= ubuntu
+PARQUET ?= 1
 EC2_SSH = ssh -i $(EC2_KEY) -o StrictHostKeyChecking=no $(EC2_USER)@$(EC2)
 EC2_SCP = scp -i $(EC2_KEY) -o StrictHostKeyChecking=no
 EC2_PG_CONFIG = /usr/lib/postgresql/18/bin/pg_config
@@ -67,7 +69,7 @@ setup:
 	rsync -az -e "ssh -i $(EC2_KEY) -o StrictHostKeyChecking=no" \
 		$(CURDIR)/ $(EC2_USER)@$(EC2):~/clickbench/
 	@echo "=== Running benchmark.sh (this takes a while) ==="
-	$(EC2_SSH) 'cd ~/clickbench && bash benchmark.sh'
+	$(EC2_SSH) 'cd ~/clickbench && PARQUET=$(PARQUET) bash benchmark.sh'
 
 # Sync source + clickbench scripts, recompile extension, restart PostgreSQL
 deploy:

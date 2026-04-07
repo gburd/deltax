@@ -51,13 +51,26 @@ sudo -u postgres psql -c "ALTER DATABASE $DB SET work_mem TO '1GB'"
 sudo -u postgres psql -c "ALTER DATABASE $DB SET min_parallel_table_scan_size TO '0'"
 
 # Download data
-if [ ! -f /tmp/hits.tsv ]; then
-    wget --continue --progress=dot:giga 'https://datasets.clickhouse.com/hits_compatible/hits.tsv.gz'
-    pigz -d -f hits.tsv.gz
-    sudo mv hits.tsv /tmp/hits.tsv
-    sudo chmod 644 /tmp/hits.tsv
+PARQUET="${PARQUET:-1}"
+if [ "$PARQUET" = "1" ]; then
+    PARQUET_DIR=/tmp/hits_parquet
+    if [ ! -d "$PARQUET_DIR" ] || [ "$(ls "$PARQUET_DIR"/*.parquet 2>/dev/null | wc -l)" -lt 100 ]; then
+        sudo mkdir -p "$PARQUET_DIR"
+        echo "Downloading 100 parquet files..."
+        seq 0 99 | xargs -P20 -I{} sudo wget -q -nc -P "$PARQUET_DIR" \
+            "https://datasets.clickhouse.com/hits_compatible/athena_partitioned/hits_{}.parquet"
+        sudo chmod 644 "$PARQUET_DIR"/*.parquet
+    fi
+    TOTAL_LINES="(parquet)"
+else
+    if [ ! -f /tmp/hits.tsv ]; then
+        wget --continue --progress=dot:giga 'https://datasets.clickhouse.com/hits_compatible/hits.tsv.gz'
+        pigz -d -f hits.tsv.gz
+        sudo mv hits.tsv /tmp/hits.tsv
+        sudo chmod 644 /tmp/hits.tsv
+    fi
+    TOTAL_LINES=$(wc -l < /tmp/hits.tsv)
 fi
-TOTAL_LINES=$(wc -l < /tmp/hits.tsv)
 
 # Create table
 sudo -u postgres psql "$DB" < create.sql 2>&1 | tee load_out.txt
@@ -72,9 +85,14 @@ sudo -u postgres psql "$DB" -t -c "SET pg_deltax.mock_now = '2013-07-01 12:00:00
 sudo -u postgres psql "$DB" -t -c "SELECT deltax_enable_compression('hits', order_by => ARRAY['counterid', 'userid', 'eventtime'], segment_size => 30000)"
 
 # Direct backfill: load and compress in a single pass using FORMAT deltax_compress
-echo "Loading data with direct backfill (FORMAT deltax_compress)..."
 LOAD_START=$(date +%s)
-sudo -u postgres psql "$DB" -c "COPY hits FROM '/tmp/hits.tsv' WITH (FORMAT deltax_compress, DELIMITER E'\t')"
+if [ "$PARQUET" = "1" ]; then
+    echo "Loading data from parquet files (FORMAT deltax_compress)..."
+    sudo -u postgres psql "$DB" -c "COPY hits FROM '/tmp/hits_parquet/hits_*.parquet' WITH (FORMAT deltax_compress)"
+else
+    echo "Loading data from TSV (FORMAT deltax_compress)..."
+    sudo -u postgres psql "$DB" -c "COPY hits FROM '/tmp/hits.tsv' WITH (FORMAT deltax_compress, DELIMITER E'\t')"
+fi
 LOAD_END=$(date +%s)
 echo "Load+compress time: $((LOAD_END - LOAD_START))s ($TOTAL_LINES rows, direct backfill)"
 
