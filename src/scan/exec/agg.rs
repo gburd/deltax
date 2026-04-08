@@ -1723,7 +1723,13 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
             );
             let has_any_cd_agg = compact_storage.as_ref().unwrap().layout.slots.iter()
                 .any(|(_, k)| matches!(k, CompactAccKind::CountDistinctInt | CompactAccKind::CountDistinctStr));
-            if topn_limit > 0 && having_filters.is_empty() && !compact_sort_is_cd {
+            // Skip speculative top-N when there are too many partial results (e.g. from
+            // pipeline batching). With hundreds of partial results, iterating all candidates
+            // across all results is very expensive and the correctness check (nth > floor_sum)
+            // is more likely to fail, wasting time before falling through to full merge.
+            let max_speculative_results = n_workers * 4;
+            if topn_limit > 0 && having_filters.is_empty() && !compact_sort_is_cd
+                && partial_results.len() <= max_speculative_results {
                 let sort_slot = sort_slot_for_compact_spec;
                 let (_, sort_kind) = compact_storage.as_ref().unwrap().layout.slots[sort_slot];
                 let limit = topn_limit as usize;
