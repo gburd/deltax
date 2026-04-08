@@ -1422,6 +1422,7 @@ struct ColResult {
     max_val: Option<String>,
     sum_val: Option<String>,
     nonnull_count: i64,
+    nonzero_count: i64,
 }
 
 /// A fully compressed segment ready for heap_insert on the main thread.
@@ -1496,12 +1497,12 @@ fn compress_segment(
                             } else {
                                 (None, None)
                             };
-                            let (sum_val, nonnull_count) = if supports_sum(&col.data_type) {
+                            let (sum_val, nonnull_count, nonzero_count) = if supports_sum(&col.data_type) {
                                 compute_typed_sum(&typed_cols_ref[col_i])
                             } else {
-                                (None, 0)
+                                (None, 0, 0)
                             };
-                            ColResult { col_idx, col_i, compressed, min_val, max_val, sum_val, nonnull_count }
+                            ColResult { col_idx, col_i, compressed, min_val, max_val, sum_val, nonnull_count, nonzero_count }
                         }).collect::<Vec<_>>()
                     })
                 })
@@ -1519,12 +1520,12 @@ fn compress_segment(
             } else {
                 (None, None)
             };
-            let (sum_val, nonnull_count) = if supports_sum(&col.data_type) {
+            let (sum_val, nonnull_count, nonzero_count) = if supports_sum(&col.data_type) {
                 compute_typed_sum(&typed_cols[col_i])
             } else {
-                (None, 0)
+                (None, 0, 0)
             };
-            ColResult { col_idx, col_i, compressed, min_val, max_val, sum_val, nonnull_count }
+            ColResult { col_idx, col_i, compressed, min_val, max_val, sum_val, nonnull_count, nonzero_count }
         }).collect()
     };
 
@@ -1533,7 +1534,7 @@ fn compress_segment(
     let mut blobs: Vec<(u16, Vec<u8>)> = Vec::new();
     let mut col_minmax: std::collections::HashMap<usize, (Option<String>, Option<String>)> =
         std::collections::HashMap::new();
-    let mut col_sums: std::collections::HashMap<usize, (Option<String>, i64)> =
+    let mut col_sums: std::collections::HashMap<usize, (Option<String>, i64, i64)> =
         std::collections::HashMap::new();
 
     for cr in &col_results {
@@ -1542,7 +1543,7 @@ fn compress_segment(
             col_minmax.insert(cr.col_i, (cr.min_val.clone(), cr.max_val.clone()));
         }
         if supports_sum(&columns[cr.col_i].data_type) {
-            col_sums.insert(cr.col_i, (cr.sum_val.clone(), cr.nonnull_count));
+            col_sums.insert(cr.col_i, (cr.sum_val.clone(), cr.nonnull_count, cr.nonzero_count));
         }
     }
     for cr in col_results {
@@ -1585,12 +1586,14 @@ fn compress_segment(
     for (i, col) in columns.iter().enumerate() {
         if !col.is_segment_by && supports_sum(&col.data_type) {
             match col_sums.get(&i) {
-                Some((Some(sum_val), nonnull_count)) => {
+                Some((Some(sum_val), nonnull_count, nonzero_count)) => {
                     insert_vals.push(sum_val.clone());
                     insert_vals.push(nonnull_count.to_string());
+                    insert_vals.push(nonzero_count.to_string());
                 }
                 _ => {
                     insert_vals.push("NULL".to_string());
+                    insert_vals.push("0".to_string());
                     insert_vals.push("0".to_string());
                 }
             }
@@ -1722,12 +1725,12 @@ fn flush_segment(
                             } else {
                                 (None, None)
                             };
-                            let (sum_val, nonnull_count) = if supports_sum(&col.data_type) {
+                            let (sum_val, nonnull_count, nonzero_count) = if supports_sum(&col.data_type) {
                                 compute_typed_sum(&typed_cols_ref[col_i])
                             } else {
-                                (None, 0)
+                                (None, 0, 0)
                             };
-                            ColResult { col_idx, col_i, compressed, min_val, max_val, sum_val, nonnull_count }
+                            ColResult { col_idx, col_i, compressed, min_val, max_val, sum_val, nonnull_count, nonzero_count }
                         }).collect::<Vec<_>>()
                     })
                 })
@@ -1746,12 +1749,12 @@ fn flush_segment(
             } else {
                 (None, None)
             };
-            let (sum_val, nonnull_count) = if supports_sum(&col.data_type) {
+            let (sum_val, nonnull_count, nonzero_count) = if supports_sum(&col.data_type) {
                 compute_typed_sum(&typed_cols_ref[col_i])
             } else {
-                (None, 0)
+                (None, 0, 0)
             };
-            ColResult { col_idx, col_i, compressed, min_val, max_val, sum_val, nonnull_count }
+            ColResult { col_idx, col_i, compressed, min_val, max_val, sum_val, nonnull_count, nonzero_count }
         }).collect()
     };
 
@@ -1765,7 +1768,7 @@ fn flush_segment(
     // Index col_results by col_i for lookup
     let mut col_minmax: std::collections::HashMap<usize, (Option<String>, Option<String>)> =
         std::collections::HashMap::new();
-    let mut col_sums: std::collections::HashMap<usize, (Option<String>, i64)> =
+    let mut col_sums: std::collections::HashMap<usize, (Option<String>, i64, i64)> =
         std::collections::HashMap::new();
 
     for cr in &col_results {
@@ -1774,7 +1777,7 @@ fn flush_segment(
             col_minmax.insert(cr.col_i, (cr.min_val.clone(), cr.max_val.clone()));
         }
         if supports_sum(&state.columns[cr.col_i].data_type) {
-            col_sums.insert(cr.col_i, (cr.sum_val.clone(), cr.nonnull_count));
+            col_sums.insert(cr.col_i, (cr.sum_val.clone(), cr.nonnull_count, cr.nonzero_count));
         }
     }
     for cr in col_results {
@@ -1818,12 +1821,14 @@ fn flush_segment(
     for (i, col) in state.columns.iter().enumerate() {
         if !col.is_segment_by && supports_sum(&col.data_type) {
             match col_sums.get(&i) {
-                Some((Some(sum_val), nonnull_count)) => {
+                Some((Some(sum_val), nonnull_count, nonzero_count)) => {
                     insert_vals.push(sum_val.clone());
                     insert_vals.push(nonnull_count.to_string());
+                    insert_vals.push(nonzero_count.to_string());
                 }
                 _ => {
                     insert_vals.push("NULL".to_string());
+                    insert_vals.push("0".to_string());
                     insert_vals.push("0".to_string());
                 }
             }
@@ -1873,6 +1878,7 @@ fn flush_segment(
             if !col.is_segment_by && supports_sum(&col.data_type) {
                 cols.push(format!("\"_sum_{}\"", col.name));
                 cols.push(format!("\"_nonnull_count_{}\"", col.name));
+                cols.push(format!("\"_nonzero_count_{}\"", col.name));
             }
         }
         for col in &state.columns {
@@ -2146,6 +2152,7 @@ fn write_compressed_segment(
             if !col.is_segment_by && supports_sum(&col.data_type) {
                 cols.push(format!("\"_sum_{}\"", col.name));
                 cols.push(format!("\"_nonnull_count_{}\"", col.name));
+                cols.push(format!("\"_nonzero_count_{}\"", col.name));
             }
         }
         for col in &state.columns {

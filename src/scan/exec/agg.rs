@@ -24,7 +24,7 @@ use super::datum_utils::{
 use super::segments::{
     SegmentData, load_metadata, load_segments_heap,
     segment_skippable_by_dict, extract_segment_filters,
-    classify_segment_quals, SegmentQualResult,
+    classify_segment_quals, SegmentQualResult, is_zero_const,
     detoast_lazy_blobs,
 };
 use super::text_col::{SegTextColumn, TextQualInfo, decompress_text_to_seg_col, apply_text_eq_filter, apply_text_like_filter, strcoll_cmp};
@@ -811,6 +811,7 @@ fn try_metadata_fast_path(
             }
             match classify_segment_quals(seg, batch_quals, &meta.col_names) {
                 SegmentQualResult::AllPass => ap.push(seg),
+                SegmentQualResult::NonePass => {} // skip — no rows pass
                 SegmentQualResult::Ambiguous => amb.push(seg),
             }
         }
@@ -827,6 +828,59 @@ fn try_metadata_fast_path(
         accumulate_segment_metadata(&mut accumulators, seg, &plan.agg_specs, meta);
     }
     let segments_metadata_resolved = allpass.len() as u64;
+
+    // Try to resolve ambiguous segments via nonzero_count metadata
+    // Only works for: single qual, Ne/Eq with const 0, all aggs are CountStar
+    let ambiguous = if !ambiguous.is_empty()
+        && batch_quals.len() == 1
+        && plan.agg_specs.iter().all(|s| s.agg_type == AggType::CountStar)
+    {
+        let bq = &batch_quals[0];
+        if is_zero_const(bq.const_datum, bq.type_oid)
+            && matches!(bq.op, BatchCompareOp::Ne | BatchCompareOp::Eq)
+        {
+            let col_name = &meta.col_names[bq.col_idx];
+            // Check all ambiguous segments have nonzero_count metadata
+            let all_have_nz = ambiguous.iter().all(|seg| {
+                seg.col_sums.get(col_name)
+                    .map(|cs| cs.nonzero_count >= 0)
+                    .unwrap_or(false)
+            });
+            if all_have_nz {
+                // Resolve from metadata
+                for seg in &ambiguous {
+                    let cs = seg.col_sums.get(col_name).unwrap();
+                    let passing = match bq.op {
+                        BatchCompareOp::Ne => cs.nonzero_count,
+                        BatchCompareOp::Eq => cs.nonnull_count - cs.nonzero_count,
+                        _ => unreachable!(),
+                    };
+                    for (i, spec) in plan.agg_specs.iter().enumerate() {
+                        if spec.agg_type == AggType::CountStar
+                            && let AggAccumulator::Count { count } = &mut accumulators[i]
+                        {
+                            *count += passing;
+                        }
+                    }
+                }
+                vec![] // all resolved
+            } else {
+                ambiguous
+            }
+        } else {
+            ambiguous
+        }
+    } else {
+        ambiguous
+    };
+
+    // If ambiguous segments remain but have no blobs loaded (metadata-only fast path),
+    // bail out — the full scan path will handle them with proper blob loading.
+    if !ambiguous.is_empty()
+        && ambiguous.iter().any(|s| s.compressed_blobs.iter().all(|b| b.is_empty()))
+    {
+        return None;
+    }
 
     // Ambiguous: parallel decompression
     let n_workers = crate::get_parallel_workers();
@@ -1260,23 +1314,11 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                 vec![]
             };
 
-            // When we have batch quals, we need blobs for ambiguous segments
-            let mut needed_cols = vec![false; num_cols];
             let mut load_minmax = needs_minmax;
             let mut load_sums = needs_sums || needs_counts;
             if !fast_batch_quals.is_empty() {
                 load_minmax = true;
                 load_sums = true;
-                // Need blobs for qual columns (for ambiguous segment decompression)
-                for bq in &fast_batch_quals {
-                    if bq.col_idx < num_cols { needed_cols[bq.col_idx] = true; }
-                }
-                // Need blobs for agg columns (for ambiguous segment decompression)
-                for spec in &plan.agg_specs {
-                    if spec.col_idx >= 0 && (spec.col_idx as usize) < num_cols {
-                        needed_cols[spec.col_idx as usize] = true;
-                    }
-                }
             }
 
             // Extract segment-by/time filters for pruning
@@ -1288,11 +1330,13 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                 (vec![], None, None)
             };
 
+            // Fast path: load metadata only (no blobs) — Phase 2 is skipped
+            let no_blobs = vec![false; num_cols];
             let t1 = Instant::now();
             let mut all_segments: Vec<SegmentData> = Vec::new();
             for &oid in &plan.companion_oids {
                 let (segs, _, _, _, _) = load_segments_heap(
-                    oid, &meta.col_names, &meta.segment_by, &needed_cols,
+                    oid, &meta.col_names, &meta.segment_by, &no_blobs,
                     &meta.time_column, load_minmax, &seg_filters, time_min, time_max, None,
                     &fast_batch_quals, load_sums,
                 );
@@ -8560,6 +8604,7 @@ mod tests {
             sum_datum: pg_sys::Datum::from(0usize),
             sum_null: true,
             nonnull_count: 900,
+            nonzero_count: -1,
             type_oid: pg_sys::Oid::from(1700u32),
         });
         let mut seg2 = make_empty_segment(500);
@@ -8567,6 +8612,7 @@ mod tests {
             sum_datum: pg_sys::Datum::from(0usize),
             sum_null: true,
             nonnull_count: 450,
+            nonzero_count: -1,
             type_oid: pg_sys::Oid::from(1700u32),
         });
         let state = try_metadata_fast_path(&plan, &meta, &[seg1, seg2], &[], 0, 0).unwrap();
@@ -8587,6 +8633,7 @@ mod tests {
             sum_datum: pg_sys::Datum::from(sum_val.to_bits() as usize),
             sum_null: false,
             nonnull_count: 100,
+            nonzero_count: -1,
             type_oid: pg_sys::Oid::from(701u32),
         });
         let state = try_metadata_fast_path(&plan, &meta, &[seg], &[], 0, 0).unwrap();
@@ -8620,6 +8667,7 @@ mod tests {
             sum_datum: numeric_datum,
             sum_null: false,
             nonnull_count: 100,
+            nonzero_count: -1,
             type_oid: pg_sys::Oid::from(1700u32),
         });
         let state = try_metadata_fast_path(&plan, &meta, &[seg], &[], 0, 0).unwrap();
@@ -8648,6 +8696,7 @@ mod tests {
             sum_datum: pg_sys::Datum::from(base_sum.to_bits() as usize),
             sum_null: false,
             nonnull_count: 50,
+            nonzero_count: -1,
             type_oid: pg_sys::Oid::from(701u32),
         });
         let state = try_metadata_fast_path(&plan, &meta, &[seg], &[], 0, 0).unwrap();

@@ -680,7 +680,7 @@ pub(crate) fn flush_segment_metadata(
         std::collections::HashMap::new();
     let mut total_size: i64 = 0;
 
-    let mut col_sums: std::collections::HashMap<String, (Option<String>, i64)> =
+    let mut col_sums: std::collections::HashMap<String, (Option<String>, i64, i64)> =
         std::collections::HashMap::new();
 
     let mut col_idx: u16 = 0;
@@ -745,22 +745,25 @@ pub(crate) fn flush_segment_metadata(
             }
         }
     }
-    // Sum and non-null count metadata
+    // Sum, non-null count, and nonzero count metadata
     for col in columns {
         if !col.is_segment_by && supports_sum(&col.data_type) {
             insert_cols.push(format!("\"_sum_{}\"", col.name));
             insert_cols.push(format!("\"_nonnull_count_{}\"", col.name));
+            insert_cols.push(format!("\"_nonzero_count_{}\"", col.name));
         }
     }
     for col in columns {
         if !col.is_segment_by && supports_sum(&col.data_type) {
             match col_sums.get(&col.name) {
-                Some((Some(sum_val), nonnull_count)) => {
+                Some((Some(sum_val), nonnull_count, nonzero_count)) => {
                     insert_vals.push(sum_val.clone());
                     insert_vals.push(nonnull_count.to_string());
+                    insert_vals.push(nonzero_count.to_string());
                 }
                 _ => {
                     insert_vals.push("NULL".to_string());
+                    insert_vals.push("0".to_string());
                     insert_vals.push("0".to_string());
                 }
             }
@@ -1015,6 +1018,7 @@ pub(crate) fn build_companion_ddl(
             };
             meta_cols.push(format!("\"_sum_{}\" {}", col.name, sum_type));
             meta_cols.push(format!("\"_nonnull_count_{}\" INT", col.name));
+            meta_cols.push(format!("\"_nonzero_count_{}\" INT", col.name));
         }
     }
     for col in columns {
@@ -1952,56 +1956,66 @@ pub(crate) fn is_float_type(data_type: &str) -> bool {
     dt == "double precision" || dt == "float8" || dt == "real" || dt == "float4"
 }
 
-/// Compute sum and non-null count for a typed column.
-/// Returns (sum_as_string, nonnull_count). Uses i128 for integer sums to avoid overflow.
-pub(crate) fn compute_typed_sum(data: &TypedColumn) -> (Option<String>, i64) {
+/// Compute sum, non-null count, and nonzero count for a typed column.
+/// Returns (sum_as_string, nonnull_count, nonzero_count). Uses i128 for integer sums to avoid overflow.
+pub(crate) fn compute_typed_sum(data: &TypedColumn) -> (Option<String>, i64, i64) {
     match data {
         TypedColumn::Int16(v) => {
             let mut sum: i128 = 0;
             let mut count: i64 = 0;
+            let mut nonzero: i64 = 0;
             for val in v.iter().flatten() {
                 sum += *val as i128;
                 count += 1;
+                if *val != 0 { nonzero += 1; }
             }
-            if count > 0 { (Some(sum.to_string()), count) } else { (None, 0) }
+            if count > 0 { (Some(sum.to_string()), count, nonzero) } else { (None, 0, 0) }
         }
         TypedColumn::Int32(v) => {
             let mut sum: i128 = 0;
             let mut count: i64 = 0;
+            let mut nonzero: i64 = 0;
             for val in v.iter().flatten() {
                 sum += *val as i128;
                 count += 1;
+                if *val != 0 { nonzero += 1; }
             }
-            if count > 0 { (Some(sum.to_string()), count) } else { (None, 0) }
+            if count > 0 { (Some(sum.to_string()), count, nonzero) } else { (None, 0, 0) }
         }
         TypedColumn::Int64(v) => {
             let mut sum: i128 = 0;
             let mut count: i64 = 0;
+            let mut nonzero: i64 = 0;
             for val in v.iter().flatten() {
                 sum += *val as i128;
                 count += 1;
+                if *val != 0 { nonzero += 1; }
             }
-            if count > 0 { (Some(sum.to_string()), count) } else { (None, 0) }
+            if count > 0 { (Some(sum.to_string()), count, nonzero) } else { (None, 0, 0) }
         }
         TypedColumn::Float32(v) => {
             let mut sum: f64 = 0.0;
             let mut count: i64 = 0;
+            let mut nonzero: i64 = 0;
             for val in v.iter().flatten() {
                 sum += *val as f64;
                 count += 1;
+                if *val != 0.0 { nonzero += 1; }
             }
-            if count > 0 { (Some(format!("{:.17e}", sum)), count) } else { (None, 0) }
+            if count > 0 { (Some(format!("{:.17e}", sum)), count, nonzero) } else { (None, 0, 0) }
         }
         TypedColumn::Float64(v) => {
             let mut sum: f64 = 0.0;
             let mut count: i64 = 0;
+            let mut nonzero: i64 = 0;
             for val in v.iter().flatten() {
                 sum += *val;
                 count += 1;
+                if *val != 0.0 { nonzero += 1; }
             }
-            if count > 0 { (Some(format!("{:.17e}", sum)), count) } else { (None, 0) }
+            if count > 0 { (Some(format!("{:.17e}", sum)), count, nonzero) } else { (None, 0, 0) }
         }
-        TypedColumn::Text(_) | TypedColumn::Bool(_) => (None, 0),
+        TypedColumn::Text(_) | TypedColumn::Bool(_) => (None, 0, 0),
     }
 }
 

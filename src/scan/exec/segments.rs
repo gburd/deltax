@@ -218,8 +218,22 @@ pub(super) fn segment_all_rows_pass(
 pub(super) enum SegmentQualResult {
     /// Metadata proves all rows satisfy all quals and no NULLs in qual columns.
     AllPass,
+    /// Metadata proves NO rows satisfy the quals (e.g. nonzero_count == 0 with Ne 0).
+    NonePass,
     /// Cannot determine from metadata — must decompress.
     Ambiguous,
+}
+
+/// Returns true if the datum is zero for the given numeric type OID.
+pub(super) fn is_zero_const(datum: pg_sys::Datum, type_oid: pg_sys::Oid) -> bool {
+    match type_oid {
+        pg_sys::INT2OID => datum.value() as i16 == 0,
+        pg_sys::INT4OID => datum.value() as i32 == 0,
+        pg_sys::INT8OID => datum.value() as i64 == 0,
+        pg_sys::FLOAT4OID => f32::from_bits(datum.value() as u32) == 0.0,
+        pg_sys::FLOAT8OID => f64::from_bits(datum.value() as u64) == 0.0,
+        _ => false,
+    }
 }
 
 /// Classify a segment: can we prove all rows pass all batch quals using metadata?
@@ -228,6 +242,7 @@ pub(super) fn classify_segment_quals(
     batch_quals: &[BatchQual],
     col_names: &[String],
 ) -> SegmentQualResult {
+    let mut any_nonepass = false;
     for bq in batch_quals {
         let col_name = &col_names[bq.col_idx];
         let cm = match seg.col_minmax.get(col_name) {
@@ -236,8 +251,33 @@ pub(super) fn classify_segment_quals(
         };
         match segment_all_rows_pass(cm, bq.op, bq.const_datum) {
             Some(true) => {} // this qual is satisfied for all rows
-            _ => return SegmentQualResult::Ambiguous,
+            Some(false) => return SegmentQualResult::NonePass,
+            None => {
+                // minmax couldn't resolve — try nonzero_count for Ne/Eq with 0
+                if is_zero_const(bq.const_datum, bq.type_oid)
+                    && let Some(cs) = seg.col_sums.get(col_name)
+                    && cs.nonzero_count >= 0 && cs.nonnull_count == seg.row_count as i64
+                {
+                    match bq.op {
+                        BatchCompareOp::Ne if cs.nonzero_count == 0 => {
+                            // All values are zero → Ne 0 passes for no rows
+                            any_nonepass = true;
+                            continue;
+                        }
+                        BatchCompareOp::Eq if cs.nonzero_count == cs.nonnull_count => {
+                            // All values are nonzero → Eq 0 passes for no rows
+                            any_nonepass = true;
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
+                return SegmentQualResult::Ambiguous;
+            }
         }
+    }
+    if any_nonepass {
+        return SegmentQualResult::NonePass;
     }
     // All quals passed via minmax. Now check for NULLs in qual columns:
     // min/max covers only non-NULL values, so if NULLs exist, we can't trust row_count.
@@ -270,6 +310,7 @@ pub(super) struct ColSum {
     pub(super) sum_datum: pg_sys::Datum,
     pub(super) sum_null: bool,
     pub(super) nonnull_count: i64,
+    pub(super) nonzero_count: i64,  // -1 = unavailable (column missing in older meta tables)
     pub(super) type_oid: pg_sys::Oid,  // NUMERICOID or FLOAT8OID
 }
 
@@ -593,8 +634,8 @@ pub(super) unsafe fn load_segments_heap(
             }
         }
 
-        // Discover per-column sum/nonnull_count columns
-        let mut sum_col_attnos: Vec<(String, usize, usize, pg_sys::Oid)> = Vec::new();
+        // Discover per-column sum/nonnull_count/nonzero_count columns
+        let mut sum_col_attnos: Vec<(String, usize, usize, Option<usize>, pg_sys::Oid)> = Vec::new();
         if load_sums {
             for col_name in col_names {
                 if segment_by.contains(col_name) {
@@ -602,13 +643,15 @@ pub(super) unsafe fn load_segments_heap(
                 }
                 let sum_name = format!("_sum_{}", col_name);
                 let nonnull_name = format!("_nonnull_count_{}", col_name);
+                let nonzero_name = format!("_nonzero_count_{}", col_name);
                 if let (Some(&sum_att), Some(&nn_att)) = (
                     attno_map.get(sum_name.as_str()),
                     attno_map.get(nonnull_name.as_str()),
                 ) {
+                    let nz_att = attno_map.get(nonzero_name.as_str()).copied();
                     let type_oid = att_type_oids.get(sum_name.as_str()).copied()
                         .unwrap_or(pg_sys::InvalidOid);
-                    sum_col_attnos.push((col_name.clone(), sum_att, nn_att, type_oid));
+                    sum_col_attnos.push((col_name.clone(), sum_att, nn_att, nz_att, type_oid));
                 }
             }
         }
@@ -840,16 +883,21 @@ pub(super) unsafe fn load_segments_heap(
                 });
             }
 
-            // Extract per-column sum/nonnull_count
+            // Extract per-column sum/nonnull_count/nonzero_count
             let mut col_sums = HashMap::new();
-            for (col_name, sum_att, nn_att, type_oid) in &sum_col_attnos {
+            for (col_name, sum_att, nn_att, nz_att, type_oid) in &sum_col_attnos {
                 let sum_null = nulls[*sum_att];
                 let sum_datum = if sum_null { pg_sys::Datum::from(0usize) } else { values[*sum_att] };
                 let nonnull_count = if nulls[*nn_att] { 0i64 } else { values[*nn_att].value() as i64 };
+                let nonzero_count = match nz_att {
+                    Some(att) => if nulls[*att] { -1i64 } else { values[*att].value() as i64 },
+                    None => -1i64,  // column missing in older meta tables
+                };
                 col_sums.insert(col_name.clone(), ColSum {
                     sum_datum,
                     sum_null,
                     nonnull_count,
+                    nonzero_count,
                     type_oid: *type_oid,
                 });
             }
