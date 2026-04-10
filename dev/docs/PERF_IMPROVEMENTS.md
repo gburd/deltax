@@ -655,50 +655,41 @@ with two-level hashing (#36), Q36 could go from 75x to ~5x.
 `plan_agg_path`), `src/scan/exec/agg.rs` (reconstruct eliminated keys
 at output)
 
-### 35. Parallel-safe custom scan paths
+### ~~35. Parallel-safe custom scan paths~~ — Investigated, not pursued
 
-**Target: All queries, especially non-aggregate scans**
-**Complexity: High**
+**Status: Evaluated — limited upside, high implementation cost**
 
-Currently all DeltaX custom paths set `parallel_safe = false` and
-`parallel_aware = false` in `src/scan/path.rs`. This prevents PostgreSQL
-from using Parallel Append to distribute partition scans across workers.
-On the ClickBench setup (8 partitions, c6a.4xlarge with 16 vCPUs), this
-leaves up to 8x parallelism unused.
+The original premise was that Q20, Q21, Q25 used DeltaXDecompress and
+would benefit ~8x from Parallel Append distributing partition scans
+across workers. EXPLAIN ANALYZE shows this was wrong:
 
-For DeltaXAgg, internal rayon parallelism compensates within a single
-partition, but partitions are still processed sequentially by PG's Append
-node. For DeltaXDecompress (non-aggregate queries like Q20, Q21, Q25, Q26),
-execution is fully single-threaded — each partition scanned one after
-another.
+- **Q20, Q21, Q22** use `DeltaXAgg` (LIKE-filtered aggregation), not
+  `DeltaXDecompress`.
+- **Q25** uses `DeltaXAppend` (sorted Top-N text scan), not a plain
+  Append over DeltaXDecompress partitions.
+- Only the remaining non-aggregate scans (Q19, Q23, Q24, Q25, Q26) go
+  through `DeltaXAppend` / `DeltaXDecompress`.
 
-**Approach (incremental):**
+DeltaXAgg already parallelizes internally using `std::thread::scope`
+with up to `get_parallel_workers()` (≈16 on a c6a.4xlarge) per
+partition — the Append above it runs sequentially over partitions, but
+each partition saturates all cores. Enabling PG-level Parallel Append
+on top would oversubscribe CPUs (e.g. 8 PG workers × 16 Rust threads
+each ≈ 128 threads on 16 cores), almost certainly a regression.
 
-1. **Phase 1 — `parallel_safe = true` without `parallel_aware`:** Mark
-   DeltaXDecompress and DeltaXAppend paths as parallel-safe. PG's Parallel
-   Append then distributes entire partition scans across workers. Each
-   worker runs a complete partition scan independently — no shared state,
-   no coordination. Requires removing SPI calls from the scan hot path
-   (move metadata loading to leader process or use direct heap access).
+That leaves only DeltaXAppend/DeltaXDecompress queries as candidates.
+Those total ~4.7s on the ClickBench hot run, and realistic savings from
+Parallel Append would be ~3s. DeltaXAppend is also architecturally
+incompatible with Parallel Append: it sets `(*rel).nparts = 0` to
+prevent PG from rebuilding Append paths above it, which is how the
+leader-side partition scheduling works today. Making it parallel-aware
+would require a significant rearchitecture.
 
-2. **Phase 2 — `parallel_aware = true`:** Enable within-partition
-   parallelism at the PG level. Multiple workers split segments within a
-   single partition using shared scan state. More complex but enables
-   parallelism even with few partitions.
-
-**Constraints:**
-- SPI is not safe in parallel workers. Metadata loading must use direct
-  catalog access or be performed in the leader and shared via DSM.
-- TOAST detoasting should be safe in parallel workers (uses buffer manager).
-- Memory contexts must not be shared across workers.
-
-**Affected queries:** Q20 (24x), Q21 (43x), Q25 (25x) and all queries
-that use DeltaXDecompress + PG native aggregation as a fallback. Phase 1
-alone would give up to 8x improvement on these.
-
-**Files:** `src/scan/path.rs` (set parallel_safe), `src/scan/exec/segments.rs`
-(replace SPI metadata loading with direct heap access),
-`src/scan/exec/decompress.rs` (verify no shared mutable state)
+Given the modest target and the cost (direct-heap metadata access,
+`InitializeWorkerCustomScan` on all five CustomExecMethods, rearchitecting
+DeltaXAppend to cooperate with Parallel Append), this optimization is not
+being pursued. If the goal changes — e.g. fewer internal Rust threads per
+partition so PG workers can compose with them — this should be revisited.
 
 ### 36. Two-level hash aggregation
 
@@ -770,37 +761,37 @@ surviving segments.
 `src/scan/exec/decompress.rs` (parallel `exec_topn_text`),
 `src/scan/exec/agg.rs` (imports from text_col)
 
-### 38. Reduce per-partition SPI overhead
+### ~~38. Reduce per-partition SPI overhead~~ — Investigated, kept in branch
 
-**Target: All queries, ~20-50ms fixed overhead reduction**
-**Complexity: Low**
+**Status: Implemented in a separate branch — modest gain, not merged**
 
 Every partition scan begins with SPI queries to load segment metadata from
 companion tables. With 7-8 partitions, that's 7-8 separate SPI calls, each
 with SPI_connect/SPI_finish overhead, plan caching, and executor startup.
-For queries where segment pruning eliminates most work (Q2, Q8, Q20, Q41-
-Q43), this fixed overhead is a significant fraction of total time.
 
-**Approaches (pick one or combine):**
+**What was tried:** Approach 2 — replaced the SPI-based metadata loader
+in `src/scan/exec/segments.rs` with direct `table_open` / `heap_getnext`
+plus a session-level `thread_local!` cache of the companion OID and the
+decoded metadata. A SPI fallback was kept for first-call correctness.
 
-1. **Batch metadata loading:** Single SPI query with `UNION ALL` across
-   all companion table OIDs, partitioned by a discriminator column.
-   Reduces N SPI roundtrips to 1.
+**Results:**
+- Metadata phase on Q0 dropped from ~36ms warm to ~1.7ms warm.
+- Total query time improvement on Q0 was ~3ms — the rest of the SPI
+  time was already hidden behind other work or amortized across
+  partitions.
+- Cold-run behavior was unchanged after accounting for OS page cache
+  variance (the original "39ms cold" baseline was measured with a warm
+  page cache; a truly cold Q0 is ~200ms on both SPI and heap paths).
+- Other queries saw sub-millisecond changes.
 
-2. **Direct heap access:** Replace SPI with direct `heap_beginscan` /
-   `heap_getnext` on companion tables. Eliminates SPI overhead entirely.
-   Already needed for #35 (parallel safety). Uses `table_open` +
-   `systable_beginscan` to read companion rows without the SPI layer.
+**Why it's not merged:** The main justification for doing this work was
+unblocking #35 (parallel-safe paths require no SPI in workers). Since #35
+is no longer being pursued, the standalone warm-run win is too small to
+justify the added unsafe direct-heap code in the hot path. The branch is
+preserved for future reference if parallel-safe paths are revisited.
 
-3. **Companion OID caching:** Cache the mapping from parent table OID to
-   companion table OIDs across queries in the same session. Eliminates
-   the catalog lookup SPI call (currently one per partition per query).
-
-Approach 2 is preferred as it also unblocks #35 (parallel-safe paths
-require no SPI in workers).
-
-**Files:** `src/scan/exec/segments.rs` (`load_segments_heap` and metadata
-loading functions), `src/catalog.rs` (companion OID lookup)
+**Files:** `src/scan/exec/segments.rs` (`load_metadata` direct-heap
+implementation), `src/scan/hook.rs` (consolidated `load_deltatable_info`)
 
 ### 39. Pipelined detoast + parallel aggregation
 
