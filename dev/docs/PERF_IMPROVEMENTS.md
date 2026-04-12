@@ -585,44 +585,27 @@ accumulation loops improves cache locality.
 
 **Files:** `src/scan/exec/agg.rs` (fused filter+aggregate loop in AggState)
 
-### 33. Trigram bloom filters for LIKE substring pruning
+### 33. Trigram bloom filters for LIKE substring pruning [TRIED — NOT EFFECTIVE]
 
 **Target: Q21 7.7s -> ~0.3s, Q22 4.6s -> ~0.5s (ClickBench hot run)**
 **Complexity: Medium**
+**Status: Investigated and abandoned.**
 
-Distinct from #25 (value-level bloom filters for equality on text columns).
-This targets `LIKE '%pattern%'` queries where the pattern contains a fixed
-substring. Dictionary-based pruning (#19) handles dictionary-compressed
-columns, but high-cardinality text columns (URL, Referer, Title) use LZ4
-and currently require full decompression + scan for LIKE matching.
+The idea was to build per-segment trigram bloom filters for LZ4-compressed
+text columns and prune segments whose blooms don't contain the pattern's
+trigrams.
 
-**Approach:** During compression, for each LZ4-compressed text column,
-extract character trigrams from all string values in the segment and build
-a per-segment trigram bloom filter. At query time, extract trigrams from
-the LIKE pattern's fixed substring (e.g. `'%google%'` → `{goo, oog, ogl,
-gle}`) and check against the bloom. A segment is skipped only if ALL
-pattern trigrams are absent from the bloom.
+**Why it doesn't work:** Common search terms like `'%google%'` produce
+trigrams (`goo`, `oog`, `ogl`, `gle`) that are individually very frequent
+across URL data. With ~30 K distinct URLs per segment, the trigram space is
+saturated — virtually every segment contains all common trigrams, so the
+bloom filter passes almost everything. Any reasonably-sized bloom (2–8 KB)
+has a near-100% false positive rate for common patterns. Only extremely rare
+substrings would benefit, and those queries are already fast because
+dictionary pruning (#19) handles them.
 
-This is a well-known technique used by columnar engines as a skip index. On
-ClickBench data, 'google' appears in ~0.1% of URLs, so a trigram bloom
-would prune ~99% of segments for Q21/Q22.
-
-**Sizing:** Trigram bloom per segment ≈ 2-8 KB (similar to value-level
-blooms). 10 bits per distinct trigram, capped at 8 KB. The trigram
-alphabet is smaller than the value space, so blooms are compact.
-
-**Pattern extraction:** For LIKE patterns:
-- `'%foo%'` → extract trigrams from `foo`
-- `'foo%'` / `'%foo'` → same trigram extraction
-- Single/two-char patterns → no trigrams, skip optimization
-- `_` wildcards → break trigram sequences at wildcard positions
-
-**Storage:** Extend `_blooms` table with a separate trigram bloom alongside
-the existing value bloom. Distinguished by a type tag in the packed format.
-
-**Files:** `src/compress.rs` (trigram extraction + bloom build),
-`src/bloom.rs` (trigram bloom type), `src/scan/exec/segments.rs` (LIKE
-pattern → trigram check during segment loading)
+The cost of storing and checking trigram blooms (extra I/O per segment)
+is not justified by the negligible pruning rate on realistic queries.
 
 ### 34. Redundant GROUP BY expression elimination ✅
 
