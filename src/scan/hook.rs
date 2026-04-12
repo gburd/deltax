@@ -1160,7 +1160,21 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                 let min_col_cname = std::ffi::CString::new(format!("_min_{}", col_name)).unwrap();
                 let attnum = pg_sys::get_attnum(companion_oids[0], min_col_cname.as_ptr());
                 if attnum == pg_sys::InvalidAttrNumber as i16 {
-                    return;
+                    // Check colstats table (non-time columns have min/max there)
+                    let meta_name_ptr = pg_sys::get_rel_name(companion_oids[0]);
+                    let meta_ns_oid = pg_sys::get_rel_namespace(companion_oids[0]);
+                    let meta_name = std::ffi::CStr::from_ptr(meta_name_ptr).to_string_lossy();
+                    let partition_name = meta_name.strip_suffix("_meta").unwrap_or(&meta_name);
+                    let colstats_name = format!("{}_colstats", partition_name);
+                    let colstats_cname = std::ffi::CString::new(colstats_name).unwrap();
+                    let colstats_oid = pg_sys::get_relname_relid(colstats_cname.as_ptr(), meta_ns_oid);
+                    if colstats_oid == pg_sys::InvalidOid {
+                        return;
+                    }
+                    let cs_attnum = pg_sys::get_attnum(colstats_oid, min_col_cname.as_ptr());
+                    if cs_attnum == pg_sys::InvalidAttrNumber as i16 {
+                        return;
+                    }
                 }
 
                 let result_type_oid = (*aggref).aggtype;

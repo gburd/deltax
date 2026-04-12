@@ -297,6 +297,11 @@ struct PartitionBuffer {
     meta_insert_cols: Option<String>,
     /// Buffered VALUES clauses for batched meta INSERTs.
     meta_insert_rows: Vec<String>,
+    /// Cached colstats table FQN and column list for batched INSERTs.
+    colstats_fqn: Option<String>,
+    colstats_insert_cols: Option<String>,
+    /// Buffered VALUES clauses for batched colstats INSERTs.
+    colstats_insert_rows: Vec<String>,
     /// Cached companion table FQNs and OIDs to avoid repeated SPI lookups.
     blobs_fqn_cached: Option<String>,
     blooms_fqn_cached: Option<String>,
@@ -422,7 +427,7 @@ fn handle_copy_from_inner(copy_stmt: *mut pg_sys::CopyStmt, format_idx: i32) {
         }
 
         // Get column metadata from the parent table
-        let columns = get_column_metadata(client, &schema, &table, &ht.segment_by);
+        let columns = get_column_metadata(client, &schema, &table, &ht.segment_by, &ht.time_column);
         if columns.is_empty() {
             pgrx::error!("pg_deltax: no columns found for {}.{}", schema, table);
         }
@@ -481,6 +486,9 @@ fn handle_copy_from_inner(copy_stmt: *mut pg_sys::CopyStmt, format_idx: i32) {
             meta_fqn: None,
             meta_insert_cols: None,
             meta_insert_rows: Vec::new(),
+            colstats_fqn: None,
+            colstats_insert_cols: None,
+            colstats_insert_rows: Vec::new(),
             blobs_fqn_cached: None,
             blooms_fqn_cached: None,
             blobs_oid_cached: None,
@@ -1433,7 +1441,8 @@ struct CompressedSegment {
     row_count: usize,
     blobs: Vec<(u16, Vec<u8>)>,      // (col_idx, compressed_data)
     bloom_entries: Vec<(u16, u8, Vec<u8>)>, // (col_idx, num_hashes, bytes); empty if blooms disabled
-    meta_values_csv: String,          // pre-formatted VALUES clause innards
+    meta_values_csv: String,          // pre-formatted VALUES clause for thin meta
+    colstats_values_csv: String,      // pre-formatted VALUES clause for colstats
     total_compressed_size: i64,
 }
 
@@ -1551,70 +1560,86 @@ fn compress_segment(
         blobs.push((cr.col_idx, cr.compressed));
     }
 
-    // Build VALUES clause
-    let mut insert_vals = Vec::new();
-    insert_vals.push(seg_id.to_string());
+    // Build VALUES clause for thin meta: segment_id, segment_by, time min/max, row_count
+    let mut meta_vals = Vec::new();
+    meta_vals.push(seg_id.to_string());
 
-    // Segment-by columns
     let mut seg_idx = 0;
     for col in columns {
         if col.is_segment_by && seg_idx < seg_values.len() {
             match &seg_values[seg_idx] {
-                Some(v) => insert_vals.push(format!("'{}'", v.replace('\'', "''"))),
-                None => insert_vals.push("NULL".to_string()),
+                Some(v) => meta_vals.push(format!("'{}'", v.replace('\'', "''"))),
+                None => meta_vals.push("NULL".to_string()),
             }
             seg_idx += 1;
         }
     }
 
-    // Min/max columns
+    // Time column min/max only
     for (i, col) in columns.iter().enumerate() {
-        if !col.is_segment_by && supports_minmax(&col.data_type) {
+        if col.is_time_column && !col.is_segment_by && supports_minmax(&col.data_type) {
             match col_minmax.get(&i) {
                 Some((Some(min_val), Some(max_val))) => {
-                    insert_vals.push(format_minmax_for_insert(min_val, &col.data_type));
-                    insert_vals.push(format_minmax_for_insert(max_val, &col.data_type));
+                    meta_vals.push(format_minmax_for_insert(min_val, &col.data_type));
+                    meta_vals.push(format_minmax_for_insert(max_val, &col.data_type));
                 }
                 _ => {
-                    insert_vals.push("NULL".to_string());
-                    insert_vals.push("NULL".to_string());
+                    meta_vals.push("NULL".to_string());
+                    meta_vals.push("NULL".to_string());
                 }
             }
         }
     }
 
-    // Sum and non-null count
+    meta_vals.push((row_count as u32).to_string());
+
+    // Build VALUES clause for colstats: non-time min/max, sum/count, ndistinct
+    let mut cs_vals = Vec::new();
+    cs_vals.push(seg_id.to_string());
+
+    for (i, col) in columns.iter().enumerate() {
+        if !col.is_segment_by && !col.is_time_column && supports_minmax(&col.data_type) {
+            match col_minmax.get(&i) {
+                Some((Some(min_val), Some(max_val))) => {
+                    cs_vals.push(format_minmax_for_insert(min_val, &col.data_type));
+                    cs_vals.push(format_minmax_for_insert(max_val, &col.data_type));
+                }
+                _ => {
+                    cs_vals.push("NULL".to_string());
+                    cs_vals.push("NULL".to_string());
+                }
+            }
+        }
+    }
+
     for (i, col) in columns.iter().enumerate() {
         if !col.is_segment_by && supports_sum(&col.data_type) {
             match col_sums.get(&i) {
                 Some((Some(sum_val), nonnull_count, nonzero_count)) => {
-                    insert_vals.push(sum_val.clone());
-                    insert_vals.push(nonnull_count.to_string());
-                    insert_vals.push(nonzero_count.to_string());
+                    cs_vals.push(sum_val.clone());
+                    cs_vals.push(nonnull_count.to_string());
+                    cs_vals.push(nonzero_count.to_string());
                 }
                 _ => {
-                    insert_vals.push("NULL".to_string());
-                    insert_vals.push("0".to_string());
-                    insert_vals.push("0".to_string());
+                    cs_vals.push("NULL".to_string());
+                    cs_vals.push("0".to_string());
+                    cs_vals.push("0".to_string());
                 }
             }
         }
     }
 
-    // Ndistinct
     let mut nd_idx = 0;
     for col in columns {
         if !col.is_segment_by {
             if nd_idx < ndistinct.len() {
-                insert_vals.push(ndistinct[nd_idx].to_string());
+                cs_vals.push(ndistinct[nd_idx].to_string());
             } else {
-                insert_vals.push("0".to_string());
+                cs_vals.push("0".to_string());
             }
             nd_idx += 1;
         }
     }
-
-    insert_vals.push((row_count as u32).to_string());
 
     // Bloom filters
     let bloom_entries = if bloom_enabled {
@@ -1629,7 +1654,8 @@ fn compress_segment(
         row_count,
         blobs,
         bloom_entries,
-        meta_values_csv: insert_vals.join(", "),
+        meta_values_csv: meta_vals.join(", "),
+        colstats_values_csv: cs_vals.join(", "),
         total_compressed_size: total_size,
     }
 }
@@ -1645,18 +1671,18 @@ fn flush_segment(
     // Blobs and blooms tables are created WITHOUT primary keys for fast heap_insert.
     // PKs are added in finalize_partition after all data is loaded.
     if !buf.meta_table_created {
-        let (_, blobs_fqn, blooms_fqn, meta_ddl, _, _) =
-            build_companion_ddl(&buf.partition_table, &state.columns);
-        spi_exec(&meta_ddl);
+        let ddl = build_companion_ddl(&buf.partition_table, &state.columns);
+        spi_exec(&ddl.meta_ddl);
+        spi_exec(&ddl.colstats_ddl);
         // STORAGE EXTERNAL: skip TOAST pglz compression — blobs are already zstd-compressed.
         spi_exec(&format!(
             "CREATE TABLE {} (_col_idx SMALLINT NOT NULL, _segment_id INT NOT NULL, _data BYTEA COMPRESSION lz4)",
-            blobs_fqn
+            ddl.blobs_fqn
         ));
         if crate::BLOOM_FILTERS.get() {
             spi_exec(&format!(
                 "CREATE TABLE {} (_col_idx SMALLINT NOT NULL, _segment_id INT NOT NULL, _num_hashes SMALLINT NOT NULL, _data BYTEA COMPRESSION lz4 NOT NULL)",
-                blooms_fqn
+                ddl.blooms_fqn
             ));
         }
         buf.meta_table_created = true;
@@ -1668,8 +1694,7 @@ fn flush_segment(
     sort_typed_columns(&mut buf.typed_cols, &state.order_col_indices, buf.row_count);
     let sort_ms = t_sort_start.elapsed().as_millis();
 
-    let (meta_fqn, _, _, _, _, _) =
-        build_companion_ddl(&buf.partition_table, &state.columns);
+    let companion_ddl = build_companion_ddl(&buf.partition_table, &state.columns);
 
     // Compute ndistinct
     let ndistinct = compute_segment_ndistinct(&buf.typed_cols, &state.columns);
@@ -1785,52 +1810,73 @@ fn flush_segment(
         blobs.push((cr.col_idx, cr.compressed));
     }
 
-    // Build VALUES clause for this segment's meta row
-    let mut insert_vals = Vec::new();
-
-    insert_vals.push(seg_id.to_string());
+    // Build VALUES clause for thin meta row: segment_id, segment_by, time min/max, row_count
+    let mut meta_vals = Vec::new();
+    meta_vals.push(seg_id.to_string());
 
     // Segment-by columns
     let mut seg_idx = 0;
     for col in &state.columns {
         if col.is_segment_by && seg_idx < seg_values.len() {
             match &seg_values[seg_idx] {
-                Some(v) => insert_vals.push(format!("'{}'", v.replace('\'', "''"))),
-                None => insert_vals.push("NULL".to_string()),
+                Some(v) => meta_vals.push(format!("'{}'", v.replace('\'', "''"))),
+                None => meta_vals.push("NULL".to_string()),
             }
             seg_idx += 1;
         }
     }
 
-    // Min/max columns
+    // Time column min/max only
     for (i, col) in state.columns.iter().enumerate() {
-        if !col.is_segment_by && supports_minmax(&col.data_type) {
+        if col.is_time_column && !col.is_segment_by && supports_minmax(&col.data_type) {
             match col_minmax.get(&i) {
                 Some((Some(min_val), Some(max_val))) => {
-                    insert_vals.push(format_minmax_for_insert(min_val, &col.data_type));
-                    insert_vals.push(format_minmax_for_insert(max_val, &col.data_type));
+                    meta_vals.push(format_minmax_for_insert(min_val, &col.data_type));
+                    meta_vals.push(format_minmax_for_insert(max_val, &col.data_type));
                 }
                 _ => {
-                    insert_vals.push("NULL".to_string());
-                    insert_vals.push("NULL".to_string());
+                    meta_vals.push("NULL".to_string());
+                    meta_vals.push("NULL".to_string());
                 }
             }
         }
     }
 
-    // Sum and non-null count
+    meta_vals.push((buf.row_count as u32).to_string());
+
+    // Build VALUES clause for colstats row: non-time min/max, sum/count, ndistinct
+    let mut cs_vals = Vec::new();
+    cs_vals.push(seg_id.to_string());
+
+    // Non-time min/max columns
+    for (i, col) in state.columns.iter().enumerate() {
+        if !col.is_segment_by && !col.is_time_column && supports_minmax(&col.data_type) {
+            match col_minmax.get(&i) {
+                Some((Some(min_val), Some(max_val))) => {
+                    cs_vals.push(format_minmax_for_insert(min_val, &col.data_type));
+                    cs_vals.push(format_minmax_for_insert(max_val, &col.data_type));
+                }
+                _ => {
+                    cs_vals.push("NULL".to_string());
+                    cs_vals.push("NULL".to_string());
+                }
+            }
+        }
+    }
+
+    // Sum, non-null count, nonzero count
     for (i, col) in state.columns.iter().enumerate() {
         if !col.is_segment_by && supports_sum(&col.data_type) {
             match col_sums.get(&i) {
                 Some((Some(sum_val), nonnull_count, nonzero_count)) => {
-                    insert_vals.push(sum_val.clone());
-                    insert_vals.push(nonnull_count.to_string());
-                    insert_vals.push(nonzero_count.to_string());
+                    cs_vals.push(sum_val.clone());
+                    cs_vals.push(nonnull_count.to_string());
+                    cs_vals.push(nonzero_count.to_string());
                 }
                 _ => {
-                    insert_vals.push("NULL".to_string());
-                    insert_vals.push("0".to_string());
-                    insert_vals.push("0".to_string());
+                    cs_vals.push("NULL".to_string());
+                    cs_vals.push("0".to_string());
+                    cs_vals.push("0".to_string());
                 }
             }
         }
@@ -1841,15 +1887,13 @@ fn flush_segment(
     for col in &state.columns {
         if !col.is_segment_by {
             if nd_idx < ndistinct.len() {
-                insert_vals.push(ndistinct[nd_idx].to_string());
+                cs_vals.push(ndistinct[nd_idx].to_string());
             } else {
-                insert_vals.push("0".to_string());
+                cs_vals.push("0".to_string());
             }
             nd_idx += 1;
         }
     }
-
-    insert_vals.push((buf.row_count as u32).to_string());
 
     // Bloom filters
     let bloom_entries = if crate::BLOOM_FILTERS.get() {
@@ -1858,9 +1902,9 @@ fn flush_segment(
         Vec::new()
     };
 
-    // Cache the meta table name and column list (same for every segment of this partition)
+    // Cache table names and column lists (same for every segment of this partition)
     if buf.meta_fqn.is_none() {
-        buf.meta_fqn = Some(meta_fqn.clone());
+        buf.meta_fqn = Some(companion_ddl.meta_fqn.clone());
 
         let mut cols = Vec::new();
         cols.push("_segment_id".to_string());
@@ -1870,7 +1914,21 @@ fn flush_segment(
             }
         }
         for col in &state.columns {
-            if !col.is_segment_by && supports_minmax(&col.data_type) {
+            if col.is_time_column && !col.is_segment_by && supports_minmax(&col.data_type) {
+                cols.push(format!("\"_min_{}\"", col.name));
+                cols.push(format!("\"_max_{}\"", col.name));
+            }
+        }
+        cols.push("_row_count".to_string());
+        buf.meta_insert_cols = Some(cols.join(", "));
+    }
+    if buf.colstats_fqn.is_none() {
+        buf.colstats_fqn = Some(companion_ddl.colstats_fqn.clone());
+
+        let mut cols = Vec::new();
+        cols.push("_segment_id".to_string());
+        for col in &state.columns {
+            if !col.is_segment_by && !col.is_time_column && supports_minmax(&col.data_type) {
                 cols.push(format!("\"_min_{}\"", col.name));
                 cols.push(format!("\"_max_{}\"", col.name));
             }
@@ -1887,12 +1945,12 @@ fn flush_segment(
                 cols.push(format!("\"_ndistinct_{}\"", col.name));
             }
         }
-        cols.push("_row_count".to_string());
-        buf.meta_insert_cols = Some(cols.join(", "));
+        buf.colstats_insert_cols = Some(cols.join(", "));
     }
 
-    // Buffer the VALUES row
-    buf.meta_insert_rows.push(format!("({})", insert_vals.join(", ")));
+    // Buffer the VALUES rows
+    buf.meta_insert_rows.push(format!("({})", meta_vals.join(", ")));
+    buf.colstats_insert_rows.push(format!("({})", cs_vals.join(", ")));
 
     // Flush meta batch if full
     if buf.meta_insert_rows.len() >= META_BATCH_SIZE {
@@ -1935,21 +1993,32 @@ fn flush_segment(
     buf.row_count = 0;
 }
 
-/// Flush buffered meta rows as a single multi-row INSERT.
+/// Flush buffered meta and colstats rows as multi-row INSERTs.
 fn flush_meta_buffer(buf: &mut PartitionBuffer) {
-    if buf.meta_insert_rows.is_empty() {
-        return;
+    if !buf.meta_insert_rows.is_empty() {
+        let meta_fqn = buf.meta_fqn.as_ref().expect("meta_fqn not set");
+        let cols = buf.meta_insert_cols.as_ref().expect("meta_insert_cols not set");
+        let insert_sql = format!(
+            "INSERT INTO {} ({}) VALUES {}",
+            meta_fqn,
+            cols,
+            buf.meta_insert_rows.join(", ")
+        );
+        spi_exec(&insert_sql);
+        buf.meta_insert_rows.clear();
     }
-    let meta_fqn = buf.meta_fqn.as_ref().expect("meta_fqn not set");
-    let cols = buf.meta_insert_cols.as_ref().expect("meta_insert_cols not set");
-    let insert_sql = format!(
-        "INSERT INTO {} ({}) VALUES {}",
-        meta_fqn,
-        cols,
-        buf.meta_insert_rows.join(", ")
-    );
-    spi_exec(&insert_sql);
-    buf.meta_insert_rows.clear();
+    if !buf.colstats_insert_rows.is_empty() {
+        let colstats_fqn = buf.colstats_fqn.as_ref().expect("colstats_fqn not set");
+        let cols = buf.colstats_insert_cols.as_ref().expect("colstats_insert_cols not set");
+        let insert_sql = format!(
+            "INSERT INTO {} ({}) VALUES {}",
+            colstats_fqn,
+            cols,
+            buf.colstats_insert_rows.join(", ")
+        );
+        spi_exec(&insert_sql);
+        buf.colstats_insert_rows.clear();
+    }
 }
 
 /// Flush a partition's blob and bloom buffers to the companion tables.
@@ -1966,10 +2035,9 @@ fn flush_partition_blobs(
 
     // Cache companion table FQNs on first call
     if buf.blobs_fqn_cached.is_none() {
-        let (_, blobs_fqn, blooms_fqn, _, _, _) =
-            build_companion_ddl(&buf.partition_table, columns);
-        buf.blobs_fqn_cached = Some(blobs_fqn);
-        buf.blooms_fqn_cached = Some(blooms_fqn);
+        let ddl = build_companion_ddl(&buf.partition_table, columns);
+        buf.blobs_fqn_cached = Some(ddl.blobs_fqn);
+        buf.blooms_fqn_cached = Some(ddl.blooms_fqn);
     }
     let blobs_fqn = buf.blobs_fqn_cached.as_ref().unwrap();
     let blooms_fqn = buf.blooms_fqn_cached.as_ref().unwrap();
@@ -2118,28 +2186,27 @@ fn write_compressed_segment(
 ) {
     // Ensure companion tables exist
     if !buf.meta_table_created {
-        let (_, blobs_fqn, blooms_fqn, meta_ddl, _, _) =
-            build_companion_ddl(&buf.partition_table, &state.columns);
-        spi_exec(&meta_ddl);
+        let ddl = build_companion_ddl(&buf.partition_table, &state.columns);
+        spi_exec(&ddl.meta_ddl);
+        spi_exec(&ddl.colstats_ddl);
         spi_exec(&format!(
             "CREATE TABLE {} (_col_idx SMALLINT NOT NULL, _segment_id INT NOT NULL, _data BYTEA COMPRESSION lz4)",
-            blobs_fqn
+            ddl.blobs_fqn
         ));
         if crate::BLOOM_FILTERS.get() {
             spi_exec(&format!(
                 "CREATE TABLE {} (_col_idx SMALLINT NOT NULL, _segment_id INT NOT NULL, _num_hashes SMALLINT NOT NULL, _data BYTEA COMPRESSION lz4 NOT NULL)",
-                blooms_fqn
+                ddl.blooms_fqn
             ));
         }
         buf.meta_table_created = true;
         buf.blobs_table_created = true;
     }
 
-    // Cache meta column list
+    // Cache meta and colstats column lists
     if buf.meta_fqn.is_none() {
-        let (meta_fqn, _, _, _, _, _) =
-            build_companion_ddl(&buf.partition_table, &state.columns);
-        buf.meta_fqn = Some(meta_fqn);
+        let ddl = build_companion_ddl(&buf.partition_table, &state.columns);
+        buf.meta_fqn = Some(ddl.meta_fqn);
 
         let mut cols = Vec::new();
         cols.push("_segment_id".to_string());
@@ -2149,7 +2216,22 @@ fn write_compressed_segment(
             }
         }
         for col in &state.columns {
-            if !col.is_segment_by && supports_minmax(&col.data_type) {
+            if col.is_time_column && !col.is_segment_by && supports_minmax(&col.data_type) {
+                cols.push(format!("\"_min_{}\"", col.name));
+                cols.push(format!("\"_max_{}\"", col.name));
+            }
+        }
+        cols.push("_row_count".to_string());
+        buf.meta_insert_cols = Some(cols.join(", "));
+    }
+    if buf.colstats_fqn.is_none() {
+        let ddl = build_companion_ddl(&buf.partition_table, &state.columns);
+        buf.colstats_fqn = Some(ddl.colstats_fqn);
+
+        let mut cols = Vec::new();
+        cols.push("_segment_id".to_string());
+        for col in &state.columns {
+            if !col.is_segment_by && !col.is_time_column && supports_minmax(&col.data_type) {
                 cols.push(format!("\"_min_{}\"", col.name));
                 cols.push(format!("\"_max_{}\"", col.name));
             }
@@ -2166,12 +2248,12 @@ fn write_compressed_segment(
                 cols.push(format!("\"_ndistinct_{}\"", col.name));
             }
         }
-        cols.push("_row_count".to_string());
-        buf.meta_insert_cols = Some(cols.join(", "));
+        buf.colstats_insert_cols = Some(cols.join(", "));
     }
 
-    // Buffer meta row
+    // Buffer meta and colstats rows
     buf.meta_insert_rows.push(format!("({})", cs.meta_values_csv));
+    buf.colstats_insert_rows.push(format!("({})", cs.colstats_values_csv));
     if buf.meta_insert_rows.len() >= META_BATCH_SIZE {
         flush_meta_buffer(buf);
     }
@@ -2208,27 +2290,27 @@ fn finalize_partition(
         return;
     }
 
-    let (meta_fqn, blobs_fqn, blooms_fqn, _, _, _) =
-        build_companion_ddl(&buf.partition_table, columns);
+    let ddl = build_companion_ddl(&buf.partition_table, columns);
 
     // Add primary keys now that all data is loaded (much faster than maintaining
     // indexes during insert — PostgreSQL builds the B-tree in a single sort pass).
     spi_exec(&format!(
         "ALTER TABLE {} ADD PRIMARY KEY (_col_idx, _segment_id)",
-        blobs_fqn
+        ddl.blobs_fqn
     ));
     if buf.blobs_table_created && crate::BLOOM_FILTERS.get() {
         spi_exec(&format!(
             "ALTER TABLE {} ADD PRIMARY KEY (_col_idx, _segment_id)",
-            blooms_fqn
+            ddl.blooms_fqn
         ));
     }
 
-    spi_exec(&format!("ANALYZE {}", meta_fqn));
-    spi_exec(&format!("ANALYZE {}", blobs_fqn));
+    spi_exec(&format!("ANALYZE {}", ddl.meta_fqn));
+    spi_exec(&format!("ANALYZE {}", ddl.colstats_fqn));
+    spi_exec(&format!("ANALYZE {}", ddl.blobs_fqn));
 
     if buf.blobs_table_created && crate::BLOOM_FILTERS.get() {
-        spi_exec(&format!("ANALYZE {}", blooms_fqn));
+        spi_exec(&format!("ANALYZE {}", ddl.blooms_fqn));
     }
 
     // Use a short-lived SPI connection for catalog update
@@ -2252,7 +2334,7 @@ fn finalize_partition(
         catalog::update_partition_column_ndistinct(
             client,
             partition_id,
-            &meta_fqn,
+            &ddl.colstats_fqn,
             &nd_col_names,
         )
         .expect("failed to update partition column_ndistinct");

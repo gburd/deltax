@@ -999,6 +999,246 @@ pub(super) unsafe fn load_segments_heap(
         buf_stats.meta_read = t1_read - t0_read;
 
         // ================================================================
+        // Phase 1b: Scan colstats table for per-column stats (minmax, sum)
+        // Only opened when we need non-time column stats and have surviving segments.
+        // ================================================================
+        let need_colstats = !segments.is_empty() && (
+            // Need minmax for non-time columns?
+            (load_minmax && minmax_col_attnos.len() < col_names.iter().filter(|n| !segment_by.contains(n)).count())
+            // Need sum data?
+            || (load_sums && sum_col_attnos.is_empty())
+            // Have batch quals on non-time columns that weren't matched in meta?
+            || batch_quals.iter().any(|bq| {
+                !matches!(bq.op, BatchCompareOp::Like | BatchCompareOp::NotLike)
+                && matches!(bq.type_oid,
+                    pg_sys::INT2OID | pg_sys::INT4OID | pg_sys::INT8OID
+                    | pg_sys::FLOAT4OID | pg_sys::FLOAT8OID
+                    | pg_sys::DATEOID | pg_sys::TIMESTAMPOID | pg_sys::TIMESTAMPTZOID)
+                && {
+                    let col_name = &col_names[bq.col_idx];
+                    let min_name = format!("_min_{}", col_name);
+                    // Not in meta attno_map = it's a non-time column
+                    !attno_map.contains_key(min_name.as_str())
+                }
+            })
+        );
+
+        if need_colstats {
+            let meta_name_ptr = pg_sys::get_rel_name(meta_oid);
+            let meta_name_str = std::ffi::CStr::from_ptr(meta_name_ptr)
+                .to_string_lossy()
+                .into_owned();
+            let meta_ns_oid = pg_sys::get_rel_namespace(meta_oid);
+            let partition_name = meta_name_str.strip_suffix("_meta").unwrap_or(&meta_name_str);
+            let colstats_name = format!("{}_colstats", partition_name);
+            let colstats_cname = std::ffi::CString::new(colstats_name).unwrap();
+            let colstats_oid = pg_sys::get_relname_relid(colstats_cname.as_ptr(), meta_ns_oid);
+
+            if colstats_oid != pg_sys::InvalidOid {
+                let cs_rel = pg_sys::table_open(colstats_oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+                let cs_tupdesc = (*cs_rel).rd_att;
+                let cs_natts = (*cs_tupdesc).natts as usize;
+
+                // Build colstats attno map
+                let mut cs_attno_map: HashMap<String, usize> = HashMap::new();
+                let mut cs_att_type_oids: HashMap<String, pg_sys::Oid> = HashMap::new();
+                for i in 0..cs_natts {
+                    let att = &*tupdesc_get_attr(cs_tupdesc, i);
+                    if att.attisdropped { continue; }
+                    let name = std::ffi::CStr::from_ptr(att.attname.data.as_ptr())
+                        .to_string_lossy()
+                        .into_owned();
+                    cs_att_type_oids.insert(name.clone(), att.atttypid);
+                    cs_attno_map.insert(name, i);
+                }
+
+                let cs_segment_id_attno = cs_attno_map.get("_segment_id").copied();
+
+                // Discover colstats min/max columns (non-time columns)
+                let mut cs_minmax_col_attnos: Vec<(String, usize, usize, pg_sys::Oid)> = Vec::new();
+                if load_minmax {
+                    for col_name in col_names {
+                        if segment_by.contains(col_name) { continue; }
+                        // Skip if already found in meta (time column)
+                        if minmax_col_attnos.iter().any(|(n, _, _, _)| n == col_name) { continue; }
+                        let min_name = format!("_min_{}", col_name);
+                        let max_name = format!("_max_{}", col_name);
+                        if let (Some(&min_att), Some(&max_att)) = (
+                            cs_attno_map.get(min_name.as_str()),
+                            cs_attno_map.get(max_name.as_str()),
+                        ) {
+                            let type_oid = cs_att_type_oids.get(min_name.as_str()).copied()
+                                .unwrap_or(pg_sys::InvalidOid);
+                            cs_minmax_col_attnos.push((col_name.clone(), min_att, max_att, type_oid));
+                        }
+                    }
+                }
+
+                // Discover colstats sum columns
+                let mut cs_sum_col_attnos: Vec<(String, usize, usize, Option<usize>, pg_sys::Oid)> = Vec::new();
+                if load_sums {
+                    for col_name in col_names {
+                        if segment_by.contains(col_name) { continue; }
+                        let sum_name = format!("_sum_{}", col_name);
+                        let nonnull_name = format!("_nonnull_count_{}", col_name);
+                        let nonzero_name = format!("_nonzero_count_{}", col_name);
+                        if let (Some(&sum_att), Some(&nn_att)) = (
+                            cs_attno_map.get(sum_name.as_str()),
+                            cs_attno_map.get(nonnull_name.as_str()),
+                        ) {
+                            let nz_att = cs_attno_map.get(nonzero_name.as_str()).copied();
+                            let type_oid = cs_att_type_oids.get(sum_name.as_str()).copied()
+                                .unwrap_or(pg_sys::InvalidOid);
+                            cs_sum_col_attnos.push((col_name.clone(), sum_att, nn_att, nz_att, type_oid));
+                        }
+                    }
+                }
+
+                // Build minmax filters for colstats columns (non-time batch quals)
+                let mut cs_minmax_filters: Vec<MinMaxFilter> = Vec::new();
+                for bq in batch_quals {
+                    match bq.op {
+                        BatchCompareOp::Like | BatchCompareOp::NotLike => continue,
+                        _ => {}
+                    }
+                    match bq.type_oid {
+                        pg_sys::INT2OID | pg_sys::INT4OID | pg_sys::INT8OID
+                        | pg_sys::FLOAT4OID | pg_sys::FLOAT8OID
+                        | pg_sys::DATEOID | pg_sys::TIMESTAMPOID | pg_sys::TIMESTAMPTZOID => {}
+                        _ => continue,
+                    }
+                    let col_name = &col_names[bq.col_idx];
+                    let min_name = format!("_min_{}", col_name);
+                    let max_name = format!("_max_{}", col_name);
+                    // Only build filter if the column is in colstats (not in meta)
+                    if attno_map.contains_key(min_name.as_str()) { continue; }
+                    if let (Some(&min_att), Some(&max_att)) = (
+                        cs_attno_map.get(min_name.as_str()),
+                        cs_attno_map.get(max_name.as_str()),
+                    ) {
+                        cs_minmax_filters.push(MinMaxFilter {
+                            min_attno: min_att,
+                            max_attno: max_att,
+                            op: bq.op,
+                            const_datum: bq.const_datum,
+                            type_oid: bq.type_oid,
+                            in_list_i64: bq.in_list_i64.clone(),
+                        });
+                    }
+                }
+
+                // Build surviving segment_id → index mapping
+                let mut seg_id_to_idx: HashMap<i32, usize> = HashMap::new();
+                for (idx, &sid) in surviving_segment_ids.iter().enumerate() {
+                    seg_id_to_idx.insert(sid, idx);
+                }
+
+                // Scan colstats table
+                let cs_snapshot = pg_sys::GetActiveSnapshot();
+                let cs_flags: u32 = pg_sys::ScanOptions::SO_TYPE_SEQSCAN
+                    | pg_sys::ScanOptions::SO_ALLOW_STRAT
+                    | pg_sys::ScanOptions::SO_ALLOW_SYNC
+                    | pg_sys::ScanOptions::SO_ALLOW_PAGEMODE;
+                let cs_scan = (*(*cs_rel).rd_tableam).scan_begin.unwrap()(
+                    cs_rel, cs_snapshot, 0, std::ptr::null_mut(), std::ptr::null_mut(), cs_flags,
+                );
+
+                let mut cs_values = vec![pg_sys::Datum::from(0); cs_natts];
+                let mut cs_nulls = vec![true; cs_natts];
+                let mut cs_pruned_ids: std::collections::HashSet<i32> = std::collections::HashSet::new();
+
+                loop {
+                    let tuple = pg_sys::heap_getnext(
+                        cs_scan,
+                        pg_sys::ScanDirection::ForwardScanDirection,
+                    );
+                    if tuple.is_null() { break; }
+
+                    pg_sys::heap_deform_tuple(
+                        tuple, cs_tupdesc,
+                        cs_values.as_mut_ptr(), cs_nulls.as_mut_ptr(),
+                    );
+
+                    // Extract segment_id, skip if not in surviving set
+                    let seg_id = match cs_segment_id_attno {
+                        Some(attno) if !cs_nulls[attno] => cs_values[attno].value() as i32,
+                        _ => continue,
+                    };
+                    let seg_idx = match seg_id_to_idx.get(&seg_id) {
+                        Some(&idx) => idx,
+                        None => continue,
+                    };
+
+                    // Apply minmax filters from colstats columns
+                    if !cs_minmax_filters.is_empty() {
+                        let mut skip = false;
+                        for f in &cs_minmax_filters {
+                            if !segment_passes_minmax_filter(f, &cs_values, &cs_nulls) {
+                                skip = true;
+                                break;
+                            }
+                        }
+                        if skip {
+                            cs_pruned_ids.insert(seg_id);
+                            segments_minmax_skipped += 1;
+                            continue;
+                        }
+                    }
+
+                    // Extract per-column min/max from colstats
+                    for (col_name, min_att, max_att, type_oid) in &cs_minmax_col_attnos {
+                        segments[seg_idx].col_minmax.insert(col_name.clone(), ColMinMax {
+                            min_datum: if cs_nulls[*min_att] { pg_sys::Datum::from(0usize) } else { cs_values[*min_att] },
+                            max_datum: if cs_nulls[*max_att] { pg_sys::Datum::from(0usize) } else { cs_values[*max_att] },
+                            min_null: cs_nulls[*min_att],
+                            max_null: cs_nulls[*max_att],
+                            type_oid: *type_oid,
+                        });
+                    }
+
+                    // Extract per-column sum/nonnull_count/nonzero_count from colstats
+                    for (col_name, sum_att, nn_att, nz_att, type_oid) in &cs_sum_col_attnos {
+                        let sum_null = cs_nulls[*sum_att];
+                        let sum_datum = if sum_null { pg_sys::Datum::from(0usize) } else { cs_values[*sum_att] };
+                        let nonnull_count = if cs_nulls[*nn_att] { 0i64 } else { cs_values[*nn_att].value() as i64 };
+                        let nonzero_count = match nz_att {
+                            Some(att) => if cs_nulls[*att] { -1i64 } else { cs_values[*att].value() as i64 },
+                            None => -1i64,
+                        };
+                        segments[seg_idx].col_sums.insert(col_name.clone(), ColSum {
+                            sum_datum,
+                            sum_null,
+                            nonnull_count,
+                            nonzero_count,
+                            type_oid: *type_oid,
+                        });
+                    }
+                }
+
+                (*(*cs_rel).rd_tableam).scan_end.unwrap()(cs_scan);
+                pg_sys::table_close(cs_rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+
+                // Remove colstats-pruned segments
+                if !cs_pruned_ids.is_empty() {
+                    let mut i = 0;
+                    while i < segments.len() {
+                        if cs_pruned_ids.contains(&surviving_segment_ids[i]) {
+                            segments.swap_remove(i);
+                            surviving_segment_ids.swap_remove(i);
+                            segments_skipped += 1;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        let (t1b_hit, t1b_read) = shared_buf_snapshot();
+        buf_stats.meta_hit += t1b_hit - t1_hit;
+        buf_stats.meta_read += t1b_read - t1_read;
+
+        // ================================================================
         // Bloom phase: PK index scan per bloom-checked column to prune
         // surviving segments. Mirrors the Phase 2 blob index-scan loop.
         // ================================================================

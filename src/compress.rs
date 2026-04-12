@@ -18,6 +18,7 @@ pub(crate) struct ColumnMeta {
     pub(crate) name: String,
     pub(crate) data_type: String,
     pub(crate) is_segment_by: bool,
+    pub(crate) is_time_column: bool,
 }
 
 // ============================================================================
@@ -251,7 +252,7 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
     }
 
     // 3. Get column metadata
-    let columns = get_column_metadata(client, &schema, &part_table, &ht.segment_by);
+    let columns = get_column_metadata(client, &schema, &part_table, &ht.segment_by, &ht.time_column);
     if columns.is_empty() {
         pgrx::error!("pg_deltax: no columns found for {}.{}", schema, part_table);
     }
@@ -281,9 +282,8 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
         return format!("Partition {}.{} has no rows to compress", schema, part_table);
     }
 
-    // 5. Build two-table DDL: meta (metadata) + blobs (column-major compressed data)
-    let (meta_fqn, blobs_fqn, blooms_fqn, meta_ddl, blobs_ddl, blooms_ddl) =
-        build_companion_ddl(&part_table, &columns);
+    // 5. Build companion table DDL: meta (thin) + colstats (wide) + blobs + blooms
+    let ddl = build_companion_ddl(&part_table, &columns);
     // NOTE: table creation is deferred until we confirm data exists.
     // Creating it early would cause the scan hook to intercept queries on the partition
     // (it checks for meta table existence, not is_compressed in the catalog).
@@ -296,12 +296,7 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
     let (total_compressed_size, row_count) = compress_partition_streaming(
         client,
         &part_fqn,
-        &meta_fqn,
-        &blobs_fqn,
-        &blooms_fqn,
-        &meta_ddl,
-        &blobs_ddl,
-        &blooms_ddl,
+        &ddl,
         &columns,
         &ht.order_by,
         &ht.segment_by,
@@ -311,13 +306,16 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
     // Empty partition — clean up tables and return
     if row_count == 0 {
         client
-            .update(&format!("DROP TABLE IF EXISTS {}", meta_fqn), None, &[])
+            .update(&format!("DROP TABLE IF EXISTS {}", ddl.meta_fqn), None, &[])
             .expect("failed to drop empty meta table");
         client
-            .update(&format!("DROP TABLE IF EXISTS {}", blobs_fqn), None, &[])
+            .update(&format!("DROP TABLE IF EXISTS {}", ddl.colstats_fqn), None, &[])
+            .expect("failed to drop empty colstats table");
+        client
+            .update(&format!("DROP TABLE IF EXISTS {}", ddl.blobs_fqn), None, &[])
             .expect("failed to drop empty blobs table");
         client
-            .update(&format!("DROP TABLE IF EXISTS {}", blooms_fqn), None, &[])
+            .update(&format!("DROP TABLE IF EXISTS {}", ddl.blooms_fqn), None, &[])
             .expect("failed to drop empty blooms table");
         return format!("Partition {}.{} has no rows to compress", schema, part_table);
     }
@@ -338,13 +336,13 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
     .expect("failed to update catalog");
 
     // Persist per-column max ndistinct so planner cost estimation can do
-    // a catalog lookup instead of a cold full scan of the meta table.
+    // a catalog lookup instead of a cold full scan of the colstats table.
     let nd_col_names: Vec<String> = columns
         .iter()
         .filter(|c| !c.is_segment_by)
         .map(|c| c.name.clone())
         .collect();
-    catalog::update_partition_column_ndistinct(client, part_info.id, &meta_fqn, &nd_col_names)
+    catalog::update_partition_column_ndistinct(client, part_info.id, &ddl.colstats_fqn, &nd_col_names)
         .expect("failed to update partition column_ndistinct");
 
     crate::scan::invalidate_compressed_cache();
@@ -670,13 +668,14 @@ fn apply_permutation<T: Clone>(v: &mut Vec<T>, perm: &[usize]) {
 /// Each bloom entry is (col_idx, num_hashes, bloom_bytes).
 pub(crate) type FlushResult = (i64, Vec<(u16, Vec<u8>)>, Vec<(u16, u8, Vec<u8>)>);
 
-/// Compress accumulated typed column data and INSERT metadata into the meta table.
+/// Compress accumulated typed column data and INSERT metadata into the meta + colstats tables.
 /// Returns (compressed_size, vec of (col_idx, compressed_blob)) — blobs are NOT inserted,
 /// they are returned for column-major buffering by the caller.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn flush_segment_metadata(
     client: &mut SpiClient,
     meta_fqn: &str,
+    colstats_fqn: &str,
     columns: &[ColumnMeta],
     typed_cols: &[TypedColumn],
     segment_by_values: &[Option<String>],
@@ -712,89 +711,128 @@ pub(crate) fn flush_segment_metadata(
         col_idx += 1;
     }
 
-    // Build INSERT for meta table — no BYTEA columns, just metadata
-    let mut insert_cols = Vec::new();
-    let mut insert_vals = Vec::new();
+    // Build INSERT for thin meta table: segment_id, segment_by, time min/max, row_count
+    let mut meta_cols = Vec::new();
+    let mut meta_vals = Vec::new();
 
-    // Segment ID
-    insert_cols.push("_segment_id".to_string());
-    insert_vals.push(segment_id.to_string());
+    meta_cols.push("_segment_id".to_string());
+    meta_vals.push(segment_id.to_string());
 
-    // Segment-by columns as SQL literals
+    // Segment-by columns
     let mut seg_idx = 0;
     for col in columns {
         if col.is_segment_by {
-            insert_cols.push(format!("\"{}\"", col.name));
+            meta_cols.push(format!("\"{}\"", col.name));
             if seg_idx < segment_by_values.len() {
                 match &segment_by_values[seg_idx] {
-                    Some(v) => insert_vals.push(format!("'{}'", v.replace('\'', "''"))),
-                    None => insert_vals.push("NULL".to_string()),
+                    Some(v) => meta_vals.push(format!("'{}'", v.replace('\'', "''"))),
+                    None => meta_vals.push("NULL".to_string()),
                 }
                 seg_idx += 1;
             }
         }
     }
 
-    // Min/max as SQL literals (small values)
+    // Time column min/max only
     for col in columns {
-        if !col.is_segment_by && supports_minmax(&col.data_type) {
-            insert_cols.push(format!("\"_min_{}\"", col.name));
-            insert_cols.push(format!("\"_max_{}\"", col.name));
-        }
-    }
-    for col in columns {
-        if !col.is_segment_by && supports_minmax(&col.data_type) {
+        if col.is_time_column && !col.is_segment_by && supports_minmax(&col.data_type) {
+            meta_cols.push(format!("\"_min_{}\"", col.name));
+            meta_cols.push(format!("\"_max_{}\"", col.name));
             match col_minmax.get(&col.name) {
                 Some((Some(min_val), Some(max_val))) => {
-                    insert_vals.push(format_minmax_for_insert(min_val, &col.data_type));
-                    insert_vals.push(format_minmax_for_insert(max_val, &col.data_type));
+                    meta_vals.push(format_minmax_for_insert(min_val, &col.data_type));
+                    meta_vals.push(format_minmax_for_insert(max_val, &col.data_type));
                 }
                 _ => {
-                    insert_vals.push("NULL".to_string());
-                    insert_vals.push("NULL".to_string());
+                    meta_vals.push("NULL".to_string());
+                    meta_vals.push("NULL".to_string());
                 }
             }
         }
     }
-    // Sum, non-null count, and nonzero count metadata
+
+    meta_cols.push("_row_count".to_string());
+    meta_vals.push(row_count.to_string());
+
+    let meta_sql = format!(
+        "INSERT INTO {} ({}) VALUES ({})",
+        meta_fqn,
+        meta_cols.join(", "),
+        meta_vals.join(", ")
+    );
+    client
+        .update(&meta_sql, None, &[])
+        .expect("failed to insert segment metadata");
+
+    // Build INSERT for colstats table: non-time min/max, sum/count, ndistinct
+    let mut cs_cols = Vec::new();
+    let mut cs_vals = Vec::new();
+
+    cs_cols.push("_segment_id".to_string());
+    cs_vals.push(segment_id.to_string());
+
+    // Min/max for non-time orderable columns
     for col in columns {
-        if !col.is_segment_by && supports_sum(&col.data_type) {
-            insert_cols.push(format!("\"_sum_{}\"", col.name));
-            insert_cols.push(format!("\"_nonnull_count_{}\"", col.name));
-            insert_cols.push(format!("\"_nonzero_count_{}\"", col.name));
+        if !col.is_segment_by && !col.is_time_column && supports_minmax(&col.data_type) {
+            cs_cols.push(format!("\"_min_{}\"", col.name));
+            cs_cols.push(format!("\"_max_{}\"", col.name));
+            match col_minmax.get(&col.name) {
+                Some((Some(min_val), Some(max_val))) => {
+                    cs_vals.push(format_minmax_for_insert(min_val, &col.data_type));
+                    cs_vals.push(format_minmax_for_insert(max_val, &col.data_type));
+                }
+                _ => {
+                    cs_vals.push("NULL".to_string());
+                    cs_vals.push("NULL".to_string());
+                }
+            }
         }
     }
+
+    // Sum, non-null count, nonzero count
     for col in columns {
         if !col.is_segment_by && supports_sum(&col.data_type) {
+            cs_cols.push(format!("\"_sum_{}\"", col.name));
+            cs_cols.push(format!("\"_nonnull_count_{}\"", col.name));
+            cs_cols.push(format!("\"_nonzero_count_{}\"", col.name));
             match col_sums.get(&col.name) {
                 Some((Some(sum_val), nonnull_count, nonzero_count)) => {
-                    insert_vals.push(sum_val.clone());
-                    insert_vals.push(nonnull_count.to_string());
-                    insert_vals.push(nonzero_count.to_string());
+                    cs_vals.push(sum_val.clone());
+                    cs_vals.push(nonnull_count.to_string());
+                    cs_vals.push(nonzero_count.to_string());
                 }
                 _ => {
-                    insert_vals.push("NULL".to_string());
-                    insert_vals.push("0".to_string());
-                    insert_vals.push("0".to_string());
+                    cs_vals.push("NULL".to_string());
+                    cs_vals.push("0".to_string());
+                    cs_vals.push("0".to_string());
                 }
             }
         }
     }
-    // Per-segment ndistinct for non-segment-by columns
+
+    // Ndistinct for all non-segment-by columns
     let mut nd_idx = 0;
     for col in columns {
         if !col.is_segment_by {
-            insert_cols.push(format!("\"_ndistinct_{}\"", col.name));
+            cs_cols.push(format!("\"_ndistinct_{}\"", col.name));
             if nd_idx < ndistinct_values.len() {
-                insert_vals.push(ndistinct_values[nd_idx].to_string());
+                cs_vals.push(ndistinct_values[nd_idx].to_string());
             } else {
-                insert_vals.push("0".to_string());
+                cs_vals.push("0".to_string());
             }
             nd_idx += 1;
         }
     }
-    insert_cols.push("_row_count".to_string());
-    insert_vals.push(row_count.to_string());
+
+    let cs_sql = format!(
+        "INSERT INTO {} ({}) VALUES ({})",
+        colstats_fqn,
+        cs_cols.join(", "),
+        cs_vals.join(", ")
+    );
+    client
+        .update(&cs_sql, None, &[])
+        .expect("failed to insert segment colstats");
 
     // Compute per-column bloom filters (if enabled via GUC) — stored separately
     let bloom_entries = if crate::BLOOM_FILTERS.get() {
@@ -802,16 +840,6 @@ pub(crate) fn flush_segment_metadata(
     } else {
         Vec::new()
     };
-
-    let insert_sql = format!(
-        "INSERT INTO {} ({}) VALUES ({})",
-        meta_fqn,
-        insert_cols.join(", "),
-        insert_vals.join(", ")
-    );
-    client
-        .update(&insert_sql, None, &[])
-        .expect("failed to insert segment metadata");
 
     (total_size, blobs, bloom_entries)
 }
@@ -947,6 +975,7 @@ pub(crate) fn compute_segment_blooms(
 pub(crate) fn flush_with_splitting(
     client: &mut SpiClient,
     meta_fqn: &str,
+    colstats_fqn: &str,
     columns: &[ColumnMeta],
     typed_cols: &[TypedColumn],
     seg_values: &[Option<String>],
@@ -966,7 +995,7 @@ pub(crate) fn flush_with_splitting(
         if offset == 0 && chunk_end == total_rows {
             let ndistinct = compute_segment_ndistinct(typed_cols, columns);
             let (size, blobs, bloom_entries) =
-                flush_segment_metadata(client, meta_fqn, columns, typed_cols, seg_values, &ndistinct, chunk_rows, seg_id);
+                flush_segment_metadata(client, meta_fqn, colstats_fqn, columns, typed_cols, seg_values, &ndistinct, chunk_rows, seg_id);
             total_size += size;
             for (col_idx, blob) in blobs {
                 blob_buffer.push((col_idx, seg_id, blob));
@@ -981,7 +1010,7 @@ pub(crate) fn flush_with_splitting(
                 .collect();
             let ndistinct = compute_segment_ndistinct(&chunk_cols, columns);
             let (size, blobs, bloom_entries) =
-                flush_segment_metadata(client, meta_fqn, columns, &chunk_cols, seg_values, &ndistinct, chunk_rows, seg_id);
+                flush_segment_metadata(client, meta_fqn, colstats_fqn, columns, &chunk_cols, seg_values, &ndistinct, chunk_rows, seg_id);
             total_size += size;
             for (col_idx, blob) in blobs {
                 blob_buffer.push((col_idx, seg_id, blob));
@@ -996,18 +1025,34 @@ pub(crate) fn flush_with_splitting(
 }
 
 
-/// Build DDL for companion tables (meta, blobs, blooms) for a partition.
-/// Returns: (meta_fqn, blobs_fqn, blooms_fqn, meta_ddl, blobs_ddl, blooms_ddl)
+/// DDL info for all companion tables of a compressed partition.
+pub(crate) struct CompanionDdl {
+    pub(crate) meta_fqn: String,
+    pub(crate) colstats_fqn: String,
+    pub(crate) blobs_fqn: String,
+    pub(crate) blooms_fqn: String,
+    pub(crate) meta_ddl: String,
+    pub(crate) colstats_ddl: String,
+    pub(crate) blobs_ddl: String,
+    pub(crate) blooms_ddl: String,
+}
+
+/// Build DDL for companion tables (meta, colstats, blobs, blooms) for a partition.
+///
+/// The meta table is thin: only segment_id, segment_by cols, time column min/max,
+/// and row_count. All other per-column stats (min/max for non-time columns,
+/// sum/count, ndistinct) go into the colstats table.
 pub(crate) fn build_companion_ddl(
     part_table: &str,
     columns: &[ColumnMeta],
-) -> (String, String, String, String, String, String) {
+) -> CompanionDdl {
     let companion_schema = "_deltax_compressed";
     let meta_fqn = format!("\"{}\".\"{}_meta\"", companion_schema, part_table);
+    let colstats_fqn = format!("\"{}\".\"{}_colstats\"", companion_schema, part_table);
     let blobs_fqn = format!("\"{}\".\"{}_blobs\"", companion_schema, part_table);
     let blooms_fqn = format!("\"{}\".\"{}_blooms\"", companion_schema, part_table);
 
-    // Meta table: segment_by cols, min/max, sum/count, ndistinct, row_count
+    // Thin meta table: segment_id, segment_by cols, time column min/max, row_count
     let mut meta_cols = Vec::new();
     meta_cols.push("_segment_id INT PRIMARY KEY".to_string());
     for col in columns {
@@ -1016,26 +1061,9 @@ pub(crate) fn build_companion_ddl(
         }
     }
     for col in columns {
-        if !col.is_segment_by && supports_minmax(&col.data_type) {
+        if col.is_time_column && !col.is_segment_by && supports_minmax(&col.data_type) {
             meta_cols.push(format!("\"_min_{}\" {}", col.name, col.data_type));
             meta_cols.push(format!("\"_max_{}\" {}", col.name, col.data_type));
-        }
-    }
-    for col in columns {
-        if !col.is_segment_by && supports_sum(&col.data_type) {
-            let sum_type = if is_float_type(&col.data_type) {
-                "DOUBLE PRECISION"
-            } else {
-                "NUMERIC"
-            };
-            meta_cols.push(format!("\"_sum_{}\" {}", col.name, sum_type));
-            meta_cols.push(format!("\"_nonnull_count_{}\" INT", col.name));
-            meta_cols.push(format!("\"_nonzero_count_{}\" INT", col.name));
-        }
-    }
-    for col in columns {
-        if !col.is_segment_by {
-            meta_cols.push(format!("\"_ndistinct_{}\" INT", col.name));
         }
     }
     meta_cols.push("_row_count INT".to_string());
@@ -1044,6 +1072,42 @@ pub(crate) fn build_companion_ddl(
         "CREATE TABLE {} ({})",
         meta_fqn,
         meta_cols.join(", ")
+    );
+
+    // Colstats table: all per-column stats for non-time columns
+    let mut colstats_cols = Vec::new();
+    colstats_cols.push("_segment_id INT PRIMARY KEY".to_string());
+    // Min/max for non-time orderable columns
+    for col in columns {
+        if !col.is_segment_by && !col.is_time_column && supports_minmax(&col.data_type) {
+            colstats_cols.push(format!("\"_min_{}\" {}", col.name, col.data_type));
+            colstats_cols.push(format!("\"_max_{}\" {}", col.name, col.data_type));
+        }
+    }
+    // Sum/count for numeric columns (including time if numeric, which it isn't typically)
+    for col in columns {
+        if !col.is_segment_by && supports_sum(&col.data_type) {
+            let sum_type = if is_float_type(&col.data_type) {
+                "DOUBLE PRECISION"
+            } else {
+                "NUMERIC"
+            };
+            colstats_cols.push(format!("\"_sum_{}\" {}", col.name, sum_type));
+            colstats_cols.push(format!("\"_nonnull_count_{}\" INT", col.name));
+            colstats_cols.push(format!("\"_nonzero_count_{}\" INT", col.name));
+        }
+    }
+    // Ndistinct for all non-segment-by columns
+    for col in columns {
+        if !col.is_segment_by {
+            colstats_cols.push(format!("\"_ndistinct_{}\" INT", col.name));
+        }
+    }
+
+    let colstats_ddl = format!(
+        "CREATE TABLE {} ({})",
+        colstats_fqn,
+        colstats_cols.join(", ")
     );
 
     // STORAGE EXTERNAL: skip TOAST pglz compression on _data — blobs are already zstd-compressed.
@@ -1057,7 +1121,16 @@ pub(crate) fn build_companion_ddl(
         blooms_fqn
     );
 
-    (meta_fqn, blobs_fqn, blooms_fqn, meta_ddl, blobs_ddl, blooms_ddl)
+    CompanionDdl {
+        meta_fqn,
+        colstats_fqn,
+        blobs_fqn,
+        blooms_fqn,
+        meta_ddl,
+        colstats_ddl,
+        blobs_ddl,
+        blooms_ddl,
+    }
 }
 
 /// Compress a partition using cursor-based streaming.
@@ -1067,16 +1140,10 @@ pub(crate) fn build_companion_ddl(
 /// Returns (compressed_size, row_count). ndistinct is tracked per-segment via HLL
 /// and stored in the meta table. Blobs are buffered and inserted column-major
 /// into the blobs table after all segments are processed.
-#[allow(clippy::too_many_arguments)]
 fn compress_partition_streaming(
     client: &mut SpiClient,
     part_fqn: &str,
-    meta_fqn: &str,
-    blobs_fqn: &str,
-    blooms_fqn: &str,
-    meta_ddl: &str,
-    blobs_ddl: &str,
-    blooms_ddl: &str,
+    ddl: &CompanionDdl,
     columns: &[ColumnMeta],
     order_by: &[String],
     segment_by: &[String],
@@ -1152,7 +1219,7 @@ fn compress_partition_streaming(
     let mut rows_in_segment: usize = 0;
     let mut total_compressed_size: i64 = 0;
     let mut total_rows: i64 = 0;
-    let mut meta_created = false;
+    let mut tables_created = false;
     let mut next_segment_id: i32 = 1;
     let mut blob_buffer: Vec<(u16, i32, Vec<u8>)> = Vec::new(); // (col_idx, segment_id, blob)
     let mut bloom_buffer: Vec<(u16, i32, u8, Vec<u8>)> = Vec::new(); // (col_idx, segment_id, num_hashes, bloom_bytes)
@@ -1188,13 +1255,15 @@ fn compress_partition_streaming(
                 } else if row_seg_values != current_seg_values {
                     // Segment boundary — flush accumulated data
                     if rows_in_segment > 0 {
-                        if !meta_created {
-                            client.update(meta_ddl, None, &[]).expect("failed to create meta table");
-                            meta_created = true;
+                        if !tables_created {
+                            client.update(&ddl.meta_ddl, None, &[]).expect("failed to create meta table");
+                            client.update(&ddl.colstats_ddl, None, &[]).expect("failed to create colstats table");
+                            tables_created = true;
                         }
                         total_compressed_size += flush_with_splitting(
                             client,
-                            meta_fqn,
+                            &ddl.meta_fqn,
+                            &ddl.colstats_fqn,
                             columns,
                             &typed_cols,
                             &current_seg_values,
@@ -1217,9 +1286,10 @@ fn compress_partition_streaming(
 
             // Check segment_size limit
             if rows_in_segment >= segment_size {
-                if !meta_created {
-                    client.update(meta_ddl, None, &[]).expect("failed to create meta table");
-                    meta_created = true;
+                if !tables_created {
+                    client.update(&ddl.meta_ddl, None, &[]).expect("failed to create meta table");
+                    client.update(&ddl.colstats_ddl, None, &[]).expect("failed to create colstats table");
+                    tables_created = true;
                 }
                 // Sort in Rust when no SQL ORDER BY (non-segment_by path)
                 if seg_col_indices.is_empty() {
@@ -1230,7 +1300,8 @@ fn compress_partition_streaming(
                 let ndistinct = compute_segment_ndistinct(&typed_cols, columns);
                 let (size, blobs, bloom_entries) = flush_segment_metadata(
                     client,
-                    meta_fqn,
+                    &ddl.meta_fqn,
+                    &ddl.colstats_fqn,
                     columns,
                     &typed_cols,
                     &current_seg_values,
@@ -1263,15 +1334,17 @@ fn compress_partition_streaming(
 
     // Flush remaining
     if rows_in_segment > 0 {
-        if !meta_created {
-            client.update(meta_ddl, None, &[]).expect("failed to create meta table");
+        if !tables_created {
+            client.update(&ddl.meta_ddl, None, &[]).expect("failed to create meta table");
+            client.update(&ddl.colstats_ddl, None, &[]).expect("failed to create colstats table");
         }
         if seg_col_indices.is_empty() {
             sort_typed_columns(&mut typed_cols, &order_col_indices, rows_in_segment);
         }
         total_compressed_size += flush_with_splitting(
             client,
-            meta_fqn,
+            &ddl.meta_fqn,
+            &ddl.colstats_fqn,
             columns,
             &typed_cols,
             &current_seg_values,
@@ -1289,7 +1362,7 @@ fn compress_partition_streaming(
 
     // Flush blobs column-major into the blobs table
     if !blob_buffer.is_empty() {
-        client.update(blobs_ddl, None, &[]).expect("failed to create blobs table");
+        client.update(&ddl.blobs_ddl, None, &[]).expect("failed to create blobs table");
 
         // Sort by (col_idx, segment_id) for column-major insertion order
         blob_buffer.sort_by_key(|&(col_idx, seg_id, _)| (col_idx, seg_id));
@@ -1298,7 +1371,7 @@ fn compress_partition_streaming(
             use pgrx::datum::DatumWithOid;
             let insert_sql = format!(
                 "INSERT INTO {} (_col_idx, _segment_id, _data) VALUES ($1, $2, $3)",
-                blobs_fqn
+                &ddl.blobs_fqn
             );
             let args: Vec<DatumWithOid> = vec![
                 (col_idx as i16).into(),
@@ -1312,7 +1385,7 @@ fn compress_partition_streaming(
 
         // Flush bloom filters into separate blooms table
         if !bloom_buffer.is_empty() {
-            client.update(blooms_ddl, None, &[]).expect("failed to create blooms table");
+            client.update(&ddl.blooms_ddl, None, &[]).expect("failed to create blooms table");
 
             // Sort by (col_idx, segment_id) for column-major insertion order
             bloom_buffer.sort_by_key(|&(col_idx, seg_id, _, _)| (col_idx, seg_id));
@@ -1321,7 +1394,7 @@ fn compress_partition_streaming(
                 use pgrx::datum::DatumWithOid;
                 let insert_sql = format!(
                     "INSERT INTO {} (_col_idx, _segment_id, _num_hashes, _data) VALUES ($1, $2, $3, $4)",
-                    blooms_fqn
+                    &ddl.blooms_fqn
                 );
                 let args: Vec<DatumWithOid> = vec![
                     (col_idx as i16).into(),
@@ -1334,16 +1407,19 @@ fn compress_partition_streaming(
                     .expect("failed to insert bloom data");
             }
             client
-                .update(&format!("ANALYZE {}", blooms_fqn), None, &[])
+                .update(&format!("ANALYZE {}", ddl.blooms_fqn), None, &[])
                 .expect("failed to analyze blooms table");
         }
 
-        // ANALYZE meta and blobs tables for planner statistics
+        // ANALYZE meta, colstats, and blobs tables for planner statistics
         client
-            .update(&format!("ANALYZE {}", meta_fqn), None, &[])
+            .update(&format!("ANALYZE {}", ddl.meta_fqn), None, &[])
             .expect("failed to analyze meta table");
         client
-            .update(&format!("ANALYZE {}", blobs_fqn), None, &[])
+            .update(&format!("ANALYZE {}", ddl.colstats_fqn), None, &[])
+            .expect("failed to analyze colstats table");
+        client
+            .update(&format!("ANALYZE {}", ddl.blobs_fqn), None, &[])
             .expect("failed to analyze blobs table");
     }
 
@@ -1547,6 +1623,7 @@ pub(crate) fn get_column_metadata(
     schema: &str,
     table: &str,
     segment_by: &[String],
+    time_column: &str,
 ) -> Vec<ColumnMeta> {
     let result = client
         .select(
@@ -1564,10 +1641,12 @@ pub(crate) fn get_column_metadata(
         let name: String = row.get_datum_by_ordinal(1).unwrap().value::<String>().unwrap().unwrap();
         let data_type: String = row.get_datum_by_ordinal(2).unwrap().value::<String>().unwrap().unwrap();
         let is_segment = segment_by.contains(&name);
+        let is_time = name == time_column;
         columns.push(ColumnMeta {
             name,
             data_type,
             is_segment_by: is_segment,
+            is_time_column: is_time,
         });
     }
     columns
@@ -1618,10 +1697,11 @@ fn decompress_partition_inner(client: &mut SpiClient, partition: &str) -> String
         .unwrap();
 
     // 2. Get column metadata (from the parent table, since partition is truncated)
-    let columns = get_column_metadata(client, &ht.schema_name, &ht.table_name, &ht.segment_by);
+    let columns = get_column_metadata(client, &ht.schema_name, &ht.table_name, &ht.segment_by, &ht.time_column);
 
     let companion_schema = "_deltax_compressed";
     let meta_fqn = format!("\"{}\".\"{}_meta\"", companion_schema, part_table);
+    let colstats_fqn = format!("\"{}\".\"{}_colstats\"", companion_schema, part_table);
     let blobs_fqn = format!("\"{}\".\"{}_blobs\"", companion_schema, part_table);
     let blooms_fqn = format!("\"{}\".\"{}_blooms\"", companion_schema, part_table);
     let part_fqn = crate::partition::fqn(&schema, &part_table);
@@ -1777,13 +1857,16 @@ fn decompress_partition_inner(client: &mut SpiClient, partition: &str) -> String
         total_rows_restored += segment_row_count as i64;
     }
 
-    // 4. Drop meta + blobs + blooms tables
+    // 4. Drop meta + colstats + blobs + blooms tables
     client
         .update(&format!("DROP TABLE IF EXISTS {}", blobs_fqn), None, &[])
         .expect("failed to drop blobs table");
     client
         .update(&format!("DROP TABLE IF EXISTS {}", blooms_fqn), None, &[])
         .expect("failed to drop blooms table");
+    client
+        .update(&format!("DROP TABLE IF EXISTS {}", colstats_fqn), None, &[])
+        .expect("failed to drop colstats table");
     client
         .update(&format!("DROP TABLE IF EXISTS {}", meta_fqn), None, &[])
         .expect("failed to drop meta table");

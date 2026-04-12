@@ -553,10 +553,18 @@ pub fn auto_drop_partitions(client: &mut SpiClient, ht: &catalog::DeltatableInfo
         // If compressed, drop the meta + blobs tables
         if *is_compressed {
             let blobs_table = format!("\"_deltax_compressed\".\"{}_blobs\"", name);
+            let blooms_table = format!("\"_deltax_compressed\".\"{}_blooms\"", name);
+            let colstats_table = format!("\"_deltax_compressed\".\"{}_colstats\"", name);
             let meta_table = format!("\"_deltax_compressed\".\"{}_meta\"", name);
             client
                 .update(&format!("DROP TABLE IF EXISTS {}", blobs_table), None, &[])
                 .expect("failed to drop compressed blobs table");
+            client
+                .update(&format!("DROP TABLE IF EXISTS {}", blooms_table), None, &[])
+                .expect("failed to drop compressed blooms table");
+            client
+                .update(&format!("DROP TABLE IF EXISTS {}", colstats_table), None, &[])
+                .expect("failed to drop compressed colstats table");
             client
                 .update(&format!("DROP TABLE IF EXISTS {}", meta_table), None, &[])
                 .expect("failed to drop compressed meta table");
