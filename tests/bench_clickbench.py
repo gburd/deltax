@@ -540,6 +540,23 @@ class TestClickBench:
                     print(f"  {qid}: MISMATCH!")
                     print(f"    uncompressed: {len(u_rows)} rows, first={u_rows[:2]}")
                     print(f"    compressed:   {len(c_rows)} rows, first={c_rows[:2]}")
+                    # Detailed diff for debugging
+                    u_sorted = sorted(u_rows)
+                    c_sorted = sorted(c_rows)
+                    if len(u_sorted) == len(c_sorted):
+                        for i, (ur, cr) in enumerate(zip(u_sorted, c_sorted)):
+                            if ur != cr:
+                                print(f"    row {i} diff: uncompr={ur}")
+                                print(f"                  compr  ={cr}")
+                    else:
+                        u_set = set(map(tuple, u_sorted))
+                        c_set = set(map(tuple, c_sorted))
+                        only_u = u_set - c_set
+                        only_c = c_set - u_set
+                        if only_u:
+                            print(f"    only in uncompressed ({len(only_u)}): {list(only_u)[:5]}")
+                        if only_c:
+                            print(f"    only in compressed ({len(only_c)}): {list(only_c)[:5]}")
 
         # Phase 6: Print results
         print("\n\n" + "=" * 72)

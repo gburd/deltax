@@ -2570,15 +2570,16 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                             CompactAccKind::MinStr | CompactAccKind::MaxStr => {
                                                 let (w_off, w_len) = worker.compact_storage.read_min_max_str(wgidx, slot_idx);
                                                 if w_off != u32::MAX {
-                                                    let w_bytes = worker.compact_storage.str_arena.get(w_off, w_len).as_bytes();
+                                                    let w_str = worker.compact_storage.str_arena.get(w_off, w_len);
                                                     let (g_off, g_len) = storage.read_min_max_str(gidx, slot_idx);
                                                     let should_update = if g_off == u32::MAX {
                                                         true
                                                     } else {
-                                                        let g_bytes = storage.str_arena.get(g_off, g_len).as_bytes();
+                                                        let g_str = storage.str_arena.get(g_off, g_len);
+                                                        let cmp = strcoll_cmp(w_str, g_str);
                                                         match kind {
-                                                            CompactAccKind::MinStr => w_bytes < g_bytes,
-                                                            _ => w_bytes > g_bytes,
+                                                            CompactAccKind::MinStr => cmp == std::cmp::Ordering::Less,
+                                                            _ => cmp == std::cmp::Ordering::Greater,
                                                         }
                                                     };
                                                     if should_update {
@@ -3909,15 +3910,16 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                             CompactAccKind::MinStr | CompactAccKind::MaxStr => {
                                                 let (w_off, w_len) = worker.compact_storage.read_min_max_str(wgidx, slot_idx);
                                                 if w_off != u32::MAX {
-                                                    let w_bytes = worker.compact_storage.str_arena.get(w_off, w_len).as_bytes();
+                                                    let w_str = worker.compact_storage.str_arena.get(w_off, w_len);
                                                     let (g_off, g_len) = storage.read_min_max_str(gidx, slot_idx);
                                                     let should_update = if g_off == u32::MAX {
                                                         true
                                                     } else {
-                                                        let g_bytes = storage.str_arena.get(g_off, g_len).as_bytes();
+                                                        let g_str = storage.str_arena.get(g_off, g_len);
+                                                        let cmp = strcoll_cmp(w_str, g_str);
                                                         match kind {
-                                                            CompactAccKind::MinStr => w_bytes < g_bytes,
-                                                            _ => w_bytes > g_bytes,
+                                                            CompactAccKind::MinStr => cmp == std::cmp::Ordering::Less,
+                                                            _ => cmp == std::cmp::Ordering::Greater,
                                                         }
                                                     };
                                                     if should_update {

@@ -1304,6 +1304,109 @@ class TestTransparentQuery:
             assert a[2] == b[2], f"row {i} COUNT(*): {b[2]} vs {a[2]}"
             assert a[3] == b[3], f"row {i} MIN(url): {b[3]} vs {a[3]}"
 
+    def test_parallel_merge_min_text_collation(self, db):
+        """MIN(text) in parallel merge must use collation, not byte order.
+
+        Regression test: the parallel merge path (triggered by ORDER BY + LIMIT
+        with multiple workers) compared MinStr/MaxStr values using raw byte
+        comparison instead of locale-aware collation_strcmp. This produced wrong
+        MIN(text) results for strings where locale order differs from byte order
+        (e.g. space 0x20 vs digit 0x34 under certain locales, or accented chars).
+
+        Exercises the parallel merge path by:
+        - Using ORDER BY + LIMIT (enables topn_limit > 0)
+        - Including HAVING (enables the having-in-parallel-merge path)
+        - Having enough groups/data to trigger parallel workers
+        - Using strings where byte-order MIN != collation-order MIN
+        """
+        db.execute(f"SET pg_deltax.mock_now = '{MOCK_NOW}'")
+        db.execute("SET pg_deltax.parallel_workers = 2")
+        db.execute("""
+            CREATE TABLE agg_parallel_min (
+                ts TIMESTAMPTZ NOT NULL,
+                url TEXT NOT NULL
+            )
+        """)
+        db.execute("SELECT deltax_create_table('agg_parallel_min', 'ts', '1 day'::interval)")
+        db.commit()
+
+        # Create groups with URLs where byte-MIN != collation-MIN.
+        # Under en_US.utf8 collation, space (0x20) sorts differently than
+        # digits (0x30+), so "http://a.com/path 123" vs "http://a.com/path4"
+        # can diverge between byte order and locale order.
+        groups = {
+            "alpha.com": [
+                "https://alpha.com/Ångström-path",
+                "https://alpha.com/abc-path",
+                "https://alpha.com/ABC-path",
+                "https://alpha.com/ space-first",
+                "https://alpha.com/café-path",
+                "https://alpha.com/über-alles",
+            ],
+            "beta.org": [
+                "https://beta.org/żółć",
+                "https://beta.org/Abc",
+                "https://beta.org/abc",
+                "https://beta.org/ leading-space",
+                "https://beta.org/0-digit-start",
+                "https://beta.org/日本語",
+            ],
+            "gamma.net": [
+                "https://gamma.net/Ζεύς",
+                "https://gamma.net/alpha",
+                "https://gamma.net/ spaced",
+                "https://gamma.net/42-numeric",
+                "https://gamma.net/résumé",
+            ],
+        }
+
+        # Insert enough rows per group to pass HAVING COUNT(*) > 10
+        # and enough total rows to potentially trigger parallel merge
+        row_idx = 0
+        for domain, urls in groups.items():
+            for i in range(100):
+                url = urls[i % len(urls)]
+                db.execute(
+                    f"INSERT INTO agg_parallel_min VALUES ("
+                    f"'{BASE_TS}'::timestamptz + interval '{row_idx} minutes', "
+                    f"$${url}$$)"
+                )
+                row_idx += 1
+        db.commit()
+
+        query = (
+            r"SELECT REGEXP_REPLACE(url, '^https?://(?:www\.)?([^/]+)/.*$', '\1') AS k, "
+            "AVG(length(url)) AS l, COUNT(*) AS c, MIN(url) "
+            "FROM agg_parallel_min WHERE url <> '' "
+            "GROUP BY k HAVING COUNT(*) > 10 "
+            "ORDER BY l DESC LIMIT 10"
+        )
+
+        before = db.execute(query).fetchall()
+        assert len(before) > 0, "expected results before compression"
+
+        db.execute(
+            "SELECT deltax_enable_compression('agg_parallel_min', "
+            "order_by => ARRAY['ts'])"
+        )
+        db.commit()
+        _compress_all_partitions(db, "agg_parallel_min")
+
+        after = db.execute(query).fetchall()
+
+        assert len(after) == len(before), (
+            f"row count mismatch: {len(before)} vs {len(after)}"
+        )
+        # Sort by group key for deterministic comparison (ORDER BY on AVG
+        # can reorder groups with close values across compressed/uncompressed)
+        before_sorted = sorted(before, key=lambda r: r[0])
+        after_sorted = sorted(after, key=lambda r: r[0])
+        for i, (b, a) in enumerate(zip(before_sorted, after_sorted)):
+            assert a[0] == b[0], f"row {i} GROUP BY key: {b[0]} vs {a[0]}"
+            assert a[1] == b[1], f"row {i} AVG(length()): {b[1]} vs {a[1]}"
+            assert a[2] == b[2], f"row {i} COUNT(*): {b[2]} vs {a[2]}"
+            assert a[3] == b[3], f"row {i} MIN(url): compressed={a[3]} vs uncompressed={b[3]}"
+
     def test_agg_where_prepared_statement_caching(self, db):
         """AggScan+WHERE must return correct results under prepared statement plan caching.
 
