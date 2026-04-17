@@ -7,135 +7,102 @@ ideas.
 
 > Environment: 18 partitions, ~3338 compressed segments total,
 > `pg_deltax.parallel_workers=0` (auto, capped at 16), `max_parallel_workers=8`.
-> Meta table split into narrow meta + wide stats table (commits 7d2643b, 9bff354).
-> Local meta table cache (fd8ce56). SPI planning cache (172cf6e, 8810ce6).
+> Meta table split into narrow meta + wide stats table. Local meta table
+> cache. SPI planning cache. Length-sidecar blob for text columns.
+> Partitioned parallel merge for both compact (int) and mixed (text) paths.
 
 ## What changed since the last analysis
 
-F1 (planner SPI cache) and F2 (meta table split + local cache) have
-been implemented:
+Major optimizations landed in the interval:
 
-| Change | Before | After | Effect |
-|--------|--------|-------|--------|
-| **F1: Planning cache** | ~30 ms on every DeltaXAgg query | 3–5 ms | ~25 ms saved per query |
-| **F2: Meta table split + cache** | heap_scan 17–68 ms on metadata queries | 0–15 ms (hot) | Metadata-only queries 3–5× faster |
+| Change | Commits | Queries helped | Effect |
+|--------|---------|----------------|--------|
+| Partitioned parallel merge for the **mixed (text GROUP BY) path** | 83b5ad0 | Q13 | 4.96 s → 2.14 s (2.3×) |
+| Parallel merge + HAVING path | 81ca6f1, f4e005b | Q28 | 9.59 s → 6.75 s (1.4×); now **faster than CH** |
+| Length-sidecar blob for `length(text_col)` | e0f09a9 | Q27 | 1.82 s → 0.55 s (3.3×) |
+| Knock-on partitioned-merge gains (compact path) | — | Q8, Q30, Q31, Q39 | 2–2.3× each |
 
-Impact on key metadata queries (bench best-of-3, seconds):
+Bench best-of-3 (seconds) — before/after snapshot:
 
 | Query | Before | After | Speedup |
 |-------|--------|-------|---------|
-| Q0 COUNT(*) | 0.022 | 0.003 | 7.3× |
-| Q1 COUNT WHERE | 0.088 | 0.019 | 4.6× |
-| Q2 SUM/AVG | 0.079 | 0.023 | 3.4× |
-| Q3 AVG(UserID) | 0.077 | 0.020 | 3.9× |
-| Q6 MIN/MAX | 0.061 | 0.013 | 4.7× |
-| Q29 Wide SUM 89 | 0.151 | 0.041 | 3.7× |
+| Q8 GROUP BY RegionID COUNT(DISTINCT) | 2.074 | **1.012** | 2.05× |
+| Q13 SearchPhrase COUNT(DISTINCT) | 4.960 | **2.143** | 2.31× |
+| Q27 AVG(length(URL)) GROUP BY CounterID | 1.815 | **0.550** | 3.30× |
+| Q28 Referer regex GROUP BY HAVING | 9.585 | **6.748** | 1.42× |
+| Q30 SearchEngine+ClientIP multi-agg | 1.548 | **1.055** | 1.47× |
+| Q31 WatchID+ClientIP multi-agg | 2.253 | **1.751** | 1.29× |
+| Q39 CounterID=62 traffic src | 0.380 | **0.214** | 1.78× |
 
-Planning time improvements on filtered aggregate queries:
-
-| Query | Planning before | Planning after |
-|-------|-----------------|----------------|
-| Q7 | 33 ms | 8.8 ms |
-| Q36 | 33 ms | 5.4 ms |
-| Q37 | 33 ms | 4.9 ms |
-| Q41 | 33 ms | 5.0 ms |
+**Now faster than ClickHouse: Q3, Q24, Q26, Q28, Q33, Q34** (was 5 queries,
+now 6 — Q28 moved into this bucket).
 
 ## Top-level findings (actionable)
 
-With F1 and F2 done, three cross-cutting bottlenecks remain:
+Ranked by remaining cumulative wallclock across the benchmark.
 
-### F3. Detoast is the dominant cost on most DeltaXAgg queries
+### F3. Detoast still dominates most DeltaXAgg queries (unchanged)
 
-**Impact: 25+ queries, ~50 s cumulative wallclock across the benchmark.**
+**Impact: 20+ queries, ~40 s cumulative wallclock.** Pipelined detoast is
+active and helps a little, but serial TOAST I/O sets a floor. Cold-run
+`detoast` numbers from EXPLAIN ANALYZE on queries still well above CH:
 
-Detoast time (loading compressed column blobs from TOAST storage) is
-now the single biggest cost since planning and metadata overhead have
-been addressed. Cold-run numbers from EXPLAIN ANALYZE:
+| Query | detoast (ms) | Total DeltaX (ms) |
+|-------|--------------|-------------------|
+| Q20 | 14,376 | 18,955 |
+| Q28 | 7,214 | 11,522 |
+| Q22 | 7,626 | 8,963 |
+| Q32 | 6,615 | 13,271 |
+| Q31 | 4,700 | 5,589 |
+| Q18 | 3,576 | 5,859 |
+| Q30 | 3,342 | 3,894 |
+| Q13 | 2,457 | 3,956 |
+| Q5 | 1,722 | 2,918 |
 
-| Query | detoast (ms) | % of DeltaX time | Total DeltaX (ms) |
-|-------|-------------|-------------------|-------------------|
-| Q20 | 11,053 | 66% | 16,714 |
-| Q22 | 7,888 | 86% | 9,218 |
-| Q28 | 7,061 | 49% | 14,405 |
-| Q32 | 6,048 | 48% | 12,713 |
-| Q31 | 4,882 | 81% | 6,012 |
-| Q18 | 3,683 | 62% | 5,909 |
-| Q9 | 1,734 | 79% | 2,204 |
-| Q8 | 1,561 | 53% | 2,939 |
-| Q21 | 1,338 | 69% | 1,934 |
-| Q30 | 1,258 | 61% | 2,066 |
-| Q33 | 1,063 | 42% | 2,509 |
-| Q34 | 1,048 | 42% | 2,482 |
-| Q27 | 1,039 | 57% | 1,810 |
-| Q14 | 832 | 51% | 1,618 |
-| Q10 | 660 | 85% | 776 |
-| Q11 | 634 | 79% | 799 |
-| Q15 | 582 | 29% | 1,982 |
-| Q13 | 557 | 12% | 4,745 |
-| Q16 | 527 | 29% | 1,805 |
-| Q17 | 519 | 35% | 1,490 |
-| Q35 | 502 | 30% | 1,691 |
-| Q12 | 393 | 37% | 1,073 |
+Previously investigated and ruled out (no change): inline `STORAGE MAIN`
+(LZ4-on-LZ4 compression is a net I/O win), `STORAGE EXTERNAL` (same
+reason), tightening `needed_cols` (already correct).
 
-**#39 Pipelined detoast** is implemented (compact, mixed, and
-CountDistinct paths) but has **limited impact** — workers finish 6×
-faster than detoast per batch, so the pipeline can't hide the serial
-TOAST I/O.
+### F4. Merge phase on essentially-unique GROUP BY keys (narrowed)
 
-**Investigated and ruled out:**
-- `needed_cols` is correct — only referenced columns are detoasted.
-  Q32 detoasts 4 small int columns; the 6 s cost is inherent to
-  ~13 K `pg_detoast_datum()` calls doing chunk-by-chunk TOAST I/O.
-- **Inline storage (`STORAGE MAIN` + self-chunking):** Would eliminate
-  TOAST indirection, but PG's LZ4 TOAST compression achieves ~31%
-  compression on top of our already-compressed blobs (4.1 GB raw →
-  2.8 GB on disk). Going inline would increase I/O by ~45% — net loss.
-- **`STORAGE EXTERNAL`:** Tried, but the LZ4 double-compression saves
-  enough I/O to be a net win. Reverted.
-
-Detoast remains the dominant cost with no clear fix beyond a
-**session-level blob cache** (detoast once, reuse across queries).
-
-### F4. Merge phase dominates high-cardinality GROUP BY / COUNT DISTINCT
-
-**Impact: Q8, Q13, Q15, Q28, Q32, Q35, Q39 — ~14 s cumulative.**
+With #41 done, the high-cardinality merge bottleneck is largely solved for
+`GROUP BY text_col` shapes (Q13, Q28). What **remains** is GROUP BY on
+near-unique integer keys, where every 100 M row produces a distinct group.
+Partitioned merge still iterates every worker's full map with a
+hash-modulo filter, so work is O(total entries × n_partitions/n_partitions) =
+O(total entries).
 
 | Query | merge (ms) | pre_topn_groups | Total DeltaX (ms) |
 |-------|-----------|-----------------|-------------------|
-| Q32 | 5,739 | 99,997,494 | 12,713 |
-| Q13 | 2,956 | 3,890,822 | 4,745 |
-| Q28 | 1,538 | — | 14,405 |
-| Q8 | 1,336 | 9,040 | 2,939 |
-| Q15 | 1,057 | 21,981,283 | 1,982 |
-| Q35 | 817 | 20,961,910 | 1,691 |
-| Q39 | 174 | 426,328 | 517 |
+| Q32 WatchID+ClientIP | 5,750 | 99,997,494 | 9,440 |
+| Q15 Top UserID | 1,040 | 21,981,595 | 1,957 |
+| Q35 ClientIP arithmetic | 841 | 20,960,937 | 1,710 |
 
-This is **#36 Two-level hash aggregation** in PERF_IMPROVEMENTS.md.
+This is the shape where **#36 two-level hash aggregation**
+(already spec'd in PERF_IMPROVEMENTS.md, not yet implemented) would
+help: each worker writes directly into 256 partition-local hashmaps
+during phase-1, eliminating the re-routing scan at merge time.
 
-### F5. Q20 (URL LIKE '%google%') is the worst query: 25× slower than CH
+### F5. Q20/Q21/Q22 URL LIKE on LZ4 columns (unchanged)
 
-**Impact: Q20 alone accounts for ~8 s of the benchmark gap.**
+Still the worst outlier in the benchmark. Q20 remains ~22× CH. Options
+covered previously: #40 dict-accelerated LIKE helps only where the column
+is dict-compressed (Title yes, URL no). #33 trigram bloom has been tried
+and doesn't prune meaningfully on common patterns.
 
-Q20 is uniquely bad because URL is LZ4-compressed (not dictionary):
-- 1709 segments survive dict pruning (51% of total)
-- Each surviving segment's URL blob must be fully detoasted and
-  decompressed just to check LIKE
-- Only 15,911 rows match (0.016% of scanned data)
-- detoast=11,053 ms + decompress=3,775 ms = 14.8 s of the 16.7 s
+### F6. `COUNT(DISTINCT)` still detoasts every blob (new)
 
-**#40 dict-accelerated LIKE** doesn't help here (URL is LZ4).
-**#33 trigram bloom filters** was investigated but doesn't work —
-common search terms like 'google' produce trigrams that are present
-in virtually every segment, so the bloom filter prunes nothing.
+Q4 (`COUNT DISTINCT UserID`) and Q5 (`COUNT DISTINCT SearchPhrase`) still
+cost 3.0 s and 1.85 s. The dict-only fast path for text
+`COUNT(DISTINCT)` is **already implemented** (agg.rs
+`count_distinct_only_str`), but it still has to load the full compressed
+blob via `pg_detoast_datum` to reach the dict header. Result: Q5 is
+detoast-bound, not agg-bound.
 
-This leaves Q20 as an open problem. Possible approaches:
-- **#39 pipelined detoast** to at least overlap the I/O with work
-- **Parallel LIKE scan** — split surviving segments across workers
-  for the LIKE check itself, rather than detoasting serially
-- **Inverted index** — full-text or ngram index on URL, but this
-  is a much heavier solution
-
-Q21, Q22 remain bottlenecked by URL/Title LIKE filtering on LZ4 columns.
+Proposed fix: store the dict (and/or its hashes) as a separate sidecar
+TOAST column, analogous to the length sidecar — see "Dict sidecar blob"
+in the improvement list below. This is not covered by any existing item
+in PERF_IMPROVEMENTS.md.
 
 ---
 
@@ -143,8 +110,8 @@ Q21, Q22 remain bottlenecked by URL/Title LIKE filtering on LZ4 columns.
 
 Format per query:
 - **Query** (from queries.sql)
-- **CH / deltax / ratio** (CH = ClickHouse c6a.4xlarge reference, deltax = bench best-of-3 hot run)
-- **EXPLAIN ANALYZE timing breakdown** (cold single run)
+- **CH / deltax / ratio** (CH = ClickHouse c6a.4xlarge reference, deltax = bench best-of-3)
+- **EXPLAIN ANALYZE timing breakdown** (warm run unless noted)
 - **Analysis + potential improvements**
 
 ### Q0 — COUNT(*)
@@ -154,10 +121,8 @@ SELECT COUNT(*) FROM hits;
 ```
 
 - CH 0.001 s / deltax **0.003 s** / **3.0×**
-- `DeltaXCount`, metadata=0.001 ms, heap_scan=0.000 ms, planning=2.9 ms.
-- **Near-optimal.** Meta cache returns instantly. The 3 ms is
-  PostgreSQL framework overhead (planning + custom scan init).
-  Nothing actionable.
+- `DeltaXCount`, metadata=0.001 ms, heap_scan=0.000 ms.
+- **Near-optimal.** Nothing actionable.
 
 ### Q1 — COUNT(*) WHERE AdvEngineID <> 0
 
@@ -165,12 +130,9 @@ SELECT COUNT(*) FROM hits;
 SELECT COUNT(*) FROM hits WHERE AdvEngineID <> 0;
 ```
 
-- CH 0.006 s / deltax **0.019 s** / **3.2×**
-- `DeltaXAgg`, metadata=1.7, heap_scan=39.0 (cold), rows_processed=0
-  (metadata-resolved via nonzero count stats).
-- **Cold EXPLAIN shows 39 ms heap_scan, but hot bench is 19 ms.**
-  The stat table still requires I/O on first access. With warmed
-  cache this is fine. Remaining gap to CH is framework overhead.
+- CH 0.006 s / deltax **0.023 s** / **3.8×**
+- Metadata-resolvable via nonzero count stats. Remaining gap is framework
+  overhead.
 
 ### Q2 — SUM/AVG full-scan
 
@@ -178,10 +140,8 @@ SELECT COUNT(*) FROM hits WHERE AdvEngineID <> 0;
 SELECT SUM(AdvEngineID), COUNT(*), AVG(ResolutionWidth) FROM hits;
 ```
 
-- CH 0.021 s / deltax **0.023 s** / **1.1×**
-- `DeltaXAgg`, metadata=2.3, heap_scan=43.6 (cold),
-  segments_metadata_resolved=3338, segments_decompressed=0.
-- **At parity with ClickHouse.** Fully metadata-resolved. No action needed.
+- CH 0.021 s / deltax **0.028 s** / **1.3×**
+- Fully metadata-resolved. **Near parity.**
 
 ### Q3 — AVG(UserID)
 
@@ -189,8 +149,8 @@ SELECT SUM(AdvEngineID), COUNT(*), AVG(ResolutionWidth) FROM hits;
 SELECT AVG(UserID) FROM hits;
 ```
 
-- CH 0.027 s / deltax **0.020 s** / **0.74× (faster)**
-- Same profile as Q2. **Already faster than ClickHouse.**
+- CH 0.027 s / deltax **0.025 s** / **0.93× (faster)**
+- Metadata-resolved.
 
 ### Q4 — COUNT(DISTINCT UserID)
 
@@ -198,18 +158,13 @@ SELECT AVG(UserID) FROM hits;
 SELECT COUNT(DISTINCT UserID) FROM hits;
 ```
 
-- CH 0.353 s / deltax **3.359 s** / **9.5×**
-- heap_scan=1669 ms (loading UserID blobs), agg=555 ms.
-- Dominant: heap_scan loading all 3338 segments' UserID column blobs
-  to build a global distinct set. 100 M UserIDs.
-- **Improvements:**
-  - **Per-segment HLL sketches.** Store a HyperLogLog sketch (16 KB)
-    per segment at compression time. `COUNT(DISTINCT)` without GROUP BY
-    merges sketches in O(segments) instead of hashing 100 M values.
-    3338 segments × 16 KB = 52 MB metadata, but this is an opt-in
-    feature for high-value columns.
-  - Alternative: exact distinct via sorted run merge, avoiding the
-    hash table entirely.
+- CH 0.353 s / deltax **3.022 s** / **8.6×**
+- `DeltaXAgg`, wall=3063. detoast=417, agg=450 (per-worker phase times —
+  parallel wall dominates).
+- 100 M int8s hashed into a single distinct set.
+- **Improvement:** Per-segment HLL sketches at compress time
+  (`_hll_<col>`), merge across segments in O(segments × 16 KB).
+  Expected: 3.0 s → ~100 ms.
 
 ### Q5 — COUNT(DISTINCT SearchPhrase)
 
@@ -217,14 +172,14 @@ SELECT COUNT(DISTINCT UserID) FROM hits;
 SELECT COUNT(DISTINCT SearchPhrase) FROM hits;
 ```
 
-- CH 0.623 s / deltax **2.014 s** / **3.2×**
-- heap_scan=2719 ms, agg=396 ms.
-- SearchPhrase is dictionary-encoded. Each segment's dictionary
-  contains its distinct values already.
-- **Improvement: dict-only COUNT(DISTINCT).** Load only the dict
-  portion of each blob (tiny), union dict entries across segments.
-  3338 segments × ~500 dict entries = ~1.7 M strings to dedupe
-  vs 100 M row values. Expected: 2.0 s → ~200 ms.
+- CH 0.623 s / deltax **1.848 s** / **3.0×**
+- detoast=1722, agg=1747. Dict-only COUNT(DISTINCT) fast path is active
+  (hashes only dict entries, ~500 per segment) — but the full blob must
+  still be **detoasted** to reach the dict header.
+- **Improvement: dict sidecar blob** (new idea — not in
+  PERF_IMPROVEMENTS.md). Store each segment's dict as a separate short
+  column, skip detoast of the main blob entirely.
+  Expected: 1.85 s → ~200 ms.
 
 ### Q6 — MIN/MAX EventDate
 
@@ -232,12 +187,8 @@ SELECT COUNT(DISTINCT SearchPhrase) FROM hits;
 SELECT MIN(EventDate), MAX(EventDate) FROM hits;
 ```
 
-- CH 0.010 s / deltax **0.013 s** / **1.3×**
-- `DeltaXMinMax`, metadata=21.1, heap_scan=51.8, planning=42.4 ms.
-- **Cold EXPLAIN shows 42 ms planning — anomalously high.** Hot bench
-  is 13 ms. The DeltaXMinMax planner path may be doing extra catalog
-  lookups not covered by the SPI cache, or this is cold-catalog.
-  No action needed — hot performance is near CH.
+- CH 0.010 s / deltax **0.014 s** / **1.4×**
+- `DeltaXMinMax`, metadata-resolved. **Near parity.**
 
 ### Q7 — GROUP BY AdvEngineID
 
@@ -246,14 +197,9 @@ SELECT AdvEngineID, COUNT(*) FROM hits WHERE AdvEngineID <> 0 GROUP BY AdvEngine
 ```
 
 - CH 0.009 s / deltax **0.091 s** / **10.1×**
-- `DeltaXAgg`, heap_scan=138 [detoast=161], decompress=3.5, agg=28.5,
-  planning=8.8 ms. segments=2262, rows_processed=630,500.
-- Dominant: detoast loading column blobs (F3).
-- **Hot bench is 91 ms.** With pipelined detoast (#39) this could
-  drop to ~30 ms. The agg itself (28 ms for 630 K rows, 18 groups)
-  is efficient.
-- Still 10× CH because CH resolves this from metadata (AdvEngineID
-  has only 18 values).
+- detoast=46, agg=29. 2262 segments, 630 K rows, 18 groups.
+- CH resolves this from metadata (18 fixed values). Could pre-compute
+  per-(AdvEngineID, segment) COUNT counters in stats table — ambitious.
 
 ### Q8 — GROUP BY RegionID COUNT(DISTINCT UserID)
 
@@ -261,12 +207,10 @@ SELECT AdvEngineID, COUNT(*) FROM hits WHERE AdvEngineID <> 0 GROUP BY AdvEngine
 SELECT RegionID, COUNT(DISTINCT UserID) AS u FROM hits GROUP BY RegionID ORDER BY u DESC LIMIT 10;
 ```
 
-- CH 0.452 s / deltax **2.074 s** / **4.6×**
-- detoast=1561, decompress=8, agg=61, **merge=1336**, finalize=1.9.
-- Dominant: merge phase for per-group UserID distinct sets
-  (9040 groups × ~11 K distinct UserIDs each).
-- **Improvements:** F4 (#36 two-level hash agg). Also HLL sketches
-  per group would reduce merge to O(groups × sketch_size).
+- CH 0.452 s / deltax **1.012 s** / **2.2×** ← 2.1× faster than before
+- detoast=673, decompress=7, agg=36, **merge=308**, finalize=0.2.
+- Partitioned parallel merge halved the merge cost vs the previous run.
+- **Remaining improvement:** HLL per-group sketches. Expected: 1.0 s → ~300 ms.
 
 ### Q9 — RegionID multi-agg
 
@@ -274,10 +218,9 @@ SELECT RegionID, COUNT(DISTINCT UserID) AS u FROM hits GROUP BY RegionID ORDER B
 SELECT RegionID, SUM(AdvEngineID), COUNT(*) AS c, AVG(ResolutionWidth), COUNT(DISTINCT UserID) FROM hits GROUP BY RegionID ORDER BY c DESC LIMIT 10;
 ```
 
-- CH 0.522 s / deltax **1.488 s** / **2.9×**
-- detoast=1734, decompress=18, agg=68, finalize=312, topn_select=109.
-- Dominant: detoast (79%). F3.
-- finalize=312 ms is COUNT(DISTINCT UserID) finalization — F4 applies.
+- CH 0.522 s / deltax **1.499 s** / **2.9×**
+- detoast=942, decompress=18, agg=39, finalize=320, topn_select=108.
+- finalize=320 ms is COUNT(DISTINCT UserID) finalization — HLL-style would help.
 
 ### Q10 — MobilePhoneModel users
 
@@ -285,9 +228,9 @@ SELECT RegionID, SUM(AdvEngineID), COUNT(*) AS c, AVG(ResolutionWidth), COUNT(DI
 SELECT MobilePhoneModel, COUNT(DISTINCT UserID) AS u FROM hits WHERE MobilePhoneModel <> '' GROUP BY MobilePhoneModel ORDER BY u DESC LIMIT 10;
 ```
 
-- CH 0.147 s / deltax **0.458 s** / **3.1×**
-- detoast=660, decompress=42, agg=63, merge=26.
-- Dominant: detoast (85%). F3.
+- CH 0.147 s / deltax **0.462 s** / **3.1×**
+- detoast=611, decompress=51, agg=46, merge=28.
+- Dominant: detoast (F3).
 
 ### Q11 — MobilePhone + Model users
 
@@ -295,9 +238,9 @@ SELECT MobilePhoneModel, COUNT(DISTINCT UserID) AS u FROM hits WHERE MobilePhone
 SELECT MobilePhone, MobilePhoneModel, COUNT(DISTINCT UserID) AS u FROM hits WHERE MobilePhoneModel <> '' GROUP BY MobilePhone, MobilePhoneModel ORDER BY u DESC LIMIT 10;
 ```
 
-- CH 0.143 s / deltax **0.489 s** / **3.4×**
-- detoast=634, decompress=86, agg=68, merge=27.
-- Dominant: detoast (79%). F3.
+- CH 0.143 s / deltax **0.481 s** / **3.4×**
+- detoast=581, decompress=97, agg=55, merge=27.
+- Dominant: detoast (F3).
 
 ### Q12 — Top 10 SearchPhrase
 
@@ -305,11 +248,10 @@ SELECT MobilePhone, MobilePhoneModel, COUNT(DISTINCT UserID) AS u FROM hits WHER
 SELECT SearchPhrase, COUNT(*) AS c FROM hits WHERE SearchPhrase <> '' GROUP BY SearchPhrase ORDER BY c DESC LIMIT 10;
 ```
 
-- CH 0.599 s / deltax **1.143 s** / **1.9×**
-- detoast=393, decompress=132, agg=550.
-- Dominant: agg (51%) on 55 M rows with 4.8 M groups.
-- agg at 10 ns/row — near the limit for dictionary text hashing.
-  Modest improvement with F3 (detoast) and #36 (two-level hash).
+- CH 0.599 s / deltax **1.117 s** / **1.9×**
+- detoast=399, decompress=144, agg=559, merge=0, topn_select=10.
+- agg=559 ms on 55 M rows with 4.8 M groups — near the limit for dict
+  text hashing. Minor remaining gains from F3.
 
 ### Q13 — SearchPhrase users (COUNT DISTINCT)
 
@@ -317,11 +259,11 @@ SELECT SearchPhrase, COUNT(*) AS c FROM hits WHERE SearchPhrase <> '' GROUP BY S
 SELECT SearchPhrase, COUNT(DISTINCT UserID) AS u FROM hits WHERE SearchPhrase <> '' GROUP BY SearchPhrase ORDER BY u DESC LIMIT 10;
 ```
 
-- CH 0.804 s / deltax **4.960 s** / **6.2×**
-- detoast=557, decompress=176, agg=777, **merge=2956**, finalize=301,
-  topn_select=301.
-- Dominant: merge phase (62%). 3.89 M groups × distinct UserIDs.
-- **Improvements:** F4 (#36). HLL sketches per group.
+- CH 0.804 s / deltax **2.143 s** / **2.7×** ← 2.3× faster than before
+- detoast=539, decompress=164, agg=769, **merge=574**, finalize=0.1.
+- Partitioned parallel merge cut merge from 2956 ms → 574 ms.
+- agg=769 ms is the hash-distinct on UserIDs per group — HLL sketches per
+  group would help further.
 
 ### Q14 — SearchEngine + SearchPhrase
 
@@ -329,9 +271,8 @@ SELECT SearchPhrase, COUNT(DISTINCT UserID) AS u FROM hits WHERE SearchPhrase <>
 SELECT SearchEngineID, SearchPhrase, COUNT(*) AS c FROM hits WHERE SearchPhrase <> '' GROUP BY SearchEngineID, SearchPhrase ORDER BY c DESC LIMIT 10;
 ```
 
-- CH 0.597 s / deltax **1.231 s** / **2.1×**
-- detoast=832, decompress=163, agg=652.
-- Similar to Q12. F3 for detoast.
+- CH 0.597 s / deltax **1.227 s** / **2.1×**
+- detoast=418, decompress=150, agg=612. Similar shape to Q12.
 
 ### Q15 — Top 10 UserID
 
@@ -339,10 +280,11 @@ SELECT SearchEngineID, SearchPhrase, COUNT(*) AS c FROM hits WHERE SearchPhrase 
 SELECT UserID, COUNT(*) FROM hits GROUP BY UserID ORDER BY COUNT(*) DESC LIMIT 10;
 ```
 
-- CH 0.384 s / deltax **2.040 s** / **5.3×**
-- detoast=582, decompress=4, agg=317, **merge=1057**.
-- Dominant: merge (53%). 22 M groups merged across workers.
-- **Improvements:** F4 / #36 two-level hash.
+- CH 0.384 s / deltax **2.022 s** / **5.3×**
+- detoast=576, decompress=5, agg=309, **merge=1040**.
+- 22 M distinct UserIDs. Current partitioned merge still visits every
+  worker's entries — see F4.
+- **Improvement:** #36 two-level hash agg. Expected: 2.0 s → ~1.2 s.
 
 ### Q16 — UserID + SearchPhrase top
 
@@ -350,9 +292,8 @@ SELECT UserID, COUNT(*) FROM hits GROUP BY UserID ORDER BY COUNT(*) DESC LIMIT 1
 SELECT UserID, SearchPhrase, COUNT(*) FROM hits GROUP BY UserID, SearchPhrase ORDER BY COUNT(*) DESC LIMIT 10;
 ```
 
-- CH 1.709 s / deltax **2.000 s** / **1.2×**
-- detoast=527, decompress=188, agg=1097.
-- Competitive. Modest improvement with F3.
+- CH 1.709 s / deltax **2.045 s** / **1.2×**
+- detoast=515, decompress=186, agg=1072. Competitive.
 
 ### Q17 — UserID + SearchPhrase (no order)
 
@@ -360,9 +301,8 @@ SELECT UserID, SearchPhrase, COUNT(*) FROM hits GROUP BY UserID, SearchPhrase OR
 SELECT UserID, SearchPhrase, COUNT(*) FROM hits GROUP BY UserID, SearchPhrase LIMIT 10;
 ```
 
-- CH 0.999 s / deltax **1.684 s** / **1.7×**
-- detoast=519, decompress=181, agg=812.
-- Competitive. F3.
+- CH 0.999 s / deltax **1.685 s** / **1.7×**
+- detoast=517, decompress=178, agg=797, merge=0.
 
 ### Q18 — UserID + extract(minute) + SearchPhrase
 
@@ -370,10 +310,9 @@ SELECT UserID, SearchPhrase, COUNT(*) FROM hits GROUP BY UserID, SearchPhrase LI
 SELECT UserID, extract(minute FROM EventTime) AS m, SearchPhrase, COUNT(*) FROM hits GROUP BY UserID, m, SearchPhrase ORDER BY COUNT(*) DESC LIMIT 10;
 ```
 
-- CH 3.041 s / deltax **3.699 s** / **1.2×**
-- detoast=3683, decompress=323, agg=2081.
-- Competitive. detoast=3.7 s is high — three columns × all segments.
-  F3 would help. agg=2.1 s for 34 M groups needs #36.
+- CH 3.041 s / deltax **3.670 s** / **1.2×**
+- detoast=3576, decompress=331, agg=2103. Competitive. Three-column
+  detoast is inherent.
 
 ### Q19 — Point lookup UserID = const
 
@@ -382,19 +321,12 @@ SELECT UserID FROM hits WHERE UserID = 435090932899640449;
 ```
 
 - CH 0.003 s / deltax **0.042 s** / **14×**
-- `DeltaXAppend`. segments=48, segments_skipped=3290
-  (1851 minmax + 1439 bloom).
-- Cold EXPLAIN: heap_scan=834 ms (loading all metadata for bloom
-  filter checking). Hot bench: 42 ms.
-- **With the meta cache, this is reasonable (42 ms).** The remaining
-  gap to CH (3 ms) is from:
-  1. Checking 3338 bloom filters even cached (~20 ms)
-  2. Decompressing 48 surviving segments (~12 ms)
-  3. Framework overhead
-- **Improvement:** Partition-level bloom filter. Check 18 partition
-  blooms first, then only load segment blooms for partitions that
-  pass. For point lookups with time locality, this eliminates most
-  bloom checks. Expected: 42 ms → ~10 ms.
+- `DeltaXAppend`. segments=50, segments_skipped=3288
+  (1870 minmax + 1418 bloom). Warm: heap_scan=23, decompress=13.
+- Cost split roughly: 20 ms bloom checking (122 meta + 5926 bloom buffer
+  hits), 13 ms decompress, rest framework.
+- **Improvement:** Partition-level bloom filter to prune 18 partitions
+  first. Expected: 42 ms → ~10 ms.
 
 ### Q20 — COUNT(*) WHERE URL LIKE '%google%'
 
@@ -402,19 +334,13 @@ SELECT UserID FROM hits WHERE UserID = 435090932899640449;
 SELECT COUNT(*) FROM hits WHERE URL LIKE '%google%';
 ```
 
-- CH 0.312 s / deltax **7.822 s** / **25×**
-- `DeltaXAgg`, segments=1709 (after dict pruning).
-  rows_processed=15,911 (only 0.016% match!).
-- Cold: heap_scan=11096 [detoast=11053], decompress=3775, agg=1840.
-- **The worst query in the benchmark.** URL is LZ4-compressed (not
-  dictionary), so dict-accelerated LIKE (#40) doesn't apply.
-- **#33 trigram bloom filters were tried but don't work** — common
-  trigrams like 'goo','oog','ogl','gle' are present in virtually
-  every segment, so bloom filters prune nothing.
-- **#39 pipelined detoast** would overlap the serial TOAST I/O with
-  parallel work, reducing wall time even without pruning.
-- **Open problem** — no good segment-pruning approach exists for
-  common LIKE patterns on LZ4 columns.
+- CH 0.312 s / deltax **6.798 s** / **21.8×**
+- `DeltaXAgg`, segments=1703 (after dict pruning). rows_processed=15,911.
+- Warm: detoast=2182, decompress=2699, agg=1837.
+- **Open problem.** URL is LZ4, not dict. #40 dict-accelerated LIKE
+  doesn't help. #33 trigram bloom ineffective on common patterns.
+- Only lever is #39 pipelined detoast (already active, limited help) or
+  heavier inverted-index style approach.
 
 ### Q21 — SearchPhrase MIN(URL) WHERE URL LIKE '%google%'
 
@@ -422,13 +348,10 @@ SELECT COUNT(*) FROM hits WHERE URL LIKE '%google%';
 SELECT SearchPhrase, MIN(URL), COUNT(*) AS c FROM hits WHERE URL LIKE '%google%' AND SearchPhrase <> '' GROUP BY SearchPhrase ORDER BY c DESC LIMIT 10;
 ```
 
-- CH 0.098 s / deltax **1.966 s** / **20×**
-- detoast=1338, decompress=337, agg=333.
-- segments=2419 — more than Q20 because SearchPhrase <> '' filter
-  is less selective than URL LIKE filter for pruning.
-- Dominant: detoast URL blobs.
-- #33 trigram bloom was tried but doesn't work (common trigrams).
-  #39 pipelined detoast is the main lever here.
+- CH 0.098 s / deltax **1.953 s** / **19.9×**
+- detoast=1351, decompress=315, agg=340.
+- segments=2417. Dominant: detoast URL blobs. Same fundamental issue as
+  Q20.
 
 ### Q22 — Title LIKE Google + URL NOT LIKE
 
@@ -436,12 +359,10 @@ SELECT SearchPhrase, MIN(URL), COUNT(*) AS c FROM hits WHERE URL LIKE '%google%'
 SELECT SearchPhrase, MIN(URL), MIN(Title), COUNT(*) AS c, COUNT(DISTINCT UserID) FROM hits WHERE Title LIKE '%Google%' AND URL NOT LIKE '%.google.%' AND SearchPhrase <> '' GROUP BY SearchPhrase ORDER BY c DESC LIMIT 10;
 ```
 
-- CH 0.717 s / deltax **3.766 s** / **5.3×**
-- detoast=7888, decompress=655, agg=1221.
-- segments=2931. Detoast dominates (86%).
-- #33 trigram bloom doesn't work (common trigrams). Title is
-  dict-encoded so #40 helps for the Title LIKE filter. URL is LZ4 —
-  only #39 pipelined detoast helps.
+- CH 0.717 s / deltax **3.719 s** / **5.2×**
+- detoast=7626, decompress=703, agg=1149. segments=2915.
+- Title is dict-encoded so #40 dict-accelerated LIKE would skip per-row
+  Title hashing. URL is LZ4 — only #39 helps.
 
 ### Q23 — SELECT * WHERE URL LIKE ... ORDER BY EventTime LIMIT 10
 
@@ -449,11 +370,8 @@ SELECT SearchPhrase, MIN(URL), MIN(Title), COUNT(*) AS c, COUNT(DISTINCT UserID)
 SELECT * FROM hits WHERE URL LIKE '%google%' ORDER BY EventTime LIMIT 10;
 ```
 
-- CH 0.393 s / deltax **0.468 s** / **1.2×**
-- `DeltaXAppend` TopN, 12 surviving segments, 36 candidates.
-- heap_scan=1301 (cold), decompress=240.
-- **Competitive.** TopN + time-ordered scan works well here.
-  Cold heap_scan is from loading metadata; hot bench is 468 ms.
+- CH 0.393 s / deltax **0.477 s** / **1.2×**
+- `DeltaXAppend` TopN, 12 surviving segments. **Competitive.**
 
 ### Q24 — SearchPhrase ORDER BY EventTime LIMIT 10
 
@@ -461,9 +379,7 @@ SELECT * FROM hits WHERE URL LIKE '%google%' ORDER BY EventTime LIMIT 10;
 SELECT SearchPhrase FROM hits WHERE SearchPhrase <> '' ORDER BY EventTime LIMIT 10;
 ```
 
-- CH 0.147 s / deltax **0.103 s** / **0.70× (faster)**
-- `DeltaXAppend` TopN, 21 segments, 97 K candidates.
-- **Already faster than ClickHouse.**
+- CH 0.147 s / deltax **0.110 s** / **0.75× (faster)**
 
 ### Q25 — ORDER BY SearchPhrase LIMIT 10
 
@@ -471,16 +387,14 @@ SELECT SearchPhrase FROM hits WHERE SearchPhrase <> '' ORDER BY EventTime LIMIT 
 SELECT SearchPhrase FROM hits WHERE SearchPhrase <> '' ORDER BY SearchPhrase LIMIT 10;
 ```
 
-- CH 0.192 s / deltax **1.933 s** / **10×**
-- `DeltaXAppend`, 3332 segments, decompress=2336 ms.
-- Dominant: decompressing SearchPhrase across all segments for
-  lexicographic sort. 160 K topn_candidates.
-- **Improvement: dict-only scan for ORDER BY text LIMIT N.**
-  SearchPhrase is dictionary-encoded. For each segment, load only
-  the dict header (~1 KB), find the lexicographically smallest
-  entries. Merge across segments. Skip the main LZ4 block entirely.
-  3332 segments × ~500 dict entries = 1.66 M items to min-heap.
-  Expected: 1.9 s → ~100 ms.
+- CH 0.192 s / deltax **1.925 s** / **10×**
+- `DeltaXAppend`, 3332 segments, decompress=2280 ms loading SearchPhrase
+  column across all segments for lexicographic sort.
+- **Improvement: dict-only ORDER BY text LIMIT.** For dict-encoded
+  columns, read only the dict portion of each blob, merge candidates via
+  min-heap. 3332 segments × ~500 dict entries = 1.66 M items.
+  Even better combined with the dict sidecar blob idea — no full-blob
+  detoast. Expected: 1.9 s → ~150 ms.
 
 ### Q26 — ORDER BY EventTime, SearchPhrase LIMIT 10
 
@@ -488,8 +402,7 @@ SELECT SearchPhrase FROM hits WHERE SearchPhrase <> '' ORDER BY SearchPhrase LIM
 SELECT SearchPhrase FROM hits WHERE SearchPhrase <> '' ORDER BY EventTime, SearchPhrase LIMIT 10;
 ```
 
-- CH 0.149 s / deltax **0.103 s** / **0.69× (faster)**
-- Already faster. Time-ordered pathkey + TopN.
+- CH 0.149 s / deltax **0.109 s** / **0.73× (faster)**
 
 ### Q27 — CounterID AVG(length(URL)) HAVING c > 100K
 
@@ -497,26 +410,28 @@ SELECT SearchPhrase FROM hits WHERE SearchPhrase <> '' ORDER BY EventTime, Searc
 SELECT CounterID, AVG(length(URL)) AS l, COUNT(*) AS c FROM hits WHERE URL <> '' GROUP BY CounterID HAVING COUNT(*) > 100000 ORDER BY l DESC LIMIT 25;
 ```
 
-- CH 0.083 s / deltax **1.815 s** / **21.9×**
-- detoast=1039, decompress=275, agg=548. 99.97 M rows, 60 result groups.
-- Dominant: detoast loading URL blobs to compute `length()`.
-- **Improvement: per-segment `SUM(length(text_col))` metadata.**
-  Store `_sum_length_<col>` and `_nonnull_count_<col>` at compression
-  time. Then `AVG(length(col))` with GROUP BY on a low-cardinality
-  column (CounterID has 898 groups, 60 after HAVING) becomes
-  metadata-resolvable. Q27: 1.8 s → ~50 ms.
-  **New idea not in PERF_IMPROVEMENTS.md.**
+- CH 0.083 s / deltax **0.550 s** / **6.6×** ← was 21.9×, now 3.3× faster
+- detoast=260, decompress=27, agg=241, merge=1.
+- Length-sidecar blob (#42) avoids decompressing the URL payload —
+  only the length sidecar + CounterID column are loaded.
+- Remaining 550 ms is split ~half/half between sidecar+CounterID I/O
+  and the aggregation loop over 100 M rows.
+- No obvious metadata-only fast path here: the per-segment `SUM(length)`
+  that #42 already tracks can't collapse `GROUP BY CounterID` without
+  per-(CounterID, segment) stats, which is a much heavier change.
 
-### Q28 — Referer REGEXP_REPLACE GROUP BY
+### Q28 — Referer REGEXP_REPLACE GROUP BY HAVING
 
 ```
 SELECT REGEXP_REPLACE(Referer, ...) AS k, AVG(length(Referer)) AS l, COUNT(*) AS c, MIN(Referer) FROM hits WHERE Referer <> '' GROUP BY k HAVING COUNT(*) > 100000 ORDER BY l DESC LIMIT 25;
 ```
 
-- CH 9.582 s / deltax **9.585 s** / **1.0×**
-- detoast=7061, decompress=3548, agg=1323, merge=1538, finalize=1426.
-- **Tied with ClickHouse.** Not a priority. The regex evaluation is
-  inherently expensive.
+- CH 9.582 s / deltax **6.748 s** / **0.70× (faster)** ← was 1.0×
+- detoast=1159, decompress=3184, agg=2036, merge=276.
+- Parallel merge with HAVING pushdown now parallelizes the final merge.
+  Regex evaluation (decompress=3184 ms includes the MIN(Referer) and
+  REGEXP_REPLACE work) is the remaining cost.
+- **Now outperforms ClickHouse.**
 
 ### Q29 — Wide SUM 89 cols
 
@@ -524,10 +439,8 @@ SELECT REGEXP_REPLACE(Referer, ...) AS k, AVG(length(Referer)) AS l, COUNT(*) AS
 SELECT SUM(ResolutionWidth), SUM(ResolutionWidth + 1), ... SUM(ResolutionWidth + 89) FROM hits;
 ```
 
-- CH 0.029 s / deltax **0.041 s** / **1.4×**
-- heap_scan=15.5 ms (cold), metadata-resolved, 0 segments decompressed.
-- **Near parity.** The remaining gap is framework overhead reading
-  the stats table. No action needed.
+- CH 0.029 s / deltax **0.045 s** / **1.6×**
+- Fully metadata-resolved. **Near parity.**
 
 ### Q30 — SearchEngine + ClientIP multi-agg
 
@@ -535,9 +448,9 @@ SELECT SUM(ResolutionWidth), SUM(ResolutionWidth + 1), ... SUM(ResolutionWidth +
 SELECT SearchEngineID, ClientIP, COUNT(*) AS c, SUM(IsRefresh), AVG(ResolutionWidth) FROM hits WHERE SearchPhrase <> '' GROUP BY SearchEngineID, ClientIP ORDER BY c DESC LIMIT 10;
 ```
 
-- CH 0.342 s / deltax **1.548 s** / **4.5×**
-- detoast=1258, decompress=222, agg=627, topn_select=14.
-- Dominant: detoast (61%). F3.
+- CH 0.342 s / deltax **1.055 s** / **3.1×** ← improved from 4.5×
+- detoast=437, decompress=110, agg=469, merge=0, topn_select=13.
+- Dominant: detoast + agg. Partitioned merge made merge=0.
 
 ### Q31 — WatchID + ClientIP with SearchPhrase filter
 
@@ -545,13 +458,9 @@ SELECT SearchEngineID, ClientIP, COUNT(*) AS c, SUM(IsRefresh), AVG(ResolutionWi
 SELECT WatchID, ClientIP, COUNT(*) AS c, SUM(IsRefresh), AVG(ResolutionWidth) FROM hits WHERE SearchPhrase <> '' GROUP BY WatchID, ClientIP ORDER BY c DESC LIMIT 10;
 ```
 
-- CH 0.562 s / deltax **2.253 s** / **4.0×**
-- detoast=4882, decompress=287, agg=1074.
-- Dominant: detoast (81%). F3.
-- **Note:** detoast=4882 ms for 55 M rows is much higher than Q30's
-  1258 ms for the same row count. Difference is WatchID (int8, larger
-  blobs) vs SearchEngineID (small int). F3 pipelined detoast would
-  help both.
+- CH 0.562 s / deltax **1.751 s** / **3.1×** ← improved from 4.0×
+- detoast=765, decompress=189, agg=707, merge=0.
+- Further gains from #36 two-level hash agg (8.68 M pre_topn groups).
 
 ### Q32 — WatchID + ClientIP all
 
@@ -559,11 +468,12 @@ SELECT WatchID, ClientIP, COUNT(*) AS c, SUM(IsRefresh), AVG(ResolutionWidth) FR
 SELECT WatchID, ClientIP, COUNT(*) AS c, SUM(IsRefresh), AVG(ResolutionWidth) FROM hits GROUP BY WatchID, ClientIP ORDER BY c DESC LIMIT 10;
 ```
 
-- CH 3.793 s / deltax **9.527 s** / **2.5×**
-- detoast=6048, decompress=18, agg=920, **merge=5739**.
-- Dominant: merge (45%). 100 M essentially-unique groups.
-- **Improvement:** #36 two-level hash agg. Partition merges into
-  256 buckets for parallel lock-free merging. Expected: 9.5 s → ~3 s.
+- CH 3.793 s / deltax **9.530 s** / **2.5×**
+- detoast=2045, decompress=20, agg=1636, **merge=5750**.
+- 99,997,494 essentially-unique groups. Partitioned merge threads still
+  iterate every worker's full map.
+- **Primary remaining bottleneck in the benchmark.** #36 two-level
+  hash agg expected: 9.5 s → ~4 s.
 
 ### Q33 — GROUP BY URL ORDER BY c DESC LIMIT 10
 
@@ -571,9 +481,8 @@ SELECT WatchID, ClientIP, COUNT(*) AS c, SUM(IsRefresh), AVG(ResolutionWidth) FR
 SELECT URL, COUNT(*) AS c FROM hits GROUP BY URL ORDER BY c DESC LIMIT 10;
 ```
 
-- CH 2.782 s / deltax **2.669 s** / **0.96× (tied/faster)**
-- detoast=1063, decompress=228, agg=1260.
-- **At parity.** Nothing to do.
+- CH 2.782 s / deltax **2.680 s** / **0.96× (tied/faster)**
+- detoast=1058, decompress=219, agg=1236. **At parity.**
 
 ### Q34 — GROUP BY 1, URL
 
@@ -581,8 +490,8 @@ SELECT URL, COUNT(*) AS c FROM hits GROUP BY URL ORDER BY c DESC LIMIT 10;
 SELECT 1, URL, COUNT(*) AS c FROM hits GROUP BY 1, URL ORDER BY c DESC LIMIT 10;
 ```
 
-- CH 2.851 s / deltax **2.650 s** / **0.93× (faster)**
-- Same as Q33. **Already faster.**
+- CH 2.851 s / deltax **2.689 s** / **0.94× (faster)**
+- Same shape as Q33.
 
 ### Q35 — GROUP BY ClientIP, IP−1, IP−2, IP−3
 
@@ -591,9 +500,9 @@ SELECT ClientIP, ClientIP - 1, ClientIP - 2, ClientIP - 3, COUNT(*) AS c FROM hi
 ```
 
 - CH 0.297 s / deltax **1.722 s** / **5.8×**
-- detoast=502, decompress=3, agg=344, **merge=817**.
-- merge dominates (48%). 21 M distinct ClientIPs.
-- **Improvement:** #36 two-level hash. Expected: 1.7 s → ~500 ms.
+- detoast=507, decompress=3, agg=329, **merge=841**.
+- 21 M distinct ClientIPs. Partitioned merge applies but still O(total
+  entries). #36 two-level hash agg: expected 1.7 s → ~900 ms.
 
 ### Q36 — Top URLs for CounterID=62
 
@@ -601,99 +510,46 @@ SELECT ClientIP, ClientIP - 1, ClientIP - 2, ClientIP - 3, COUNT(*) AS c FROM hi
 SELECT URL, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND DontCountHits = 0 AND IsRefresh = 0 AND URL <> '' GROUP BY URL ORDER BY PageViews DESC LIMIT 10;
 ```
 
-- CH 0.043 s / deltax **0.102 s** / **2.4×**
+- CH 0.043 s / deltax **0.101 s** / **2.3×**
 - segments=26 (min/max pruning), rows_processed=671 K.
-- detoast=40, decompress=13, agg=69, planning=5.4.
-- heap_scan=80 ms (cold), with bloom checks. Hot bench = 102 ms.
-- **Improved from 2.8× to 2.4× thanks to F1.** Remaining gap is
-  agg=69 ms for 672 K rows with 314 K groups (URL) — inherent.
+- Reasonable. Remaining is agg on 314 K URL groups.
 
 ### Q37 — Top Titles for CounterID=62
 
-```
-SELECT Title, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND DontCountHits = 0 AND IsRefresh = 0 AND Title <> '' GROUP BY Title ORDER BY PageViews DESC LIMIT 10;
-```
-
-- CH 0.021 s / deltax **0.044 s** / **2.1×**
+- CH 0.021 s / deltax **0.041 s** / **2.0×**
 - segments=26, rows_processed=660 K.
-- detoast=35, decompress=6, agg=58, planning=4.9.
-- **Improved from 3.1× to 2.1×.** Reasonable. agg=58 ms for 54 K
-  groups is the remaining cost.
 
 ### Q38 — CounterID=62 links OFFSET 1000
 
-```
-SELECT URL, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND ... AND IsLink <> 0 AND IsDownload = 0 GROUP BY URL ORDER BY PageViews DESC LIMIT 10 OFFSET 1000;
-```
-
-- CH 0.017 s / deltax **0.086 s** / **5.1×**
-- segments=26, rows_processed=47,740, 13,299 groups.
-- detoast=31, decompress=26, agg=33, planning=4.9.
-- heap_scan=59 ms (cold) with bloom reads. Hot bench = 86 ms.
-- **Improvement:** The heap_scan/bloom overhead (~59 ms cold) is a
-  significant fraction. With warmer caches it's better. The OFFSET
-  1000 forces materializing 1010 rows, adding overhead.
+- CH 0.017 s / deltax **0.079 s** / **4.6×**
+- segments=26, rows_processed=47,740, 13 K groups.
 
 ### Q39 — CounterID=62 traffic src
 
 ```
-SELECT TraficSourceID, SearchEngineID, AdvEngineID, CASE WHEN ... THEN Referer ELSE '' END AS Src, URL AS Dst, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND ... GROUP BY ... ORDER BY PageViews DESC LIMIT 10 OFFSET 1000;
+SELECT TraficSourceID, SearchEngineID, AdvEngineID, CASE ... THEN Referer ELSE '' END AS Src, URL AS Dst, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND ... GROUP BY ... ORDER BY PageViews DESC LIMIT 10 OFFSET 1000;
 ```
 
-- CH 0.077 s / deltax **0.380 s** / **4.9×**
-- segments=26, rows_processed=722,688, 426,328 groups.
-- detoast=198, decompress=22, agg=276, merge=174, finalize=28.
-- merge=174 ms and agg=276 ms are the main costs. CASE expression
-  pushdown is active.
-- **Improvement:** #36 two-level hash for the merge. Also, 426 K
-  groups for 722 K rows means very high cardinality — the
-  URL column (Dst) creates near-unique groups.
+- CH 0.077 s / deltax **0.214 s** / **2.8×** ← improved from 4.9×
+- detoast=60, decompress=31, agg=132, merge=48, topn_select=0.
+- Partitioned merge + HAVING path reduced merge cost.
 
 ### Q40 — CounterID=62 URLHash
 
-```
-SELECT URLHash, EventDate, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND ... AND TraficSourceID IN (-1, 6) AND RefererHash = 3594120000172545465 GROUP BY URLHash, EventDate ORDER BY PageViews DESC LIMIT 10 OFFSET 100;
-```
-
-- CH 0.013 s / deltax **0.130 s** / **10×**
-- segments=26, rows_processed=89,914, 41,194 groups.
-- detoast=137, decompress=71, agg=23, planning=6.3.
-- heap_scan=96 ms with meta hit=639 read=120, bloom hit=170 read=86.
-- **decompress=71 ms for 26 segments / 90 K rows is anomalously
-  high.** 6 batch_quals means 6+ columns are decompressed for
-  filtering (CounterID, EventDate, IsRefresh, TraficSourceID,
-  RefererHash, URLHash). Worth investigating whether column pruning
-  is tight — some filter columns may be decompressed unnecessarily
-  when metadata could prune them.
-- **Also:** 86 bloom reads is high for 26 segments. RefererHash
-  bloom filter checking is reading from disk for most segments.
-  With warm cache this drops.
+- CH 0.013 s / deltax **0.136 s** / **10×**
+- segments=26, rows_processed=89,914, 41 K groups.
+- detoast=145, decompress=72, agg=22. Still the "too many columns
+  decompressed for 6 batch quals" smell — worth a column-pruning audit.
 
 ### Q41 — CounterID=62 window dim
 
-```
-SELECT WindowClientWidth, WindowClientHeight, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND ... AND URLHash = 2868770270353813622 GROUP BY WindowClientWidth, WindowClientHeight ORDER BY PageViews DESC LIMIT 10 OFFSET 10000;
-```
-
-- CH 0.009 s / deltax **0.051 s** / **5.7×**
-- segments=26, rows_processed=102,676, 10,948 result rows.
-- detoast=54, decompress=12, agg=56, merge=1, planning=5.0.
-- Falls back to PG Sort because result_rows=10,948 (> OFFSET 10000).
-- **Reasonable.** The 51 ms is mostly agg + detoast overhead.
-  F1 already helped (was 68 ms → 51 ms).
+- CH 0.009 s / deltax **0.052 s** / **5.8×**
+- Falls back to PG Sort because result_rows > OFFSET 10000.
 
 ### Q42 — CounterID=62 by minute
 
-```
-SELECT DATE_TRUNC('minute', EventTime) AS M, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-14' AND EventDate <= '2013-07-15' AND IsRefresh = 0 AND DontCountHits = 0 GROUP BY DATE_TRUNC('minute', EventTime) ORDER BY DATE_TRUNC('minute', EventTime) LIMIT 10 OFFSET 1000;
-```
-
 - CH 0.008 s / deltax **0.041 s** / **5.1×**
-- segments=26, rows_processed=671,519, 1,440 result rows.
-- detoast=8.5, decompress=9.3, agg=11.7, planning=3.8.
-- All phases small. PG Sort adds 0.4 ms.
-- **Remaining gap is framework overhead.** Each of the 671 K rows
-  passes through the custom scan → PG executor interface.
+- 671 K rows pass through PG's tuple interface — framework overhead.
 
 ---
 
@@ -702,105 +558,111 @@ SELECT DATE_TRUNC('minute', EventTime) AS M, COUNT(*) AS PageViews FROM hits WHE
 | Q | CH (s) | deltax (s) | Ratio | Dominant cost | Key improvement |
 |---|--------|-----------|-------|---------------|-----------------|
 | 0 | 0.001 | 0.003 | 3.0× | framework | — |
-| 1 | 0.006 | 0.019 | 3.2× | heap_scan (cold) | — |
-| 2 | 0.021 | 0.023 | 1.1× | metadata I/O | — |
-| 3 | 0.027 | 0.020 | **0.74×** | — | — |
-| 4 | 0.353 | 3.359 | 9.5× | heap_scan + agg | HLL sketches |
-| 5 | 0.623 | 2.014 | 3.2× | heap_scan | dict-only distinct |
-| 6 | 0.010 | 0.013 | 1.3× | metadata I/O | — |
-| 7 | 0.009 | 0.091 | 10.1× | detoast | #39 pipelined detoast |
-| 8 | 0.452 | 2.074 | 4.6× | merge | #36 two-level hash |
-| 9 | 0.522 | 1.488 | 2.9× | detoast | #39 |
-| 10 | 0.147 | 0.458 | 3.1× | detoast | #39 |
-| 11 | 0.143 | 0.489 | 3.4× | detoast | #39 |
-| 12 | 0.599 | 1.143 | 1.9× | agg | — |
-| 13 | 0.804 | 4.960 | 6.2× | merge | #36 |
-| 14 | 0.597 | 1.231 | 2.1× | detoast + agg | #39 |
-| 15 | 0.384 | 2.040 | 5.3× | merge | #36 |
-| 16 | 1.709 | 2.000 | 1.2× | agg | — |
-| 17 | 0.999 | 1.684 | 1.7× | agg | — |
-| 18 | 3.041 | 3.699 | 1.2× | detoast + agg | #39 + #36 |
+| 1 | 0.006 | 0.023 | 3.8× | framework | — |
+| 2 | 0.021 | 0.028 | 1.3× | metadata I/O | — |
+| 3 | 0.027 | 0.025 | **0.93×** | — | — |
+| 4 | 0.353 | 3.022 | 8.6× | hash-distinct | HLL sketches |
+| 5 | 0.623 | 1.848 | 3.0× | detoast | **dict sidecar** |
+| 6 | 0.010 | 0.014 | 1.4× | metadata I/O | — |
+| 7 | 0.009 | 0.091 | 10.1× | detoast | — |
+| 8 | 0.452 | 1.012 | 2.2× | detoast + agg | HLL |
+| 9 | 0.522 | 1.499 | 2.9× | detoast + finalize | HLL |
+| 10 | 0.147 | 0.462 | 3.1× | detoast | #39 |
+| 11 | 0.143 | 0.481 | 3.4× | detoast | #39 |
+| 12 | 0.599 | 1.117 | 1.9× | agg | — |
+| 13 | 0.804 | 2.143 | 2.7× | detoast + agg | HLL |
+| 14 | 0.597 | 1.227 | 2.1× | detoast + agg | #39 |
+| 15 | 0.384 | 2.022 | 5.3× | merge | **#36 two-level hash** |
+| 16 | 1.709 | 2.045 | 1.2× | agg | — |
+| 17 | 0.999 | 1.685 | 1.7× | agg | — |
+| 18 | 3.041 | 3.670 | 1.2× | detoast + agg | — |
 | 19 | 0.003 | 0.042 | 14× | bloom scan | partition bloom |
-| 20 | 0.312 | 7.822 | **25×** | detoast URL (LZ4) | #39 (open problem) |
-| 21 | 0.098 | 1.966 | 20× | detoast URL | #39 |
-| 22 | 0.717 | 3.766 | 5.3× | detoast URL+Title | #39 + #40 |
-| 23 | 0.393 | 0.468 | 1.2× | decompress | — |
-| 24 | 0.147 | 0.103 | **0.70×** | — | — |
-| 25 | 0.192 | 1.933 | 10× | decompress text | dict-only ORDER BY |
-| 26 | 0.149 | 0.103 | **0.69×** | — | — |
-| 27 | 0.083 | 1.815 | 21.9× | detoast URL | **SUM(length) metadata** |
-| 28 | 9.582 | 9.585 | 1.0× | all phases | — |
-| 29 | 0.029 | 0.041 | 1.4× | metadata I/O | — |
-| 30 | 0.342 | 1.548 | 4.5× | detoast | #39 |
-| 31 | 0.562 | 2.253 | 4.0× | detoast | #39 |
-| 32 | 3.793 | 9.527 | 2.5× | merge | #36 |
-| 33 | 2.782 | 2.669 | **0.96×** | agg | — |
-| 34 | 2.851 | 2.650 | **0.93×** | agg | — |
-| 35 | 0.297 | 1.722 | 5.8× | merge | #36 |
-| 36 | 0.043 | 0.102 | 2.4× | agg | — |
-| 37 | 0.021 | 0.044 | 2.1× | agg | — |
-| 38 | 0.017 | 0.086 | 5.1× | heap_scan + agg | — |
-| 39 | 0.077 | 0.380 | 4.9× | agg + merge | #36 |
-| 40 | 0.013 | 0.130 | 10× | detoast + decompress | investigate |
-| 41 | 0.009 | 0.051 | 5.7× | agg + detoast | — |
+| 20 | 0.312 | 6.798 | **21.8×** | detoast URL (LZ4) | open problem |
+| 21 | 0.098 | 1.953 | 19.9× | detoast URL | — |
+| 22 | 0.717 | 3.719 | 5.2× | detoast URL+Title | #40 for Title |
+| 23 | 0.393 | 0.477 | 1.2× | decompress | — |
+| 24 | 0.147 | 0.110 | **0.75×** | — | — |
+| 25 | 0.192 | 1.925 | 10× | decompress text | **dict sidecar** |
+| 26 | 0.149 | 0.109 | **0.73×** | — | — |
+| 27 | 0.083 | 0.550 | 6.6× | detoast (sidecar) | — |
+| 28 | 9.582 | 6.748 | **0.70×** | regex | — |
+| 29 | 0.029 | 0.045 | 1.6× | metadata I/O | — |
+| 30 | 0.342 | 1.055 | 3.1× | detoast + agg | — |
+| 31 | 0.562 | 1.751 | 3.1× | detoast + agg | **#36 two-level hash** |
+| 32 | 3.793 | 9.530 | 2.5× | **merge** | **#36 two-level hash** |
+| 33 | 2.782 | 2.680 | **0.96×** | agg | — |
+| 34 | 2.851 | 2.689 | **0.94×** | agg | — |
+| 35 | 0.297 | 1.722 | 5.8× | merge | **#36 two-level hash** |
+| 36 | 0.043 | 0.101 | 2.3× | agg | — |
+| 37 | 0.021 | 0.041 | 2.0× | agg | — |
+| 38 | 0.017 | 0.079 | 4.6× | heap_scan + agg | — |
+| 39 | 0.077 | 0.214 | 2.8× | agg + merge | — |
+| 40 | 0.013 | 0.136 | 10× | detoast + decompress | column-pruning audit |
+| 41 | 0.009 | 0.052 | 5.8× | agg + detoast | — |
 | 42 | 0.008 | 0.041 | 5.1× | framework | — |
 
-**Queries faster than CH:** Q3, Q24, Q26, Q33, Q34 (5 queries)
-**Queries within 2× of CH:** Q0, Q1, Q2, Q6, Q12, Q16, Q17, Q18, Q23, Q28, Q29 (11 queries)
-**Queries 2–5× of CH:** Q5, Q8, Q9, Q10, Q11, Q14, Q30, Q31, Q32, Q36, Q37 (11 queries)
-**Queries 5–10× of CH:** Q4, Q7, Q13, Q15, Q22, Q25, Q35, Q38, Q39, Q40, Q41, Q42 (12 queries)
-**Queries >10× of CH:** Q19, Q20, Q21, Q27 (4 queries)
+**Queries faster than CH:** Q3, Q24, Q26, Q28, Q33, Q34 (6 queries, +Q28)
+**Within 2× of CH:** Q0, Q1, Q2, Q6, Q12, Q14 (near), Q16, Q17, Q18, Q23, Q29 (11)
+**2–5× of CH:** Q5, Q8, Q9, Q10, Q11, Q13, Q14, Q30, Q31, Q32, Q36, Q37 (12)
+**5–10× of CH:** Q4, Q15, Q22, Q25, Q35, Q38, Q39, Q41, Q42 (9)
+**>10× of CH:** Q7, Q19, Q20, Q21, Q40 (5)
 
 ---
 
 ## Prioritized improvement list
 
-Sorted by estimated combined wallclock benefit across the benchmark:
+Ranked by estimated combined wallclock benefit across the benchmark.
+All entries cross-referenced against PERF_IMPROVEMENTS.md.
 
 | # | Improvement | Queries helped | Est. benefit | Complexity | In PERF_IMPROVEMENTS.md? |
-|---|-------------|----------------|-------------|------------|--------------------------|
-| ~~1~~ | ~~#39 Pipelined detoast~~ | ~~Q7–Q18, Q20–Q22, Q27, Q30–Q35~~ | — | — | **Done — limited impact** |
-| ~~2~~ | ~~#33 Trigram bloom filters~~ | ~~Q20, Q21, Q22~~ | — | — | **Tried — doesn't work** |
-| **3** | **#36 Two-level hash aggregation** | Q8, Q13, Q15, Q32, Q35, Q39 | ~12 s | Med-High | Yes |
-| **4** | **Per-segment SUM(length(text_col)) metadata** | Q27 | ~1.7 s | Low | **No — new idea** |
-| **5** | **Dict-only scan for ORDER BY text LIMIT** | Q25 | ~1.8 s | Low-Med | **No — new idea** |
-| **6** | **Dict-only COUNT(DISTINCT) for dict columns** | Q5 | ~1.8 s | Low-Med | **No — new idea** |
-| **7** | **HLL sketches for COUNT(DISTINCT)** | Q4, Q8, Q13 | ~8 s | Medium | **No — new idea** |
-| **8** | **#40 Dict-accelerated LIKE** | Q22 (Title is dict) | ~1 s | Medium | Yes |
-| **9** | **Partition-level bloom filter** | Q19 | ~30 ms | Low-Med | **No — new idea** |
-| **10** | **Q40 decompress investigation** | Q40 | ~60 ms | Investigation | — |
+|---|-------------|----------------|--------------|------------|--------------------------|
+| **1** | **#36 Two-level hash aggregation** | Q15, Q31, Q32, Q35 | ~7 s | Med-High | Yes — planned, not done |
+| **2** | **Dict sidecar blob** | Q5, Q25 (+Q22 partial) | ~3.5 s | Medium | **No — new idea** |
+| **3** | **HLL sketches for COUNT(DISTINCT)** | Q4, Q8, Q9, Q13 | ~5–6 s | Medium | No — proposed here previously |
+| **4** | **#40 Dict-accelerated LIKE** | Q22 (Title) | ~1.5 s | Medium | Yes — planned, not done |
+| **5** | **Partition-level bloom for point lookups** | Q19 | ~30 ms | Low-Med | No — proposed here previously |
+| **6** | **Q40 column-pruning audit** | Q40 | ~60 ms | Investigation | — |
 
 ### Recommended order of attack
 
-1. **#4 per-segment `SUM(length(text))` metadata.** Q27 goes from
-   21.9× to ~1× CH. Small self-contained change in compress + stats
-   table. Low risk, high ratio improvement.
+1. **Dict sidecar blob (new).** Biggest per-query gains on Q5 (1.85 s →
+   ~200 ms) and Q25 (1.93 s → ~150 ms); also the cheapest to prototype
+   (reuse the length-sidecar plumbing from #42 in compress.rs +
+   segments.rs). Compress-time cost: a second LZ4 blob per dict column
+   carrying just the dict bytes.
 
-2. **#5 dict-only ORDER BY text LIMIT.** Q25 drops from 10× to ~1× CH.
-   Only needs dict header parsing, no full decompression.
+2. **#36 two-level hash aggregation.** Largest single improvement (~5 s
+   on Q32 alone). Already spec'd in PERF_IMPROVEMENTS.md. The current
+   #41 is *receive-side* partitioning (threads filter every worker's
+   full map by hash modulo at merge time). #36 changes phase-1 so each
+   worker writes directly into 256 hash-byte-indexed sub-tables,
+   eliminating the O(entries × n_partitions) rescan.
 
-3. **#6 dict-only COUNT(DISTINCT).** Q5 drops from 3.2× to ~0.5× CH.
-   Union dict entries across segments instead of hashing 100 M values.
+3. **HLL sketches (new).** Adds a compress-time sidecar (~16 KB per
+   segment per HLL column). Best wins on Q4 (no GROUP BY) where
+   per-segment sketches merge trivially. Per-group sketches (Q8, Q13)
+   are more invasive.
 
-4. ~~#39 pipelined detoast~~ — **done, limited impact.** Pipeline is
-   active but detoast is 6× slower than parallel work per batch, so
-   workers stall. The bottleneck is serial `pg_detoast_datum` I/O.
+4. **#40 dict-accelerated LIKE** for Title in Q22. Already spec'd in
+   PERF_IMPROVEMENTS.md.
 
-5. ~~#33 trigram bloom filters~~ — **tried, doesn't work.** Common
-   trigrams saturate the bloom; no pruning on realistic patterns.
-   Q20/Q21/Q22 remain open problems, helped only by #39.
+### Ideas genuinely new vs PERF_IMPROVEMENTS.md
 
-6. **#3 #36 two-level hash aggregation.** Solves the high-cardinality
-   merge bottleneck (Q13, Q15, Q32, Q35).
+- **Dict sidecar blob** for dict-encoded text columns: store each
+  segment's dict as a separate short TOAST column, letting dict-only
+  fast paths (COUNT DISTINCT, ORDER BY LIMIT, dict-accelerated LIKE
+  pre-check) skip detoasting the main blob entirely. Reuses the
+  length-sidecar infrastructure (#42).
+- **HLL sketches for COUNT(DISTINCT)** — proposed in previous
+  QUERY_ANALYSIS iteration but not carried into PERF_IMPROVEMENTS.md.
+- **Partition-level bloom filter** for point lookups (Q19) — same.
 
-7. **#7 HLL sketches.** Best-bang-for-buck on Q4/Q8/Q13 triad.
-   Can be opt-in per column.
+### Previously-new ideas that turn out to duplicate PERF_IMPROVEMENTS.md
 
-### New ideas proposed (not in PERF_IMPROVEMENTS.md)
-
-- **#4** Per-segment `SUM(length(text_col))` + `_nonnull_count` for metadata fast path on `AVG(length(col))`
-- **#5** Dict-only scan for `ORDER BY text_col LIMIT N`
-- **#6** Dict-only scan for `COUNT(DISTINCT dict_text_col)` — union dict entries
-- **#7** Per-segment HLL sketches for `COUNT(DISTINCT)` metadata fast path
-- **#9** Partition-level bloom filter for point lookup acceleration
-- **#10** Q40: investigate decompress=71 ms for 26 segments / 90 K rows — check column pruning
+- The "send-side partitioned hash aggregation" I sketched above is
+  **already #36 two-level hash aggregation**. Both describe per-worker
+  multiple hashmaps during accumulation with parallel bucket-wise
+  merge. Treating it as the same item.
+- The "Q27 metadata-only path" I sketched doesn't work: Q27 has
+  `GROUP BY CounterID`, so per-segment `SUM(length)` + `nonnull_count`
+  can't collapse without per-(CounterID, segment) stats. Removed.
