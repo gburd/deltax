@@ -2092,87 +2092,211 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                 let topn_select_us = t_spec.elapsed().as_micros() as u64;
 
                 if speculative_ok {
-                    // Phase 5: For each winner, merge all accumulators and finalize
+                    // Phase 5: For each winner, merge all accumulators and finalize.
+                    //
+                    // CountDistinct specs use a parallel partitioned count
+                    // (same pattern as the no-GROUP-BY CD merge): 16 threads
+                    // each own a hash partition, walk every worker's per-
+                    // (winner, cd-spec) set, and count only values routing
+                    // to their partition. Buckets are disjoint → final
+                    // count = Σ bucket sizes. This replaces a serial
+                    // `HashSet::extend` loop that was 98% of finalize on
+                    // Q9-style queries (top-10 GROUP BY with a
+                    // COUNT(DISTINCT) over a ~million-distinct column).
                     let t_fin = Instant::now();
                     let storage = compact_storage.as_mut().unwrap();
                     let num_group_keys = group_specs.len();
-                    let mut result_rows = Vec::with_capacity(merged.len());
-                    let mut spec_cd_sidecar = CountDistinctSideCar::new(&agg_specs);
+                    let n_winners = merged.len();
 
-                    for &(_, packed_key) in &merged {
-                        let global_idx = storage.alloc_group();
-                        spec_cd_sidecar.alloc_group();
+                    // Pre-resolve (winner, worker) -> worker_group_idx so
+                    // worker threads don't hash-lookup repeatedly. None means
+                    // the worker doesn't have that winner's key at all.
+                    let winner_worker_idx: Vec<Vec<Option<u32>>> = merged.iter()
+                        .map(|&(_, packed_key)| {
+                            partial_results.iter()
+                                .map(|r| r.compact_map.get(&packed_key).copied())
+                                .collect()
+                        })
+                        .collect();
 
-                        // Targeted merge: only this key's accumulators across workers
-                        for result in &partial_results {
-                            if let Some(&worker_idx) = result.compact_map.get(&packed_key) {
-                                for (slot_idx, _) in agg_specs.iter().enumerate() {
-                                    let (_, kind) = storage.layout.slots[slot_idx];
-                                    match kind {
-                                        CompactAccKind::Count => {
-                                            let wc = result.compact_storage.read_count(worker_idx, slot_idx);
-                                            *storage.count_mut(global_idx, slot_idx) += wc;
-                                        }
-                                        CompactAccKind::SumInt => {
-                                            let (ws, wc) = result.compact_storage.read_sum_int(worker_idx, slot_idx);
-                                            let (gs, gc) = storage.sum_int_mut(global_idx, slot_idx);
-                                            *gs += ws;
-                                            *gc += wc;
-                                        }
-                                        CompactAccKind::SumIntNarrow => {
-                                            let (ws, wc) = result.compact_storage.read_sum_int_narrow(worker_idx, slot_idx);
-                                            let (gs, gc) = storage.sum_int_narrow_mut(global_idx, slot_idx);
-                                            *gs += ws;
-                                            *gc += wc;
-                                        }
-                                        CompactAccKind::SumFloat => {
-                                            let (ws, wc) = result.compact_storage.read_sum_float(worker_idx, slot_idx);
-                                            let (gs, gc) = storage.sum_float_mut(global_idx, slot_idx);
-                                            *gs += ws;
-                                            *gc += wc;
-                                        }
-                                        CompactAccKind::MinStr | CompactAccKind::MaxStr => {
-                                            let (w_off, w_len) = result.compact_storage.read_min_max_str(worker_idx, slot_idx);
-                                            if w_off != u32::MAX {
-                                                let w_str = result.compact_storage.str_arena.get(w_off, w_len);
-                                                let (g_off, g_len) = storage.read_min_max_str(global_idx, slot_idx);
-                                                let should_update = if g_off == u32::MAX {
-                                                    true
-                                                } else {
-                                                    let g_str = storage.str_arena.get(g_off, g_len);
-                                                    let cmp = collation_strcmp(w_str, g_str);
-                                                    match kind {
-                                                        CompactAccKind::MinStr => cmp < 0,
-                                                        CompactAccKind::MaxStr => cmp > 0,
-                                                        _ => unreachable!(),
+                    // Identify CD slots; these will be computed in parallel.
+                    let cd_slot_specs: Vec<(usize, bool)> = agg_specs.iter()
+                        .enumerate()
+                        .filter_map(|(slot_idx, spec)| {
+                            if spec.agg_type == AggType::CountDistinct {
+                                let is_str = matches!(spec.col_type_oid,
+                                    pg_sys::TEXTOID | pg_sys::VARCHAROID | pg_sys::BPCHAROID);
+                                Some((slot_idx, is_str))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+
+                    // Parallel partitioned count of CD slots across winners.
+                    // Shape: cd_counts[winner_idx][cd_slot_rank] = i64 distinct.
+                    let cd_counts: Vec<Vec<i64>> = if !cd_slot_specs.is_empty() {
+                        const CD_WIN_PARTITIONS: usize = 16;
+                        fn cd_part_int(v: i64) -> usize {
+                            let mut x = v as u64;
+                            x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+                            x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
+                            x ^= x >> 31;
+                            (x >> 60) as usize & (CD_WIN_PARTITIONS - 1)
+                        }
+                        fn cd_part_str(v: u128) -> usize {
+                            ((v >> 124) as usize) & (CD_WIN_PARTITIONS - 1)
+                        }
+
+                        let partial_refs = &partial_results;
+                        let winner_worker_ref = &winner_worker_idx;
+                        let cd_specs_ref = &cd_slot_specs;
+
+                        // bucket_counts[p][winner][cd_rank] = i64 partition-local count
+                        let bucket_counts: Vec<Vec<Vec<i64>>> = std::thread::scope(|s| {
+                            let handles: Vec<_> = (0..CD_WIN_PARTITIONS).map(|p| {
+                                s.spawn(move || {
+                                    // Per-winner per-cd-rank disjoint set
+                                    let n_cd = cd_specs_ref.len();
+                                    let mut local_int: Vec<Vec<CdSetInt>> = (0..n_winners)
+                                        .map(|_| (0..n_cd).map(|_| new_cd_set_int()).collect())
+                                        .collect();
+                                    let mut local_str: Vec<Vec<CdSetStr>> = (0..n_winners)
+                                        .map(|_| (0..n_cd).map(|_| new_cd_set_str()).collect())
+                                        .collect();
+
+                                    for (winner_idx, per_worker_gidx) in winner_worker_ref.iter().enumerate() {
+                                        for (worker_idx, &maybe_gidx) in per_worker_gidx.iter().enumerate() {
+                                            let Some(w_gidx) = maybe_gidx else { continue; };
+                                            let worker_cd = &partial_refs[worker_idx].cd_sidecar;
+                                            for (cd_rank, &(slot_idx, is_str)) in cd_specs_ref.iter().enumerate() {
+                                                // Find the matching entry in worker's cd_sidecar.
+                                                let Some(oe) = worker_cd.entries.iter()
+                                                    .find(|e| e.spec_idx == slot_idx) else { continue; };
+                                                if is_str {
+                                                    let src = &oe.sets_str[w_gidx as usize];
+                                                    let dst = &mut local_str[winner_idx][cd_rank];
+                                                    for &v in src {
+                                                        if cd_part_str(v) == p {
+                                                            dst.insert(v);
+                                                        }
                                                     }
-                                                };
-                                                if should_update {
-                                                    let w_str = result.compact_storage.str_arena.get(w_off, w_len);
-                                                    let (new_off, new_len) = storage.str_arena.alloc(w_str);
-                                                    storage.write_min_max_str(global_idx, slot_idx, new_off, new_len);
+                                                } else {
+                                                    let src = &oe.sets_int[w_gidx as usize];
+                                                    let dst = &mut local_int[winner_idx][cd_rank];
+                                                    for &v in src {
+                                                        if cd_part_int(v) == p {
+                                                            dst.insert(v);
+                                                        }
+                                                    }
                                                 }
                                             }
                                         }
-                                        CompactAccKind::CountDistinctInt | CompactAccKind::CountDistinctStr => {
-                                            spec_cd_sidecar.union_from(slot_idx, global_idx, &result.cd_sidecar, worker_idx);
+                                    }
+
+                                    // Return per-winner per-cd-rank counts.
+                                    (0..n_winners).map(|w| {
+                                        (0..n_cd).map(|c| {
+                                            let (_, is_str) = cd_specs_ref[c];
+                                            if is_str {
+                                                local_str[w][c].len() as i64
+                                            } else {
+                                                local_int[w][c].len() as i64
+                                            }
+                                        }).collect()
+                                    }).collect()
+                                })
+                            }).collect();
+                            handles.into_iter().map(|h| h.join().unwrap()).collect()
+                        });
+
+                        // Sum per (winner, cd_rank) across partitions.
+                        let n_cd = cd_slot_specs.len();
+                        let mut total: Vec<Vec<i64>> = (0..n_winners)
+                            .map(|_| vec![0i64; n_cd])
+                            .collect();
+                        for bucket in &bucket_counts {
+                            for w in 0..n_winners {
+                                for c in 0..n_cd {
+                                    total[w][c] += bucket[w][c];
+                                }
+                            }
+                        }
+                        total
+                    } else {
+                        vec![vec![]; n_winners]
+                    };
+
+                    let mut result_rows = Vec::with_capacity(merged.len());
+                    for (winner_idx, &(_, packed_key)) in merged.iter().enumerate() {
+                        let global_idx = storage.alloc_group();
+
+                        // Merge non-CD accumulators (cheap — few bytes per
+                        // winner × worker × slot).
+                        for (worker_idx, &maybe_gidx) in winner_worker_idx[winner_idx].iter().enumerate() {
+                            let Some(worker_idx_w) = maybe_gidx else { continue; };
+                            let result = &partial_results[worker_idx];
+                            for (slot_idx, _) in agg_specs.iter().enumerate() {
+                                let (_, kind) = storage.layout.slots[slot_idx];
+                                match kind {
+                                    CompactAccKind::Count => {
+                                        let wc = result.compact_storage.read_count(worker_idx_w, slot_idx);
+                                        *storage.count_mut(global_idx, slot_idx) += wc;
+                                    }
+                                    CompactAccKind::SumInt => {
+                                        let (ws, wc) = result.compact_storage.read_sum_int(worker_idx_w, slot_idx);
+                                        let (gs, gc) = storage.sum_int_mut(global_idx, slot_idx);
+                                        *gs += ws;
+                                        *gc += wc;
+                                    }
+                                    CompactAccKind::SumIntNarrow => {
+                                        let (ws, wc) = result.compact_storage.read_sum_int_narrow(worker_idx_w, slot_idx);
+                                        let (gs, gc) = storage.sum_int_narrow_mut(global_idx, slot_idx);
+                                        *gs += ws;
+                                        *gc += wc;
+                                    }
+                                    CompactAccKind::SumFloat => {
+                                        let (ws, wc) = result.compact_storage.read_sum_float(worker_idx_w, slot_idx);
+                                        let (gs, gc) = storage.sum_float_mut(global_idx, slot_idx);
+                                        *gs += ws;
+                                        *gc += wc;
+                                    }
+                                    CompactAccKind::MinStr | CompactAccKind::MaxStr => {
+                                        let (w_off, w_len) = result.compact_storage.read_min_max_str(worker_idx_w, slot_idx);
+                                        if w_off != u32::MAX {
+                                            let w_str = result.compact_storage.str_arena.get(w_off, w_len);
+                                            let (g_off, g_len) = storage.read_min_max_str(global_idx, slot_idx);
+                                            let should_update = if g_off == u32::MAX {
+                                                true
+                                            } else {
+                                                let g_str = storage.str_arena.get(g_off, g_len);
+                                                let cmp = collation_strcmp(w_str, g_str);
+                                                match kind {
+                                                    CompactAccKind::MinStr => cmp < 0,
+                                                    CompactAccKind::MaxStr => cmp > 0,
+                                                    _ => unreachable!(),
+                                                }
+                                            };
+                                            if should_update {
+                                                let w_str = result.compact_storage.str_arena.get(w_off, w_len);
+                                                let (new_off, new_len) = storage.str_arena.alloc(w_str);
+                                                storage.write_min_max_str(global_idx, slot_idx, new_off, new_len);
+                                            }
                                         }
+                                    }
+                                    CompactAccKind::CountDistinctInt | CompactAccKind::CountDistinctStr => {
+                                        // Handled by parallel pass above.
                                     }
                                 }
                             }
                         }
 
-                        // Write CountDistinct counts for this group
-                        for e in &spec_cd_sidecar.entries {
-                            let count = if e.is_str {
-                                e.sets_str[global_idx as usize].len() as i64
-                            } else {
-                                e.sets_int[global_idx as usize].len() as i64
-                            };
-                            *storage.count_mut(global_idx, e.spec_idx) = count;
+                        // Write CD counts from parallel pass into storage.
+                        for (cd_rank, &(slot_idx, _)) in cd_slot_specs.iter().enumerate() {
+                            *storage.count_mut(global_idx, slot_idx) = cd_counts[winner_idx][cd_rank];
                         }
 
-                        // Finalize this group
+                        // Finalize this group.
                         let mut agg_results: Vec<(pg_sys::Datum, bool)> = Vec::new();
                         for (spec_idx, spec) in agg_specs.iter().enumerate() {
                             agg_results.push(compact_finalize(storage, global_idx, spec_idx, spec));
