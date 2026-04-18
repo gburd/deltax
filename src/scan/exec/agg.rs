@@ -83,14 +83,31 @@ pub(crate) enum AggExpr {
     AddConst,
 }
 
+/// `hashbrown` HashSet with ahash — the insert hot path for
+/// COUNT(DISTINCT) accumulators. Swapped from `std::collections::HashSet`
+/// (SipHash) for ~2-3× faster inserts; the serial CD merge on Q4 goes
+/// from ~2.5 s to ~1 s as a result.
+type CdSetInt = hashbrown::HashSet<i64, BuildHasherDefault<ahash::AHasher>>;
+type CdSetStr = hashbrown::HashSet<u128, BuildHasherDefault<ahash::AHasher>>;
+
+#[inline]
+fn new_cd_set_int() -> CdSetInt {
+    CdSetInt::with_hasher(BuildHasherDefault::default())
+}
+
+#[inline]
+fn new_cd_set_str() -> CdSetStr {
+    CdSetStr::with_hasher(BuildHasherDefault::default())
+}
+
 enum AggAccumulator {
     SumInt { sum: i128, count: i64 },
     SumFloat { sum: f64, count: i64 },
     Count { count: i64 },
-    CountDistinctInt { seen: std::collections::HashSet<i64> },
+    CountDistinctInt { seen: CdSetInt },
     /// Stores SipHash-128 digests of strings instead of owned Strings.
     /// Bounded memory (16 bytes per distinct value) — same approach as ClickHouse's uniqExact.
-    CountDistinctStr { seen: std::collections::HashSet<u128> },
+    CountDistinctStr { seen: CdSetStr },
     MinInt { val: Option<i64> },
     MaxInt { val: Option<i64> },
     MinFloat { val: Option<f64> },
@@ -112,9 +129,9 @@ impl AggAccumulator {
             AggType::Count | AggType::CountStar => AggAccumulator::Count { count: 0 },
             AggType::CountDistinct => {
                 if col_type == pg_sys::TEXTOID || col_type == pg_sys::VARCHAROID || col_type == pg_sys::BPCHAROID {
-                    AggAccumulator::CountDistinctStr { seen: std::collections::HashSet::new() }
+                    AggAccumulator::CountDistinctStr { seen: new_cd_set_str() }
                 } else {
-                    AggAccumulator::CountDistinctInt { seen: std::collections::HashSet::new() }
+                    AggAccumulator::CountDistinctInt { seen: new_cd_set_int() }
                 }
             }
             AggType::Min => {
@@ -143,8 +160,8 @@ impl AggAccumulator {
             AggAccumulator::SumInt { .. } => AggAccumulator::SumInt { sum: 0, count: 0 },
             AggAccumulator::SumFloat { .. } => AggAccumulator::SumFloat { sum: 0.0, count: 0 },
             AggAccumulator::Count { .. } => AggAccumulator::Count { count: 0 },
-            AggAccumulator::CountDistinctInt { .. } => AggAccumulator::CountDistinctInt { seen: std::collections::HashSet::new() },
-            AggAccumulator::CountDistinctStr { .. } => AggAccumulator::CountDistinctStr { seen: std::collections::HashSet::new() },
+            AggAccumulator::CountDistinctInt { .. } => AggAccumulator::CountDistinctInt { seen: new_cd_set_int() },
+            AggAccumulator::CountDistinctStr { .. } => AggAccumulator::CountDistinctStr { seen: new_cd_set_str() },
             AggAccumulator::MinInt { .. } => AggAccumulator::MinInt { val: None },
             AggAccumulator::MaxInt { .. } => AggAccumulator::MaxInt { val: None },
             AggAccumulator::MinFloat { .. } => AggAccumulator::MinFloat { val: None },
@@ -4572,8 +4589,8 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
             unsafe impl Sync for ParallelCdConfig<'_> {}
 
             struct ParallelCdResult {
-                int_sets: Vec<std::collections::HashSet<i64>>,
-                str_sets: Vec<std::collections::HashSet<u128>>,
+                int_sets: Vec<CdSetInt>,
+                str_sets: Vec<CdSetStr>,
                 segments_processed: u64,
             }
 
@@ -4595,11 +4612,11 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                 config: &ParallelCdConfig,
             ) -> ParallelCdResult {
                 let n_aggs = config.agg_specs.len();
-                let mut int_sets: Vec<std::collections::HashSet<i64>> = (0..n_aggs)
-                    .map(|_| std::collections::HashSet::new())
+                let mut int_sets: Vec<CdSetInt> = (0..n_aggs)
+                    .map(|_| new_cd_set_int())
                     .collect();
-                let mut str_sets: Vec<std::collections::HashSet<u128>> = (0..n_aggs)
-                    .map(|_| std::collections::HashSet::new())
+                let mut str_sets: Vec<CdSetStr> = (0..n_aggs)
+                    .map(|_| new_cd_set_str())
                     .collect();
                 let mut segments_processed = 0u64;
 
@@ -9970,7 +9987,7 @@ mod tests {
 
     #[pg_test]
     fn test_clone_fresh_count_distinct_int_resets() {
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = new_cd_set_int();
         seen.insert(1i64);
         seen.insert(2);
         let acc = AggAccumulator::CountDistinctInt { seen };
@@ -9997,7 +10014,7 @@ mod tests {
 
     #[pg_test]
     fn test_finalize_count_distinct_int() {
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = new_cd_set_int();
         seen.insert(10i64);
         seen.insert(20);
         seen.insert(30);
@@ -10010,7 +10027,7 @@ mod tests {
 
     #[pg_test]
     fn test_finalize_count_distinct_str() {
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = new_cd_set_str();
         seen.insert(0xdeadbeef_u128);
         seen.insert(0xcafebabe_u128);
         let acc = AggAccumulator::CountDistinctStr { seen };

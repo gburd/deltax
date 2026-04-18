@@ -674,40 +674,63 @@ DeltaXAppend to cooperate with Parallel Append), this optimization is not
 being pursued. If the goal changes — e.g. fewer internal Rust threads per
 partition so PG workers can compose with them — this should be revisited.
 
-### 36. Two-level hash aggregation
+### 36. Two-level hash aggregation [TRIED — LIMITED IMPACT, REVERTED]
 
-**Target: Q16 3.4s -> ~1s, Q28 12.7s -> ~3s, Q31/Q32 10-14s -> ~3s,
-Q36 23.1s -> ~5s (ClickBench hot run)**
-**Complexity: Medium-High**
+**Status (2026-04-18):** Phase 1 (map partitioning only) implemented on
+branch `two_phases_hash`. Measured on EC2 c6a.4xlarge 100 M bench (hot
+best-of-3):
 
-Extends beyond #30 (largely addressed by #28). For high-cardinality GROUP
-BY (>100K groups), the single hashbrown table exceeds L2/L3 cache, causing
-random memory access patterns that dominate execution time.
+| Query | Before | After | Δ |
+|-------|--------|-------|---|
+| Q32 WatchID+ClientIP | 9.53 s | 8.55 s | −0.98 s (−10 %) |
+| Q35 ClientIP arith | 1.72 s | 1.50 s | −0.22 s (−13 %) |
+| all others | — | — | ±2 % noise |
+| **bench total** | **65 s** | **64 s** | **−1.2 s (−1.8 %)** |
 
-**Approach:** Partition the hash space into 256 independent sub-tables,
-selected by one byte of the hash value (a well-known technique in
-columnar engines). Benefits:
+Reverted from `main` on 2026-04-18 because the bench-level improvement
+is within single-run noise (re-running the full bench multiple times
+produces ±2 s variance on EC2). Branch preserved for a possible
+revisit if phase 2 (per-sub-table `CompactAccStorage`) is pursued.
 
-1. **Cache locality:** Each sub-table fits in L2 cache during processing.
-   A 1M-group table split into 256 buckets ≈ 4K groups per bucket ≈
-   128 KB — fits in L2.
-2. **Lock-free parallel merge:** Workers claim buckets via atomic
-   `fetch_add`. Each bucket merged independently, no synchronization.
-3. **Amortized resizing:** 256 small resizes instead of one large resize
-   that stalls all processing.
+**Why phase 1 alone is not enough.** The `CompactAccStorage` remains
+one flat 150–200 MB buffer per worker, addressed by a global u32
+`group_idx`. Phase-2 merge reads `worker.compact_storage[wgidx]` at
+offsets scattered across the whole buffer — every accumulator read is
+a DRAM miss. Partitioning the *map* makes group-key lookups cheaper
+but does not address the accumulator reads that dominate Q32 merge
+time. Early experiments:
+- `AGG_SUBMAP_COUNT = 256` gave the measured wins above.
+- `AGG_SUBMAP_COUNT = 1024` was slightly worse (more allocator traffic
+  per worker, no additional cache benefit for the storage buffer).
 
-**Conversion threshold:** Switch from single-level to two-level when group
-count exceeds a threshold (e.g. ~50K groups or ~256 MB of hash table). Below
-the threshold, single-level is faster due to less indirection.
+**Follow-up approach** (if ever revisited): partition
+`CompactAccStorage` and `CountDistinctSideCar` by sub-index too, so
+each merge thread reads only its ~580 KB slice of each worker's
+storage sequentially. Estimated additional Q32 saving: 1–2 s.
+Scope: medium-high — touches `alloc_group`, every
+`count_mut`/`sum_int_mut` accessor, and CD merge. Only worth doing if
+the projected ~2 s Q32 win is deemed worth the storage-refactor cost.
 
-**Integration with existing parallel paths:** The compact and mixed
-parallel aggregation paths already produce per-worker partial results.
-Two-level hashing improves both the per-worker accumulation (better cache
-behavior) and the merge phase (256-way parallel merge instead of serial
-hash table union).
+**Original analysis (kept for context).** For high-cardinality GROUP
+BY (>100K groups), the single hashbrown table exceeds L2/L3 cache,
+causing random memory access patterns. The idea was to partition the
+hash space into 256 sub-tables by one byte of the hash, so (a) each
+sub-table fits in L2 during phase-1 accumulation and (b) phase-2
+merge threads claim sub-tables by atomic fetch_add with no
+synchronization between threads.
 
-**Files:** `src/scan/exec/agg.rs` (two-level wrapper around hashbrown in
-compact and mixed aggregation paths)
+Partitioned parallel merge (#41) already captures most of (b) at
+`n_workers` granularity. The remaining headroom that two-level
+hashing could recover (cache locality on phase-1 inserts + eliminating
+the hash-mod filter during merge) is, in practice, small compared to
+the unchanged per-accumulator DRAM latency.
+
+**Files (on branch `two_phases_hash`):** `src/scan/exec/agg.rs`
+(CompactSubMaps, ParallelCompactMap enum, routing hasher, entry_or_alloc,
+iter_partition, iter_all, into_single; phase-1 dispatch in
+process_segments_compact; phase-2 dispatch in partitioned merge,
+speculative top-N, and full-merge adoption),
+`src/scan/path.rs` (est_groups field in plan's custom_private).
 
 ### 37. Parallel Top-N text scan with byte-order pruning [DONE]
 
@@ -978,3 +1001,228 @@ buffer + heap_insert), `src/scan/exec/text_col.rs` (`Lengths` variant,
 (`load_text_length_sidecars` PK index scan), `src/scan/exec/agg.rs`
 (sidecar detection in planner, `ParallelMixedConfig.sidecar_only_cols`,
 LengthOf accumulators routed through `get_len()`).
+
+### 43. HLL sketches for COUNT(DISTINCT)
+
+**Target (validated on EC2 100 M bench, hot best-of-3, 2026-04-18):**
+Q4 3.04 s → ~0.2 s, Q5 1.78 s → ~0.3 s (pre-computed sketches).
+Q8 1.02 s → ~0.7 s, Q9 1.47 s → ~1.1 s, Q13 2.03 s → ~1.6 s
+(query-time sketches). **Cumulative ~4.5 s across the bench.**
+**Complexity: Medium**
+
+#### Validated bottleneck analysis (measured on EC2, 2026-04-18)
+
+Instrumented the code to measure the serial merge step directly.
+Warm-run numbers with the original `std::collections::HashSet`:
+
+| Query | Wall | detoast | agg | **serial merge** | # partial results | worker-set inserts |
+|-------|-----:|--------:|----:|-----------------:|------------------:|-------------------:|
+| Q4 `COUNT(DISTINCT UserID)`        | 3024 ms | 420 | 453 | **2513 (83%)** | 479 | 21.98 M |
+| Q5 `COUNT(DISTINCT SearchPhrase)`  | 1763 ms | 584 | 608 | **1109 (63%)** | 479 | 8.35 M |
+
+**The serial merge dominated both queries.** The step is at
+`src/scan/exec/agg.rs` lines 4824–4844: after parallel workers each
+build a thread-local set, the leader iterates every partial result
+and inserts every entry into one global set. For Q4 this is 22 M
+serial inserts into a set that grows to ~100 M entries, long past
+L3 — at ~114 ns per insert (SipHash + cache-miss) this cost ~2.5 s.
+
+After swapping to hashbrown (fix (a), DONE — see below):
+
+| Query | Wall | serial merge | Δ wall |
+|-------|-----:|-------------:|-------:|
+| Q4 | **2017 ms** | 1590 ms | −1005 ms |
+| Q5 | **1214 ms** | 534 ms | −634 ms |
+
+Additional observation: there are **479 partial results** (pipelined
+detoast splits the scan into ~30 batches × 16 workers). Each partial
+result holds a small HashSet; the leader walks all 479 linearly.
+A partial result count of 16 (fused across batches) would reduce
+allocator/iterator overhead but not the insert count.
+
+#### Two cheaper pre-HLL wins uncovered by this measurement
+
+These were evaluated **before** HLL because they deliver most of
+the Q4/Q5 improvement with exact semantics and minimal change.
+
+**Fix (a) — swap `std::collections::HashSet` → `hashbrown::HashSet` [DONE].**
+The parallel CD path (`ParallelCdResult` and the `AggAccumulator`)
+used the std lib's SipHash-based HashSet. Changed to hashbrown with
+ahash. ~30 lines in `agg.rs` (type alias, struct field types,
+constructors, test fixtures).
+
+Measured result (EC2 c6a.4xlarge, 100 M bench, hot best-of-3):
+
+| Query | Before | After | Δ |
+|-------|-------:|------:|--:|
+| Q4 `COUNT(DISTINCT UserID)` serial merge | 2513 ms | 1590 ms | −923 ms |
+| Q4 wall | 3022 ms | **2017 ms** | **−1005 ms (−33 %)** |
+| Q5 serial merge | 1115 ms | 534 ms | −581 ms |
+| Q5 wall | 1848 ms | **1214 ms** | **−634 ms (−34 %)** |
+| **Bench total (hot)** | 64.96 s | **63.40 s** | **−1.56 s (−2.4 %)** |
+
+No regressions on any other query (within ±10 ms noise). Per-insert
+cost dropped from ~114 ns → ~72 ns on Q4 and ~134 ns → ~64 ns on
+Q5. hashbrown's ~1.5–2× speedup doesn't fully compound because the
+set still grows past L3 — DRAM-miss latency dominates even with
+faster hashing.
+
+**Fix (b) — parallelize the CD merge** with a `thread::scope` pass
+that partitions the output set by hash (same pattern as #41 for group
+merges). N threads each own one partition; each walks every partial
+result's int_set/str_set and inserts only values whose hash routes to
+its partition. Output N disjoint sets; final count = Σ sizes. Scope:
+~80 lines. Expected on top of (a):
+- Q4: 2.02 → ~0.8 s (merge saturates L3 → parallelize hides DRAM latency).
+- Q5: 1.21 → ~0.7 s.
+
+**Cumulative pre-HLL if (b) lands:** Q4 3.02 → ~0.8 s, Q5 1.85 →
+~0.7 s — **~3.3 s saved with exact semantics** (on top of the
+1.56 s already captured by fix (a)).
+
+HLL still wins on top of these by also eliminating:
+1. The 400–600 ms of column detoast (no need to read the data column
+   if we have pre-computed per-segment sketches).
+2. The 450–600 ms of per-worker HashSet build (no need to hash
+   every value at query time).
+
+Post-HLL projected: Q4 → ~200 ms, Q5 → ~300 ms. Net HLL-specific
+saving on top of (a)+(b): ~0.3 s on Q4, ~0.3 s on Q5. Smaller than
+the pre-HLL fixes alone, but orthogonal and composable.
+
+#### HLL approach (replaces HashSet entirely)
+
+HLL replaces the union operation with elementwise `max` over a fixed
+16 KB register array per sketch — commutative/associative, fully
+parallelizable, and trivially fast (~50 µs for 16 sketches). Pair
+this with **pre-computed per-segment sketches** (compress-time) and
+the no-GROUP-BY CD path becomes metadata-only: no detoast, no
+per-worker build, no serial merge.
+
+#### Approach
+
+`COUNT(DISTINCT col)` today goes through `CountDistinctSideCar`: one
+`HashSet<u64>` (or `HashSet<u128>` for text) *per group*, inserted
+row-by-row during phase-1, union-merged across workers during phase-2,
+and finalized as `set.len()`.
+
+**Approach.** Replace the per-group HashSet with a HyperLogLog sketch:
+a fixed-size register array (e.g. 16 KB / 2¹⁴ registers, standard
+precision = 14) where each register holds the run of leading zeros of
+the value's hash that was routed to that register. Properties:
+
+- **Insert:** `reg[hash & mask] = max(reg[hash & mask], clz(hash >> shift))` —
+  one AND + one comparison + one store. Constant-time, no hashing
+  chain, fixed memory. Batched inserts are SIMD-friendly.
+- **Merge across workers:** elementwise `max` over register arrays.
+  Sequential access, no hashing.
+- **Finalize:** `|distinct| ≈ α · m² / Σ 2^(−reg[i])` — standard HLL
+  estimator. ~0.8 % relative error at 16 KB / precision 14.
+
+#### Per-segment sketches for the no-GROUP-BY shape (Q4, Q5) — **biggest win**
+
+Pre-compute an HLL sketch per segment at compress time, stored in a
+new companion blob (`_hll_<col>` in the existing `_blobs` table or a
+dedicated companion, analogous to `_text_lengths` for #42). Query
+time: load one sketch per segment, merge via elementwise max, estimate.
+
+This variant eliminates both:
+1. The detoast of the full column blob (Q4: 412 ms on UserID blobs;
+   Q5: 581 ms on SearchPhrase blobs).
+2. The serial HashSet merge (Q4: ~2.2 s; Q5: ~0.6 s) — replaced by a
+   fully-parallel elementwise max over 16 KB arrays.
+
+**Expected Q4:** 3338 segments × 16 KB sketches ≈ 52 MB total detoast
+(vs ~200 MB UserID blobs). Merge = 3338 × 2¹⁴ max ops ≈ 55 M ops ≈
+50 ms. Plus sketch-blob I/O ≈ 100 ms cold, much less warm. Estimated
+warm total: **~200 ms** (down from 3.04 s, ~15× win).
+
+**Expected Q5:** Similar. The dict-only fast path already gets
+`count_distinct_only_str` to skip per-row decode, but it still loads
+the full 200+ KB dict-encoded blobs. Sketches are ~16 KB each. Merge
+like Q4. Estimated warm total: **~300 ms** (down from 1.78 s, ~6×).
+
+#### Per-group sketches for GROUP BY + COUNT(DISTINCT) (Q8, Q9, Q13) — **smaller wins**
+
+Replace `Vec<HashSet>` with `Vec<HllRegisters>` inside
+`CountDistinctSideCar`, where each group's sketch is 16 KB of u8
+registers. Per-group insert and merge as above.
+
+Honest note: these queries already use the parallel compact / mixed
+path with **partitioned parallel merge** (#41). Their CD-sidecar
+merge is already parallelized, so HLL gains are modest — mainly
+from replacing allocator-heavy HashSet operations with fixed-size
+array writes, and saving the union cost across workers.
+
+- Q8 `GROUP BY RegionID COUNT(DISTINCT UserID)`: ~10 K unique regions,
+  ~10 K distinct UserIDs per group avg. Sidecar size per worker:
+  10 K × 16 KB = 160 MB (fits comfortably). Inserts go from
+  ~100 ns hashbrown to ~5 ns register update. Merge
+  (elementwise max) ~10 ms vs 310 ms HashSet-union.
+  Projected: **1.02 s → ~0.7 s.**
+- Q9 `GROUP BY RegionID multi-agg`: same structure as Q8 plus two
+  more aggregates. `finalize=317ms` line is the `set.len()` × groups
+  cost — HLL estimate is similar O(register_count) per group, net
+  saving modest. Projected: **1.47 s → ~1.1 s.**
+- Q13 `GROUP BY SearchPhrase COUNT(DISTINCT UserID)`: 4.8 M groups ×
+  16 KB = **77 GB per worker — won't fit.** Must use sparse representation:
+  start every group as `SparseHLL` (sorted list of `(register_idx,
+  register_value)` pairs), switch to dense 16 KB register array only
+  when the sparse rep exceeds ~128 entries (~2 KB). Keeps memory bounded
+  by actual distinct count. Most Q13 groups have <20 distinct UserIDs,
+  so sparse is fine. Projected: **2.03 s → ~1.6 s.**
+
+**Sparse-to-dense conversion** is well-documented in the HLL++ paper
+(Google). Implementation is ~200 lines.
+
+These smaller wins are the follow-on tier — the big Q4+Q5 sketch
+optimization (above) should land first.
+
+#### Accuracy caveat
+
+HLL is approximate — standard 0.8 % relative error at precision 14.
+ClickBench reference queries use ClickHouse's default `uniq()` which
+is *also* approximate (HLL-style), so matching that is fine for
+bench semantics. But DeltaX currently implements `COUNT(DISTINCT)`
+with exact semantics via HashSets. Two options:
+
+1. **Default to HLL, GUC to opt out.** `pg_deltax.exact_count_distinct`
+   = false by default. Matches ClickHouse behavior; users who need
+   exact semantics set it to true and get the current path.
+2. **Default to exact, opt in to HLL.** Safer but means Q4/Q5/Q8/Q13
+   don't benefit unless explicitly enabled.
+
+Recommendation: option 1, aligned with ClickHouse. Document the
+approximation clearly in the GUC's description.
+
+#### Compile-time vs query-time sketches
+
+**Compile-time:** for queries without GROUP BY (Q4, Q5), pre-compute
+one sketch per (segment, column) at `deltax_create_table` and update
+on each load. Storage cost: ~16 KB × n_segments × n_high_cardinality
+columns. On the 100 M bench, ~3 high-cardinality int/text columns
+worth tracking → ~150 MB total. Well within budget.
+
+**Query-time:** for GROUP BY queries, sketches are built per-(group,
+segment) during phase-1 aggregation. Must live in worker-local CD
+sidecar. No storage overhead; query-time memory is the concern
+(addressed by sparse-to-dense above).
+
+#### Orthogonality to other changes
+
+HLL touches **only** `CountDistinctSideCar` and its callers
+(`insert_int`, `insert_str`, `union_from`, `write_counts_to_storage`,
+and the places that finalize `CompactAccKind::CountDistinct*`). It does
+not depend on or conflict with any map-layout change (e.g. #36).
+
+#### Files
+
+- `src/compression/hll.rs` (new) — `HllRegisters`, `SparseHll`,
+  `DenseHll`, encode/decode for persistence, merge, estimate.
+- `src/compress.rs` — compute and store per-segment sketches for
+  opted-in columns.
+- `src/scan/exec/agg.rs` — `CountDistinctSideCar` uses `HllRegisters`
+  instead of `HashSet`. Finalize reads from the registers.
+- `src/scan/exec/segments.rs` — `load_hll_sketches` PK index scan
+  (analogous to `load_text_length_sidecars`).
+- `src/lib.rs` — `pg_deltax.exact_count_distinct` GUC.
