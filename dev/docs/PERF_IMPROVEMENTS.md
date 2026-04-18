@@ -1027,12 +1027,12 @@ and inserts every entry into one global set. For Q4 this is 22 M
 serial inserts into a set that grows to ~100 M entries, long past
 L3 — at ~114 ns per insert (SipHash + cache-miss) this cost ~2.5 s.
 
-After swapping to hashbrown (fix (a), DONE — see below):
+After fix (a) hashbrown + fix (b) parallel CD merge (both DONE):
 
-| Query | Wall | serial merge | Δ wall |
-|-------|-----:|-------------:|-------:|
-| Q4 | **2017 ms** | 1590 ms | −1005 ms |
-| Q5 | **1214 ms** | 534 ms | −634 ms |
+| Query | Wall | merge | Δ wall |
+|-------|-----:|------:|-------:|
+| Q4 | **703 ms** | 271 ms | −2321 ms (−77 %) |
+| Q5 | **753 ms** | 94 ms | −1095 ms (−59 %) |
 
 Additional observation: there are **479 partial results** (pipelined
 detoast splits the scan into ~30 batches × 16 workers). Each partial
@@ -1067,28 +1067,54 @@ Q5. hashbrown's ~1.5–2× speedup doesn't fully compound because the
 set still grows past L3 — DRAM-miss latency dominates even with
 faster hashing.
 
-**Fix (b) — parallelize the CD merge** with a `thread::scope` pass
-that partitions the output set by hash (same pattern as #41 for group
-merges). N threads each own one partition; each walks every partial
-result's int_set/str_set and inserts only values whose hash routes to
-its partition. Output N disjoint sets; final count = Σ sizes. Scope:
-~80 lines. Expected on top of (a):
-- Q4: 2.02 → ~0.8 s (merge saturates L3 → parallelize hides DRAM latency).
-- Q5: 1.21 → ~0.7 s.
+**Fix (b) — parallelize the CD merge [DONE].** A `thread::scope` pass
+partitions the output keyspace by hash (N=16). Each thread owns one
+partition, walks every partial result's int_set/str_set, and inserts
+only values whose hash routes to its partition. Output buckets are
+disjoint by construction, so the final distinct count is
+`Σ bucket.len()` with no global reconstruction. The accumulator is
+bypassed entirely since this path is gated on all-CountDistinct
+(every spec's result is a count). Merge is now visible in EXPLAIN as
+`merge=...`.
 
-**Cumulative pre-HLL if (b) lands:** Q4 3.02 → ~0.8 s, Q5 1.85 →
-~0.7 s — **~3.3 s saved with exact semantics** (on top of the
-1.56 s already captured by fix (a)).
+Measured result (on top of fix (a)):
 
-HLL still wins on top of these by also eliminating:
-1. The 400–600 ms of column detoast (no need to read the data column
+| Query | After (a) only | After (a)+(b) | Δ |
+|-------|---------------:|--------------:|--:|
+| Q4 wall | 2017 ms | **703 ms** | −1314 ms (−65 %) |
+| Q4 `merge=` | 1590 ms | **271 ms** | 5.9× faster |
+| Q5 wall | 1214 ms | **753 ms** | −461 ms (−40 %) |
+| Q5 `merge=` | 534 ms | **94 ms** | 5.7× faster |
+| **Bench total (hot)** | 63.40 s | **61.44 s** | **−1.96 s** |
+
+**Cumulative pre-HLL wins (a)+(b):** Q4 3.02 → 0.70 s (−77 %),
+Q5 1.85 → 0.75 s (−59 %), bench total 64.96 → 61.44 s (−3.52 s,
+−5.4 %) — all with exact semantics.
+
+Partitioning uses SplitMix64 for int keys (cheap, well-distributed)
+and top bits of u128 for text keys (they're already SipHash-128
+digests from `hash128_str`, uniformly random).
+
+After fixes (a)+(b), Q4/Q5 breakdown is:
+
+| Q4 | Q5 | Phase |
+|---:|---:|-------|
+| 391 ms | 581 ms | detoast |
+| 401 ms | 598 ms | agg (per-worker HashSet build) |
+| 271 ms | 94 ms | merge (parallel, now trivially fast) |
+| ~50 ms | ~30 ms | framework/misc |
+
+HLL still wins on top of (a)+(b) by eliminating:
+1. The ~400–600 ms of column detoast (no need to read the data column
    if we have pre-computed per-segment sketches).
-2. The 450–600 ms of per-worker HashSet build (no need to hash
+2. The ~400–600 ms of per-worker HashSet build (no need to hash
    every value at query time).
 
-Post-HLL projected: Q4 → ~200 ms, Q5 → ~300 ms. Net HLL-specific
-saving on top of (a)+(b): ~0.3 s on Q4, ~0.3 s on Q5. Smaller than
-the pre-HLL fixes alone, but orthogonal and composable.
+Post-HLL projected: Q4 → ~100 ms, Q5 → ~200 ms. Net HLL-specific
+saving on top of (a)+(b): **~600 ms on Q4, ~550 ms on Q5, ~1.2 s
+cumulative** — about the same as HLL would have contributed before,
+but now expressed vs a much lower baseline (a+b already captured
+the low-hanging fruit).
 
 #### HLL approach (replaces HashSet entirely)
 
