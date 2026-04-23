@@ -692,7 +692,7 @@ pub(crate) unsafe fn jsonb_text_to_binary(text: &str) -> Vec<u8> {
         let varlena = datum.cast_mut_ptr::<pgrx::pg_sys::varlena>();
         let detoasted = pgrx::pg_sys::pg_detoast_datum(varlena);
         let total_len = pgrx::varsize_any_exhdr(detoasted);
-        let data_ptr = pgrx::vardata_any(detoasted) as *const u8;
+        let data_ptr = pgrx::vardata_any(detoasted);
         // Copy into Rust heap before resetting the scratch context.
         let bytes = std::slice::from_raw_parts(data_ptr, total_len).to_vec();
 

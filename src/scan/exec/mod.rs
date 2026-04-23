@@ -27,6 +27,10 @@ pub(crate) use agg::create_agg_scan_state;
 // Callback imports for static method tables
 use decompress::{begin_custom_scan, exec_custom_scan, end_custom_scan, rescan_custom_scan};
 use decompress::begin_deltax_append;
+use decompress::{
+    estimate_dsm_deltax_append, initialize_dsm_deltax_append, reinit_dsm_deltax_append,
+    init_worker_deltax_append, shutdown_deltax_append,
+};
 use count_minmax::{begin_count_scan, exec_count_scan, end_count_scan, rescan_count_scan};
 use count_minmax::{begin_minmax_scan, exec_minmax_scan, end_minmax_scan, rescan_minmax_scan};
 
@@ -94,11 +98,11 @@ pub(crate) static DELTAX_APPEND_EXEC_METHODS: SyncStatic<pg_sys::CustomExecMetho
         ReScanCustomScan: Some(rescan_custom_scan),
         MarkPosCustomScan: None,
         RestrPosCustomScan: None,
-        EstimateDSMCustomScan: None,
-        InitializeDSMCustomScan: None,
-        ReInitializeDSMCustomScan: None,
-        InitializeWorkerCustomScan: None,
-        ShutdownCustomScan: None,
+        EstimateDSMCustomScan: Some(estimate_dsm_deltax_append),
+        InitializeDSMCustomScan: Some(initialize_dsm_deltax_append),
+        ReInitializeDSMCustomScan: Some(reinit_dsm_deltax_append),
+        InitializeWorkerCustomScan: Some(init_worker_deltax_append),
+        ShutdownCustomScan: Some(shutdown_deltax_append),
         ExplainCustomScan: Some(super::explain::explain_deltax_append),
     });
 

@@ -68,6 +68,10 @@ pub unsafe fn register_hook() {
             PREV_UPPER_HOOK.store(prev_fn as *mut (), Ordering::SeqCst);
         }
         pg_sys::create_upper_paths_hook = Some(hook::deltax_create_upper_paths);
+
+        // Register CustomScanMethods by name so parallel workers can
+        // deserialize custom scan nodes from DSM.
+        path::register_custom_scan_methods();
     }
 }
 

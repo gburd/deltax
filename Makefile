@@ -13,6 +13,7 @@ VENV         = .venv
        integration-test \
        bench-clickbench bench-clickbench-keep bench-clickbench-full bench-clean \
        bench-rtabench bench-rtabench-keep bench-rtabench-full bench-rtabench-clean \
+       bench-rtabench-distclean \
        bench-timescaledb bench-compare bench-all \
        run-sql run-sql-file logs logs-all logs-follow
 
@@ -207,17 +208,25 @@ bench-rtabench: $(VENV)/.stamp image
 bench-rtabench-full: $(VENV)/.stamp image
 	PG_DELTAX_IMAGE=pg_deltax:pg$(PG_MAJOR) RTABENCH_ORDERS=10010342 $(VENV)/bin/pytest tests/bench_rtabench.py -v -s
 
-# Same as bench-rtabench but persists the data volume and leaves the
-# container up so the next `bench-rtabench-keep` run skips the load and
-# you can `docker exec -it pg_deltax_inttest psql -U postgres` afterward.
-bench-rtabench-keep: $(VENV)/.stamp image
+# Reload the dataset (drops container + PG data volume, preserves the
+# downloaded CSV cache under tests/.data/rtabench) and run the benchmark
+# with KEEP_CONTAINER + BENCH_PERSIST so the container stays up after.
+# Every invocation re-loads data through the current extension code, so
+# compression changes are exercised end-to-end; the first run downloads
+# the upstream CSVs (~7 GB, one-time) — subsequent runs reuse them.
+bench-rtabench-keep: $(VENV)/.stamp image bench-rtabench-clean
 	PG_DELTAX_IMAGE=pg_deltax:pg$(PG_MAJOR) KEEP_CONTAINER=1 BENCH_PERSIST=1 \
 		$(VENV)/bin/pytest tests/bench_rtabench.py -v -s
 
-# Wipe the container, persistent data volume, and cached CSV slices.
+# Wipe the container and persistent PG data volume. The downloaded CSV
+# cache (tests/.data/rtabench) is preserved — use `bench-rtabench-distclean`
+# to also drop the ~7 GB cache.
 bench-rtabench-clean:
 	-docker rm -f pg_deltax_inttest 2>/dev/null
 	-docker volume rm pg_deltax_bench_pgdata 2>/dev/null
+
+# Full wipe including the downloaded CSV cache (forces ~7 GB redownload).
+bench-rtabench-distclean: bench-rtabench-clean
 	rm -rf tests/.data/rtabench
 
 bench-timescaledb: $(VENV)/.stamp

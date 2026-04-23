@@ -3,6 +3,7 @@ use pgrx::prelude::*;
 use pgrx::pg_guard;
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use super::{CUSTOM_EXEC_METHODS, DELTAX_APPEND_EXEC_METHODS};
@@ -92,6 +93,16 @@ pub(crate) struct DecompressState {
     topn_done: bool,
     /// Whether the Top-N sort column is a text type (uses byte comparison).
     topn_sort_is_text: bool,
+
+    /// DSM-resident shared state when running as a parallel partial scan.
+    /// Null in the serial path; non-null after `InitializeDSMCustomScan`
+    /// (leader) or `InitializeWorkerCustomScan` (worker) wires it up.
+    pub(crate) pscan: *mut DeltaXAppendPState,
+
+    /// Snapshot of DSM per-worker timings, copied by the leader in
+    /// `ShutdownCustomScan` before the DSM is torn down. Empty on workers
+    /// and in the serial path. Consumed by `ExplainCustomScan`.
+    pub(crate) cached_worker_timings: Vec<ScanTimingShmem>,
 }
 
 /// Wall-clock timing for the decompress scan phases.
@@ -144,6 +155,111 @@ pub(crate) struct ScanTiming {
     pub(crate) topn_candidates: u64,
     /// Top-N segments processed in Phase 2.
     pub(crate) topn_phase2_segments: u64,
+}
+
+/// POD projection of `ScanTiming` for cross-process DSM aggregation.
+/// All fields are u64 (no heap pointers, no buf_stats).
+#[repr(C)]
+#[derive(Copy, Clone, Default)]
+pub(crate) struct ScanTimingShmem {
+    /// Marker: non-zero when this slot was written by its worker.
+    pub(crate) populated: u64,
+    pub(crate) metadata_us: u64,
+    pub(crate) heap_scan_us: u64,
+    pub(crate) decompress_us: u64,
+    pub(crate) phase1_us: u64,
+    pub(crate) phase2_us: u64,
+    pub(crate) phase2_text_us: u64,
+    pub(crate) phase2_nontext_us: u64,
+    pub(crate) phase2_text_cols: u64,
+    pub(crate) phase2_nontext_cols: u64,
+    pub(crate) emit_us: u64,
+    pub(crate) rows_emitted: u64,
+    pub(crate) rows_filtered: u64,
+    pub(crate) batch_eval_us: u64,
+    pub(crate) rows_batch_filtered: u64,
+    pub(crate) segments_decompressed: u64,
+    pub(crate) compressed_bytes: u64,
+    pub(crate) segments_skipped: u64,
+    pub(crate) segments_minmax_skipped: u64,
+    pub(crate) segments_bloom_skipped: u64,
+    pub(crate) phase2_skipped: u64,
+}
+
+/// Leader + up to 32 workers. PG typically uses much less; we hard-error
+/// if the planner requests more than this cap.
+pub(crate) const MAX_WORKER_SLOTS: usize = 33;
+
+/// DSM-resident shared state for parallel DeltaXAppend.
+///
+/// Layout is POD (no rust-side Drop, no pointers). `AtomicU64` has the
+/// same memory representation as `u64`, so zero-initialized DSM is a
+/// valid state (`next_segment = 0`, nothing populated yet).
+#[repr(C)]
+pub(crate) struct DeltaXAppendPState {
+    /// Shared cursor: workers call `fetch_add(1)` to claim the next
+    /// segment index. When it reaches `total_segments`, the scan is done.
+    pub(crate) next_segment: AtomicU64,
+    /// Total segments in the leader's `segments_data`. Set during
+    /// `InitializeDSMCustomScan` after the leader's `BeginCustomScan` ran.
+    pub(crate) total_segments: u64,
+    /// Number of timing slots (== worker-cap + 1 for the leader).
+    pub(crate) n_worker_slots: u32,
+    _pad: u32,
+    /// Per-process timing aggregation. Slot 0 = leader, slots 1..=N = workers.
+    pub(crate) worker_timings: [ScanTimingShmem; MAX_WORKER_SLOTS],
+}
+
+/// Returns the DSM slot index for the current process.
+/// Leader (ParallelWorkerNumber == -1) → slot 0; worker K → slot K + 1.
+unsafe fn current_worker_slot() -> usize {
+    let n = unsafe { pg_sys::ParallelWorkerNumber };
+    if n < 0 {
+        0
+    } else {
+        ((n as usize) + 1).min(MAX_WORKER_SLOTS - 1)
+    }
+}
+
+/// Copy the running `ScanTiming` counters into this process's DSM slot.
+/// Called from `ShutdownCustomScan` (before state teardown) so the leader
+/// can aggregate per-worker numbers for EXPLAIN output.
+unsafe fn flush_timing_to_shmem(state: &DecompressState) {
+    unsafe {
+        if state.pscan.is_null() {
+            return;
+        }
+        let slot_idx = current_worker_slot();
+        let ps = &mut *state.pscan;
+        if slot_idx >= ps.n_worker_slots as usize {
+            return;
+        }
+        let slot = &mut ps.worker_timings[slot_idx];
+        let t = &state.timing;
+        slot.metadata_us = t.metadata_us;
+        slot.heap_scan_us = t.heap_scan_us;
+        slot.decompress_us = t.decompress_us;
+        slot.phase1_us = t.phase1_us;
+        slot.phase2_us = t.phase2_us;
+        slot.phase2_text_us = t.phase2_text_us;
+        slot.phase2_nontext_us = t.phase2_nontext_us;
+        slot.phase2_text_cols = t.phase2_text_cols;
+        slot.phase2_nontext_cols = t.phase2_nontext_cols;
+        slot.emit_us = t.emit_us;
+        slot.rows_emitted = t.rows_emitted;
+        slot.rows_filtered = t.rows_filtered;
+        slot.batch_eval_us = t.batch_eval_us;
+        slot.rows_batch_filtered = t.rows_batch_filtered;
+        slot.segments_decompressed = t.segments_decompressed;
+        slot.compressed_bytes = t.compressed_bytes;
+        slot.segments_skipped = t.segments_skipped;
+        slot.segments_minmax_skipped = t.segments_minmax_skipped;
+        slot.segments_bloom_skipped = t.segments_bloom_skipped;
+        slot.phase2_skipped = t.phase2_skipped;
+        // populated must be written last so the leader can treat slots
+        // missing this flag (e.g. a worker that crashed) as absent.
+        slot.populated = 1;
+    }
 }
 
 /// CreateCustomScanState callback.
@@ -526,6 +642,8 @@ pub(super) unsafe extern "C-unwind" fn begin_deltax_append(
             topn_cursor: 0,
             topn_done: false,
             topn_sort_is_text,
+            pscan: std::ptr::null_mut(),
+            cached_worker_timings: Vec::new(),
         };
 
         // Create per-segment memory context
@@ -690,6 +808,8 @@ fn load_decompress_state(
         topn_cursor: 0,
         topn_done: false,
         topn_sort_is_text: false,
+        pscan: std::ptr::null_mut(),
+        cached_worker_timings: Vec::new(),
     }
 }
 
@@ -2759,12 +2879,26 @@ unsafe fn load_next_segment(
 ) -> bool {
     unsafe {
         loop {
-            if state.segment_index >= state.segments_data.len() {
-                return false;
+            // Parallel path: atomically claim the next segment index from the
+            // shared DSM cursor. Serial path: walk segment_index locally.
+            if !state.pscan.is_null() {
+                let idx = (*state.pscan)
+                    .next_segment
+                    .fetch_add(1, Ordering::Relaxed);
+                if idx >= state.segments_data.len() as u64 {
+                    return false;
+                }
+                state.segment_index = idx as usize;
+            } else {
+                if state.segment_index >= state.segments_data.len() {
+                    return false;
+                }
             }
 
             let seg = &state.segments_data[state.segment_index];
-            state.segment_index += 1;
+            if state.pscan.is_null() {
+                state.segment_index += 1;
+            }
 
             if seg.row_count == 0 {
                 continue;
@@ -3071,6 +3205,110 @@ pub(super) unsafe extern "C-unwind" fn rescan_custom_scan(
         state.topn_buffer.clear();
         state.topn_cursor = 0;
         state.topn_done = false;
+    }
+}
+
+// ============================================================================
+// Parallel partial-path DSM hooks (DeltaXAppend only)
+// ============================================================================
+
+/// EstimateDSMCustomScan: how much shared memory this node needs.
+#[pg_guard]
+pub(super) unsafe extern "C-unwind" fn estimate_dsm_deltax_append(
+    _node: *mut pg_sys::CustomScanState,
+    _pcxt: *mut pg_sys::ParallelContext,
+) -> pg_sys::Size {
+    std::mem::size_of::<DeltaXAppendPState>() as pg_sys::Size
+}
+
+/// InitializeDSMCustomScan: leader populates the shared state after its own
+/// BeginCustomScan has loaded segments_data.
+#[pg_guard]
+pub(super) unsafe extern "C-unwind" fn initialize_dsm_deltax_append(
+    node: *mut pg_sys::CustomScanState,
+    pcxt: *mut pg_sys::ParallelContext,
+    coordinate: *mut std::ffi::c_void,
+) {
+    unsafe {
+        let ps = coordinate as *mut DeltaXAppendPState;
+        std::ptr::write_bytes(ps as *mut u8, 0, std::mem::size_of::<DeltaXAppendPState>());
+
+        let state = &mut *((*node).custom_ps as *mut DecompressState);
+
+        // Cap slots: leader + nworkers. Hard-error if the planner asked for more
+        // than we support — the cost formula + GUC range should prevent this.
+        let nworkers = (*pcxt).nworkers as usize;
+        if nworkers + 1 > MAX_WORKER_SLOTS {
+            pgrx::error!(
+                "pg_deltax: parallel worker count {} exceeds MAX_WORKER_SLOTS {}",
+                nworkers, MAX_WORKER_SLOTS - 1,
+            );
+        }
+
+        (*ps).next_segment = AtomicU64::new(0);
+        (*ps).total_segments = state.segments_data.len() as u64;
+        (*ps).n_worker_slots = (nworkers + 1) as u32;
+
+        state.pscan = ps;
+    }
+}
+
+/// ReInitializeDSMCustomScan: reset the shared cursor on rescan.
+#[pg_guard]
+pub(super) unsafe extern "C-unwind" fn reinit_dsm_deltax_append(
+    _node: *mut pg_sys::CustomScanState,
+    _pcxt: *mut pg_sys::ParallelContext,
+    coordinate: *mut std::ffi::c_void,
+) {
+    unsafe {
+        let ps = coordinate as *mut DeltaXAppendPState;
+        (*ps).next_segment.store(0, Ordering::Relaxed);
+        for slot in (*ps).worker_timings.iter_mut() {
+            *slot = ScanTimingShmem::default();
+        }
+    }
+}
+
+/// InitializeWorkerCustomScan: worker picks up the shared state pointer.
+/// The worker's own BeginCustomScan has already run and loaded its own
+/// `segments_data`; we only need to wire `pscan`.
+#[pg_guard]
+pub(super) unsafe extern "C-unwind" fn init_worker_deltax_append(
+    node: *mut pg_sys::CustomScanState,
+    _toc: *mut pg_sys::shm_toc,
+    coordinate: *mut std::ffi::c_void,
+) {
+    unsafe {
+        let state = &mut *((*node).custom_ps as *mut DecompressState);
+        state.pscan = coordinate as *mut DeltaXAppendPState;
+    }
+}
+
+/// ShutdownCustomScan: flush this process's timing counters into the shared
+/// slot so the leader can aggregate per-worker numbers for EXPLAIN output.
+/// PG may call this before EndCustomScan when tearing down workers.
+///
+/// On the leader, also snapshot the DSM worker_timings into a local Vec
+/// so EXPLAIN can render them after DSM is detached.
+#[pg_guard]
+pub(super) unsafe extern "C-unwind" fn shutdown_deltax_append(
+    node: *mut pg_sys::CustomScanState,
+) {
+    unsafe {
+        let state_ptr = (*node).custom_ps as *mut DecompressState;
+        if state_ptr.is_null() {
+            return;
+        }
+        let state = &mut *state_ptr;
+        flush_timing_to_shmem(state);
+
+        // Leader (ParallelWorkerNumber < 0) caches all DSM slots now while
+        // the DSM is still attached. Workers skip this step.
+        if !state.pscan.is_null() && pg_sys::ParallelWorkerNumber < 0 {
+            let ps = &*state.pscan;
+            let n = (ps.n_worker_slots as usize).min(MAX_WORKER_SLOTS);
+            state.cached_worker_timings = ps.worker_timings[..n].to_vec();
+        }
     }
 }
 

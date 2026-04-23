@@ -1686,8 +1686,25 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
         }).collect();
 
         // Gate sidecar activation on the parallel-mixed path being usable.
+        //
+        // can_parallel_mixed_flag (computed later) also requires
+        // `all_segments.len() > 1` — but segments aren't loaded yet.
+        // Without checking that upstream, a query that ends up going
+        // through the non-parallel path reads from `compressed_blobs`
+        // entries that were never loaded (because sidecar mode skipped
+        // them), silently returning NULL from AVG(length()).
+        //
+        // Use a conservative catalog-based row estimate: one default
+        // segment is 30K rows, so require at least 2× that to be
+        // confident the parallel path will fire.
+        const SIDECAR_MIN_ROWS: i64 = 60_000;
+        let estimated_rows: i64 = companion_oids
+            .iter()
+            .map(|&oid| super::super::cost::get_row_count(oid).unwrap_or(0))
+            .sum();
         let sidecar_only_cols: Vec<bool> = if sidecar_candidate.iter().any(|&s| s)
             && crate::get_parallel_workers() > 1
+            && estimated_rows >= SIDECAR_MIN_ROWS
             && can_parallel_mixed(&group_specs, &needed_cols, &meta.col_types, &batch_quals, &agg_specs)
         {
             sidecar_candidate
@@ -2074,9 +2091,9 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
 
                 // Phase 3: Sort and take top-N
                 if !topn_ascending {
-                    merged.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+                    merged.sort_unstable_by_key(|b| std::cmp::Reverse(b.0));
                 } else {
-                    merged.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                    merged.sort_unstable_by_key(|a| a.0);
                 }
                 merged.truncate(limit);
 
@@ -2949,9 +2966,9 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                     }
                 }
                 if topn_ascending {
-                    all_candidates.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                    all_candidates.sort_unstable_by_key(|a| a.0);
                 } else {
-                    all_candidates.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+                    all_candidates.sort_unstable_by_key(|b| std::cmp::Reverse(b.0));
                 }
                 all_candidates.truncate(limit);
 
@@ -3481,9 +3498,9 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
 
                 // Phase 3: Sort and take top-N
                 if !topn_ascending {
-                    merged.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+                    merged.sort_unstable_by_key(|b| std::cmp::Reverse(b.0));
                 } else {
-                    merged.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                    merged.sort_unstable_by_key(|a| a.0);
                 }
                 merged.truncate(limit);
 
@@ -4337,9 +4354,9 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                     }
                 }
                 if topn_ascending {
-                    all_candidates.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                    all_candidates.sort_unstable_by_key(|a| a.0);
                 } else {
-                    all_candidates.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+                    all_candidates.sort_unstable_by_key(|b| std::cmp::Reverse(b.0));
                 }
                 all_candidates.truncate(limit);
 
@@ -5283,12 +5300,11 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                             }
                                             if has_empty { seen.insert(empty_hash); }
                                         }
-                                        compression::CompressionType::Constant => {
+                                        compression::CompressionType::Constant
                                             // Single constant string — hash the raw bytes
-                                            if non_null_count > 0 {
+                                            if non_null_count > 0 => {
                                                 seen.insert(hash128_str(cc_ref.data));
                                             }
-                                        }
                                         _ => {}
                                     }
                                 }
@@ -6935,7 +6951,7 @@ impl CompactAccLayout {
             (i, kind)
         }).collect();
         // Sort by alignment descending (i128 first, then i64/f64)
-        indexed.sort_by(|a, b| b.1.alignment().cmp(&a.1.alignment()));
+        indexed.sort_by_key(|b| std::cmp::Reverse(b.1.alignment()));
 
         let mut slots = vec![(0usize, CompactAccKind::Count); specs.len()];
         for (orig_idx, kind) in &indexed {
@@ -7365,7 +7381,7 @@ unsafe fn compact_topn_select(
                 }
             }
             let mut result: Vec<(u128, u32)> = heap.into_iter().map(|Reverse((_, k, g))| (k, g)).collect();
-            result.sort_by(|&(_, ga), &(_, gb)| read_val(gb).cmp(&read_val(ga)));
+            result.sort_by_key(|&(_, gb)| std::cmp::Reverse(read_val(gb)));
             result
         }
     }

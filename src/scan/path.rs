@@ -84,6 +84,24 @@ thread_local! {
     static TOPN_INFO: std::cell::Cell<(i64, bool, bool, i32)> = const { std::cell::Cell::new((0, true, false, 0)) };
 }
 
+/// Register every CustomScanMethods struct with PG's name-keyed registry.
+/// Required for parallel workers: when a worker deserializes the plan tree
+/// from DSM, it looks up the methods struct by name (not by pointer, since
+/// the leader's pointer would be invalid in the worker process).
+///
+/// # Safety
+/// Must be called exactly once from `_PG_init()` before any parallel query
+/// can reach a custom scan node.
+pub(super) unsafe fn register_custom_scan_methods() {
+    unsafe {
+        pg_sys::RegisterCustomScanMethods(&CUSTOM_SCAN_METHODS.0);
+        pg_sys::RegisterCustomScanMethods(&DELTAX_APPEND_SCAN_METHODS.0);
+        pg_sys::RegisterCustomScanMethods(&DELTAX_COUNT_SCAN_METHODS.0);
+        pg_sys::RegisterCustomScanMethods(&DELTAX_MINMAX_SCAN_METHODS.0);
+        pg_sys::RegisterCustomScanMethods(&DELTAX_AGG_SCAN_METHODS.0);
+    }
+}
+
 /// Add a DeltaXDecompress custom path to the relation's pathlist.
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn add_decompress_path(
@@ -105,7 +123,7 @@ pub unsafe fn add_decompress_path(
         (*cpath).path.parent = rel;
         (*cpath).path.pathtarget = (*rel).reltarget;
 
-        let (startup_cost, total_cost, rows) = cost::estimate_cost(companion_oid);
+        let (startup_cost, total_cost, rows) = cost::estimate_cost(companion_oid, 0);
         (*cpath).path.rows = rows;
         (*cpath).path.startup_cost = startup_cost;
         (*cpath).path.total_cost = total_cost;
@@ -1487,6 +1505,68 @@ pub unsafe fn add_deltax_append_path(
     sort_col_attno: i32,
 ) {
     unsafe {
+        // Store Top-N info once — consumed by both the serial and partial
+        // plan callbacks. Partial-path emission suppresses Top-N at the
+        // hook level, but the thread-local is the mechanism plan_* uses
+        // to reach the executor either way.
+        if effective_limit > 0 {
+            APPEND_TOPN_INFO.with(|cell| cell.set((effective_limit, sort_ascending, multi_col_sort, sort_col_attno)));
+        } else {
+            APPEND_TOPN_INFO.with(|cell| cell.set((0, true, false, 0)));
+        }
+
+        // Clear existing paths (removes Append paths). Must happen before we
+        // add our serial path; any partial path added afterwards (by a
+        // subsequent call to `add_partial_deltax_append_path`) inserts into
+        // the now-empty partial_pathlist.
+        (*rel).pathlist = std::ptr::null_mut();
+        (*rel).partial_pathlist = std::ptr::null_mut();
+
+        let cpath = build_deltax_append_path(rel, companion_oids, pathkeys, 0);
+        pg_sys::add_path(rel, cpath as *mut pg_sys::Path);
+
+        // Mark rel as non-partitioned so that apply_scanjoin_target_to_paths()
+        // in grouping_planner does NOT discard our path and rebuild Append
+        // paths from children.  DeltaXAppend handles all partitions internally,
+        // so the planner must treat this rel as a single-scan base rel.
+        (*rel).nparts = 0;
+    }
+}
+
+/// Partial-path variant of `add_deltax_append_path`: builds a parallel-aware
+/// CustomPath that splits segment-granularity work across `workers`
+/// processes via a shared DSM cursor. Must be called AFTER
+/// `add_deltax_append_path` so the serial wrapper's pathlist/partition
+/// reshaping has already run.
+pub unsafe fn add_partial_deltax_append_path(
+    _root: *mut pg_sys::PlannerInfo,
+    rel: *mut pg_sys::RelOptInfo,
+    companion_oids: &[pg_sys::Oid],
+    pathkeys: *mut pg_sys::List,
+    workers: i32,
+) {
+    unsafe {
+        if workers <= 0 {
+            return;
+        }
+        let cpath = build_deltax_append_path(rel, companion_oids, pathkeys, workers);
+        (*cpath).path.parallel_workers = workers;
+        (*cpath).path.parallel_aware = true;
+        (*cpath).path.parallel_safe = true;
+        pg_sys::add_partial_path(rel, cpath as *mut pg_sys::Path);
+    }
+}
+
+/// Shared construction for serial and partial DeltaXAppend paths.
+/// `workers > 0` applies the parallel cost divisor; callers then flip
+/// `parallel_aware`/`parallel_safe`/`parallel_workers` on the returned path.
+unsafe fn build_deltax_append_path(
+    rel: *mut pg_sys::RelOptInfo,
+    companion_oids: &[pg_sys::Oid],
+    pathkeys: *mut pg_sys::List,
+    workers: i32,
+) -> *mut pg_sys::CustomPath {
+    unsafe {
         let cpath =
             pg_sys::palloc0(std::mem::size_of::<pg_sys::CustomPath>()) as *mut pg_sys::CustomPath;
 
@@ -1495,12 +1575,12 @@ pub unsafe fn add_deltax_append_path(
         (*cpath).path.parent = rel;
         (*cpath).path.pathtarget = (*rel).reltarget;
 
-        // Cost = sum of individual companion costs
+        let w = if workers > 0 { workers as usize } else { 0 };
         let mut total_startup = 0.0f64;
         let mut total_cost = 0.0f64;
         let mut total_rows = 0.0f64;
         for &oid in companion_oids {
-            let (startup, cost, rows) = cost::estimate_cost(oid);
+            let (startup, cost, rows) = cost::estimate_cost(oid, w);
             total_startup += startup;
             total_cost += cost;
             total_rows += rows;
@@ -1513,7 +1593,6 @@ pub unsafe fn add_deltax_append_path(
         (*cpath).path.parallel_safe = false;
         (*cpath).path.pathkeys = pathkeys;
 
-        // Store companion OIDs in custom_private
         let mut private_list: *mut pg_sys::List = std::ptr::null_mut();
         for &oid in companion_oids {
             private_list = pg_sys::lappend_oid(private_list, oid);
@@ -1524,24 +1603,7 @@ pub unsafe fn add_deltax_append_path(
         (*cpath).custom_restrictinfo = std::ptr::null_mut();
         (*cpath).methods = &DELTAX_APPEND_PATH_METHODS.0;
 
-        // Store Top-N info.
-        if effective_limit > 0 {
-            APPEND_TOPN_INFO.with(|cell| cell.set((effective_limit, sort_ascending, multi_col_sort, sort_col_attno)));
-        } else {
-            APPEND_TOPN_INFO.with(|cell| cell.set((0, true, false, 0)));
-        }
-
-        // Clear existing paths (removes Append paths)
-        (*rel).pathlist = std::ptr::null_mut();
-        (*rel).partial_pathlist = std::ptr::null_mut();
-
-        pg_sys::add_path(rel, cpath as *mut pg_sys::Path);
-
-        // Mark rel as non-partitioned so that apply_scanjoin_target_to_paths()
-        // in grouping_planner does NOT discard our path and rebuild Append
-        // paths from children.  DeltaXAppend handles all partitions internally,
-        // so the planner must treat this rel as a single-scan base rel.
-        (*rel).nparts = 0;
+        cpath
     }
 }
 

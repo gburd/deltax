@@ -25,7 +25,10 @@ pub(super) fn invalidate_caches() {
 
 /// Estimate the cost and row count for scanning a compressed partition.
 /// Returns (startup_cost, total_cost, estimated_rows).
-pub unsafe fn estimate_cost(companion_oid: pg_sys::Oid) -> (f64, f64, f64) {
+///
+/// When `workers > 0`, applies PG's parallel divisor to non-startup cost and
+/// row count so callers building a partial path see per-worker values.
+pub unsafe fn estimate_cost(companion_oid: pg_sys::Oid, workers: usize) -> (f64, f64, f64) {
     let (total_rows, segment_count) = get_partition_stats(companion_oid);
 
     let rows = if total_rows > 0 {
@@ -46,7 +49,21 @@ pub unsafe fn estimate_cost(companion_oid: pg_sys::Oid) -> (f64, f64, f64) {
     let per_row = 0.1;
     let total = startup + segs * per_segment + rows * per_row;
 
+    if workers > 0 {
+        let div = parallel_divisor(workers);
+        let non_startup = total - startup;
+        return (startup, startup + non_startup / div, rows / div);
+    }
+
     (startup, total, rows)
+}
+
+/// Mirror PG's `get_parallel_divisor` in `costsize.c`: workers contribute
+/// fully, leader contribution decays at 0.3/worker, clamped to ≥ 0.
+pub(crate) fn parallel_divisor(workers: usize) -> f64 {
+    let w = workers as f64;
+    let leader = (1.0 - 0.3 * w).max(0.0);
+    w + leader
 }
 
 /// Get partition stats from deltax_partition catalog.
@@ -110,6 +127,12 @@ pub(super) unsafe fn get_relpages(rel_oid: pg_sys::Oid) -> i32 {
 pub(super) fn get_row_count(companion_oid: pg_sys::Oid) -> Option<i64> {
     let (row_count, _) = get_partition_stats(companion_oid);
     if row_count > 0 { Some(row_count) } else { None }
+}
+
+/// Get the estimated segment count for a companion OID (0 if unknown).
+pub(super) fn get_segment_count(companion_oid: pg_sys::Oid) -> i64 {
+    let (_, segments) = get_partition_stats(companion_oid);
+    segments
 }
 
 /// Get per-column ndistinct for a companion OID from the catalog column

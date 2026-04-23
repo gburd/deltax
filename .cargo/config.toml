@@ -1,0 +1,11 @@
+# pgrx test harness produces a test binary that references Postgres server
+# symbols (PG_exception_stack, CurrentMemoryContext, etc.) which are
+# ordinarily resolved at runtime when the extension cdylib is loaded into
+# PG. Without telling the linker to defer unresolved symbols, `cargo pgrx
+# test` fails to link the test binary. Mirrors the linker args pgrx 0.17
+# generates for the cdylib target.
+[target.'cfg(target_os = "linux")']
+rustflags = ["-C", "link-args=-Wl,--unresolved-symbols=ignore-in-object-files"]
+
+[target.'cfg(target_os = "macos")']
+rustflags = ["-C", "link-args=-Wl,-undefined,dynamic_lookup"]

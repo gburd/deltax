@@ -34,9 +34,10 @@ make clean                            # Clean Docker volumes
 make bench-clickbench                 # Run Clickbench benchmark
 make bench-clickbench-keep            # Run Clickbench benchmark, keep container running
 make bench-rtabench                   # Run RTABench (plain PG vs pg_deltax) on a 250K-order subset
-make bench-rtabench-keep              # Same, but persist data volume + keep container for iteration
+make bench-rtabench-keep              # Wipe DB volume (not CSV cache), reload + recompress, keep container running
 make bench-rtabench-full              # RTABench with full 10M orders locally (slow, for parity with EC2)
-make bench-rtabench-clean             # Remove RTABench container, volume, and cached CSV slices
+make bench-rtabench-clean             # Remove RTABench container + PG volume (preserves CSV cache)
+make bench-rtabench-distclean         # Full wipe including the ~7 GB CSV cache (forces redownload)
 make bench-clean                      # Remove benchmark data volume
 make bench-all                        # Compare benchmarks with timescale
 ```
@@ -88,9 +89,9 @@ Full query-by-query analysis with plan breakdowns and root causes for slow queri
 
 Side-by-side plain-PG vs pg_deltax comparison on a sub-GB slice of the real dataset. Runs every query against both `order_events_plain` (plain PostgreSQL) and `order_events` (pg_deltax-managed, compressed) and requires result-set equality — so it doubles as a correctness test.
 
-1. `make bench-rtabench-keep` — first run downloads ~7 GB of upstream CSVs, slices to 250K orders (~4.6M events), loads both variants, runs 31 × 2 queries. ~5 min first time, ~1 min thereafter (data volume persists).
+1. `make bench-rtabench-keep` — wipes the previous PG volume, reloads data through the current extension code (so compression changes are exercised), and leaves the container up. First run downloads ~7 GB of upstream CSVs (one-time). Subsequent runs reuse the cache and take ~1–2 min.
 2. `docker exec -it pg_deltax_inttest psql -U postgres -d bench_rtabench` — poke at plans directly after the run.
-3. `make bench-rtabench-clean` — wipes container, data volume, and cached CSV slices.
+3. `make bench-rtabench-clean` — wipes the container + PG volume, keeps the CSV cache. `make bench-rtabench-distclean` also removes the CSV cache (forces ~7 GB redownload).
 
 Override `RTABENCH_ORDERS=<n>` to change the slice size (default 250,000; use `bench-rtabench-full` for all 10M).
 
@@ -147,6 +148,10 @@ Python-based (pytest + psycopg). Fixtures in `conftest.py` manage Docker contain
 ### Unit Tests
 
 Inline in Rust source files using `#[pg_test]` macros, run via pgrx test harness.
+
+Unit, integration, and clippy are supposed to always be clean. Even if you
+suspect the failures/warnings are pre-existing, work on fixing them, rather
+than ignoring them.
 
 ### Docker (`docker/`)
 

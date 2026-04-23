@@ -245,10 +245,13 @@ def _setup_bare_limit_table(db):
     keys = [(1000 + i, f"phrase-{i:02d}", 3 + (i % 5)) for i in range(20)]
 
     # Generate rows spanning 4 hours (= 4 partitions at 1h window).
+    # MOCK_NOW is noon, so deltax_create_table places partitions at
+    # 11:00–15:00 UTC. Offset from BASE_TS (midnight) by 11 h so every
+    # row lands in a real partition, not in `bare_limit_test_default`.
     values = []
     for uid, phrase, count in keys:
         for c in range(count):
-            hour = c % 4
+            hour = (c % 4) + 11
             values.append(
                 f"('{BASE_TS}'::timestamptz + interval '{hour} hours {c} seconds',"
                 f" {uid}, '{phrase}', {c})"
@@ -265,14 +268,28 @@ def _setup_bare_limit_table(db):
     )
     db.commit()
 
+    # Compress every partition that received data so DeltaXAgg is eligible.
+    # The earlier range predicate targeted 00:00–04:00 which, under the
+    # noon MOCK_NOW, matched no real partition — leaving all data
+    # uncompressed and defeating the F8 plan check.
     partitions = db.execute(
         "SELECT partition_name FROM deltax_partition_info('bare_limit_test') "
-        "WHERE range_start <= '2025-01-15 04:00:00+00'::timestamptz "
-        "AND range_end > '2025-01-15'::timestamptz"
+        "WHERE range_start < '2025-01-15 15:00:00+00'::timestamptz "
+        "AND range_end > '2025-01-15 11:00:00+00'::timestamptz"
     ).fetchall()
     for row in partitions:
-        db.execute(f"SELECT deltax_compress_partition('{row[0]}')")
+        cnt = db.execute(f'SELECT count(*) FROM "{row[0]}"').fetchone()[0]
+        if cnt > 0:
+            db.execute(f"SELECT deltax_compress_partition('{row[0]}')")
     db.commit()
+
+    # ANALYZE populates reltuples so collect_compressed_children() can
+    # treat empty uncompressed partitions (the future one + the default)
+    # as safe to skip instead of bailing out of DeltaXAgg/DeltaXAppend.
+    db.rollback()
+    db.autocommit = True
+    db.execute("ANALYZE bare_limit_test")
+    db.autocommit = False
 
     return {uid: (phrase, count) for uid, phrase, count in keys}
 

@@ -290,18 +290,57 @@ unsafe fn explain_timing(
         if (*es).analyze {
             let state_ptr = (*node).custom_ps as *const DecompressState;
             if !state_ptr.is_null() {
-                let t = &(*state_ptr).timing;
-                let total_ms = (t.metadata_us + t.heap_scan_us + t.decompress_us + t.batch_eval_us + t.emit_us)
+                let state = &*state_ptr;
+                let t = &state.timing;
+
+                // Aggregate leader + all worker slots for the top-line totals
+                // so EXPLAIN shows total work across the parallel group rather
+                // than just the leader's slice.
+                let mut metadata_us = t.metadata_us;
+                let mut heap_scan_us = t.heap_scan_us;
+                let mut decompress_us = t.decompress_us;
+                let mut batch_eval_us = t.batch_eval_us;
+                let mut emit_us = t.emit_us;
+                let mut segments_decompressed = t.segments_decompressed;
+                let mut segments_skipped = t.segments_skipped;
+                let mut segments_minmax_skipped = t.segments_minmax_skipped;
+                let mut segments_bloom_skipped = t.segments_bloom_skipped;
+                let mut phase2_skipped = t.phase2_skipped;
+                let mut rows_emitted = t.rows_emitted;
+                let mut rows_filtered = t.rows_filtered;
+                let mut rows_batch_filtered = t.rows_batch_filtered;
+                let mut compressed_bytes = t.compressed_bytes;
+                // Slot 0 is the leader; its counters are already in `t`.
+                // Skip it during aggregation to avoid double-counting.
+                for (slot_idx, s) in state.cached_worker_timings.iter().enumerate() {
+                    if slot_idx == 0 || s.populated == 0 { continue; }
+                    metadata_us += s.metadata_us;
+                    heap_scan_us += s.heap_scan_us;
+                    decompress_us += s.decompress_us;
+                    batch_eval_us += s.batch_eval_us;
+                    emit_us += s.emit_us;
+                    segments_decompressed += s.segments_decompressed;
+                    segments_skipped += s.segments_skipped;
+                    segments_minmax_skipped += s.segments_minmax_skipped;
+                    segments_bloom_skipped += s.segments_bloom_skipped;
+                    phase2_skipped += s.phase2_skipped;
+                    rows_emitted += s.rows_emitted;
+                    rows_filtered += s.rows_filtered;
+                    rows_batch_filtered += s.rows_batch_filtered;
+                    compressed_bytes += s.compressed_bytes;
+                }
+
+                let total_ms = (metadata_us + heap_scan_us + decompress_us + batch_eval_us + emit_us)
                     as f64 / 1000.0;
 
                 let timing_str = std::ffi::CString::new(format!(
                     "{:.3} ms (metadata={:.3} heap_scan={:.3} decompress={:.3} batch_eval={:.3} emit={:.3})",
                     total_ms,
-                    t.metadata_us as f64 / 1000.0,
-                    t.heap_scan_us as f64 / 1000.0,
-                    t.decompress_us as f64 / 1000.0,
-                    t.batch_eval_us as f64 / 1000.0,
-                    t.emit_us as f64 / 1000.0,
+                    metadata_us as f64 / 1000.0,
+                    heap_scan_us as f64 / 1000.0,
+                    decompress_us as f64 / 1000.0,
+                    batch_eval_us as f64 / 1000.0,
+                    emit_us as f64 / 1000.0,
                 ))
                 .unwrap();
                 pg_sys::ExplainPropertyText(
@@ -317,15 +356,15 @@ unsafe fn explain_timing(
                 };
                 let stats_str = std::ffi::CString::new(format!(
                     "segments={} segments_skipped={} segments_minmax_skipped={} segments_bloom_skipped={} phase2_skipped={} rows_out={} rows_filtered={} rows_batch_filtered={} compressed_bytes={}{}",
-                    t.segments_decompressed,
-                    t.segments_skipped,
-                    t.segments_minmax_skipped,
-                    t.segments_bloom_skipped,
-                    t.phase2_skipped,
-                    t.rows_emitted,
-                    t.rows_filtered,
-                    t.rows_batch_filtered,
-                    t.compressed_bytes,
+                    segments_decompressed,
+                    segments_skipped,
+                    segments_minmax_skipped,
+                    segments_bloom_skipped,
+                    phase2_skipped,
+                    rows_emitted,
+                    rows_filtered,
+                    rows_batch_filtered,
+                    compressed_bytes,
                     topn_str,
                 ))
                 .unwrap();
@@ -334,6 +373,35 @@ unsafe fn explain_timing(
                     stats_str.as_ptr(),
                     es,
                 );
+
+                // If this was a parallel partial scan, surface per-process
+                // segment counts + decompress timing for visibility into
+                // worker balance.
+                let verbose = (*es).verbose;
+                if !state.cached_worker_timings.is_empty() && verbose {
+                    for (idx, s) in state.cached_worker_timings.iter().enumerate() {
+                        if s.populated == 0 { continue; }
+                        let tag = if idx == 0 { "leader".to_string() } else { format!("worker{}", idx - 1) };
+                        let w_total_ms =
+                            (s.metadata_us + s.heap_scan_us + s.decompress_us + s.batch_eval_us + s.emit_us)
+                                as f64 / 1000.0;
+                        let line = std::ffi::CString::new(format!(
+                            "{} segs={} rows_out={} total={:.3}ms decompress={:.3}ms emit={:.3}ms",
+                            tag,
+                            s.segments_decompressed,
+                            s.rows_emitted,
+                            w_total_ms,
+                            s.decompress_us as f64 / 1000.0,
+                            s.emit_us as f64 / 1000.0,
+                        ))
+                        .unwrap();
+                        pg_sys::ExplainPropertyText(
+                            c"DeltaX Worker".as_ptr(),
+                            line.as_ptr(),
+                            es,
+                        );
+                    }
+                }
 
                 // Per-phase shared-buffer deltas. Custom scan work happens
                 // in BeginCustomScan, outside PG's node-level instrumentation,

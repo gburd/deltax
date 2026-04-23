@@ -1309,6 +1309,7 @@ fn handle_copy_from_file_sequential(
 /// When `is_csv` is true, the stripped `FORMAT deltax_compress_csv` option is
 /// replaced with `FORMAT csv` so PG's CSV parser handles quoting / escaping
 /// (used for files with embedded commas, e.g. jsonb columns).
+#[allow(clippy::too_many_arguments)]
 fn handle_copy_from_legacy(
     cs: &pg_sys::CopyStmt,
     format_idx: i32,

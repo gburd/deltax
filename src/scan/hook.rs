@@ -435,6 +435,30 @@ pub unsafe extern "C-unwind" fn deltax_set_rel_pathlist(
             };
             let append_multi_col = if append_topn_limit > 0 { multi_col_sort } else { false };
             path::add_deltax_append_path(root, rel, &companion_oids, std::ptr::null_mut(), append_topn_limit, sort_ascending, append_multi_col, append_sort_col_attno);
+
+            // Partial-path variant for PG parallel query. Top-N pushdown is
+            // suppressed because per-worker top-N would be incorrect without
+            // a Gather-Merge combiner.
+            if (*rel).consider_parallel && append_topn_limit == 0 {
+                let cap = crate::get_scan_parallel_workers();
+                if cap > 0 {
+                    let pg_cap = pg_sys::max_parallel_workers_per_gather;
+                    let per_scan_cap = cap.min(pg_cap);
+                    let total_segments: i64 = companion_oids.iter()
+                        .map(|&oid| cost::get_segment_count(oid))
+                        .sum();
+                    // Mirror PG's compute_parallel_worker(): don't spawn a
+                    // worker unless it has a meaningful amount of work.
+                    const MIN_SEGS_PER_WORKER: i64 = 8;
+                    let seg_floor = (total_segments / MIN_SEGS_PER_WORKER) as i32;
+                    let workers = per_scan_cap.min(seg_floor).max(0);
+                    if workers > 0 {
+                        path::add_partial_deltax_append_path(
+                            root, rel, &companion_oids, std::ptr::null_mut(), workers,
+                        );
+                    }
+                }
+            }
             return;
         }
 
@@ -1988,16 +2012,26 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
         let mut ndistinct_estimated_groups: Option<f64> = None;
         if !group_specs.is_empty() && group_by_relid != pg_sys::InvalidOid {
             let total_uncompressed_rows: f64 = companion_oids.iter()
-                .map(|&oid| { let (_, _, rows) = cost::estimate_cost(oid); rows })
+                .map(|&oid| { let (_, _, rows) = cost::estimate_cost(oid, 0); rows })
                 .sum();
 
             if total_uncompressed_rows > 0.0 {
+                // Merge per-partition ndistinct across partitions. Summing
+                // assumes disjoint key sets, but in time-series data the
+                // same entity keys (device_id, user_id, phrase, …) recur
+                // across every time partition — summing then inflates
+                // ndistinct and misfires the high-cardinality bail
+                // downstream. Take the max-across-partitions as a
+                // lower-bound-but-closer estimate, then cap by total row
+                // count as a hard upper bound.
+                let row_cap = total_uncompressed_rows as i64;
                 let mut merged_ndistinct: std::collections::HashMap<String, i64> =
                     std::collections::HashMap::new();
                 for &oid in &companion_oids {
                     let nd = cost::get_column_ndistinct(oid);
                     for (col, count) in nd {
-                        *merged_ndistinct.entry(col).or_insert(0) += count;
+                        let entry = merged_ndistinct.entry(col).or_insert(0);
+                        *entry = (*entry).max(count).min(row_cap);
                     }
                 }
 
@@ -2023,7 +2057,7 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                 let n_workers = crate::get_parallel_workers();
                 if has_text_group && has_where && n_workers <= 1 {
                     let estimated_rows = (*input_rel).rows;
-                    let few_rows = estimated_rows < total_uncompressed_rows as f64 * 0.05;
+                    let few_rows = estimated_rows < total_uncompressed_rows * 0.05;
                     let has_high_card_text = group_specs.iter().any(|gs| {
                         if !matches!(gs.expr, GroupByExpr::Column) {
                             return false;

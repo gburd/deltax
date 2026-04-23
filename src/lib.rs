@@ -27,6 +27,9 @@ pub(crate) static PARALLEL_REGEX: GucSetting<bool> = GucSetting::<bool>::new(tru
 
 pub(crate) static BLOOM_FILTERS: GucSetting<bool> = GucSetting::<bool>::new(true);
 
+pub(crate) static MAX_PARALLEL_WORKERS_PER_SCAN: GucSetting<i32> =
+    GucSetting::<i32>::new(-1);
+
 /// Resolve the effective number of parallel workers.
 /// 0 = auto (num_cpus, capped at 16), 1 = single-threaded, 2..=64 = explicit.
 pub(crate) fn get_parallel_workers() -> usize {
@@ -35,6 +38,17 @@ pub(crate) fn get_parallel_workers() -> usize {
         num_cpus::get().min(16)
     } else {
         (v as usize).min(64)
+    }
+}
+
+/// Resolve the effective per-scan PG-worker cap for DeltaXAppend partial paths.
+/// -1 = follow `max_parallel_workers_per_gather`, 0 = disabled, N = explicit cap.
+pub(crate) fn get_scan_parallel_workers() -> i32 {
+    let v = MAX_PARALLEL_WORKERS_PER_SCAN.get();
+    if v < 0 {
+        unsafe { pg_sys::max_parallel_workers_per_gather }
+    } else {
+        v
     }
 }
 
@@ -113,6 +127,16 @@ pub extern "C-unwind" fn _PG_init() {
         c"Build per-segment bloom filters during compression for equality predicate pushdown",
         c"When ON, bloom filters are built during compression and used to skip segments during scans. Size is proportional to column cardinality (~2-5% storage overhead).",
         &BLOOM_FILTERS,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_int_guc(
+        c"pg_deltax.max_parallel_workers_per_scan",
+        c"Max PG parallel workers for DeltaXAppend partial paths (-1=follow max_parallel_workers_per_gather, 0=disabled)",
+        c"-1 (default) follows max_parallel_workers_per_gather. 0 disables the partial-path variant (scans run serially). 1..=64 caps the worker count explicitly.",
+        &MAX_PARALLEL_WORKERS_PER_SCAN,
+        -1,
+        64,
         GucContext::Userset,
         GucFlags::default(),
     );
