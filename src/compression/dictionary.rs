@@ -158,6 +158,45 @@ pub fn decode_to_slices(data: &[u8], count: usize) -> Vec<&str> {
     values
 }
 
+/// Byte-level variant of `parse_header` that does NOT validate UTF-8.
+/// Used for jsonb columns where the stored dictionary entries are binary
+/// jsonb varlena payloads, not UTF-8 text.
+pub fn parse_header_bytes(data: &[u8]) -> (Vec<&[u8]>, usize, u8) {
+    let mut offset = 0;
+    let dict_size = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+    offset += 4;
+
+    let index_width = data[offset];
+    offset += 1;
+
+    // skip empty_string_idx (2 bytes) — unused for binary blobs
+    offset += 2;
+
+    let mut dict: Vec<&[u8]> = Vec::with_capacity(dict_size);
+    for _ in 0..dict_size {
+        let str_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+        offset += 4;
+        dict.push(&data[offset..offset + str_len]);
+        offset += str_len;
+    }
+    (dict, offset, index_width)
+}
+
+/// Byte-level variant of `decode_to_slices` — returns `&[u8]` instead of `&str`.
+/// Skips UTF-8 validation so it works for jsonb (binary) payloads.
+pub fn decode_to_byte_slices(data: &[u8], count: usize) -> Vec<&[u8]> {
+    if count == 0 {
+        return Vec::new();
+    }
+    let (dict, indices_start, index_width) = parse_header_bytes(data);
+    let mut values = Vec::with_capacity(count);
+    for i in 0..count {
+        let idx = read_index(data, indices_start, index_width, i);
+        values.push(dict[idx as usize]);
+    }
+    values
+}
+
 /// Decode dictionary-encoded data, returning the dictionary entries and per-row indices separately.
 /// This allows matching against only the dictionary entries (e.g. for LIKE filtering)
 /// instead of resolving every row.

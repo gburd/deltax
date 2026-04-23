@@ -46,6 +46,9 @@ def pg_container():
         "--name", CONTAINER_NAME,
         "-p", f"{HOST_PORT}:5432",
         "-e", f"POSTGRES_PASSWORD={PG_PASSWORD}",
+        # Docker's default /dev/shm is 64MB — too small for parallel hash
+        # joins on mid-size data (Q17 on rtabench fails without this).
+        "--shm-size=1g",
     ]
     if persist:
         cmd += ["-v", f"{BENCH_VOLUME}:/var/lib/postgresql/data"]

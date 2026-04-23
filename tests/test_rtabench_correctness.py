@@ -374,6 +374,59 @@ def test_rtabench_query_matches_plain_postgres(rtabench_db, name, sql):
         pytest.fail("\n".join(msg))
 
 
+def test_jsonb_scan_low_cardinality_dict_encoding(db):
+    """Regression test: jsonb payloads with low cardinality pick the Dictionary
+    compression codec at flush time, whose decode path previously validated
+    UTF-8 and panicked on binary jsonb bytes. Exercises the byte-level
+    dictionary decode."""
+    db.execute("SET pg_deltax.mock_now = '2024-01-01 00:00:00+00'")
+    db.execute(
+        "CREATE TABLE je (ts timestamptz NOT NULL, payload jsonb NOT NULL)"
+    )
+    db.execute("SELECT deltax_create_table('je', 'ts', '1 day'::interval, 5)")
+    db.execute(
+        "SELECT deltax_enable_compression('je', "
+        "order_by => ARRAY['ts'], segment_size => 200)"
+    )
+    db.commit()
+
+    # 500 rows, only 3 distinct jsonb values → cardinality is 3, well under
+    # segment_size/2 → pg_deltax picks the Dictionary codec at flush time.
+    payloads = [
+        '{"terminal": "Berlin", "lane": 3}',
+        '{"terminal": "Hamburg", "lane": 7}',
+        '{"terminal": "Munich", "lane": 1}',
+    ]
+    rows = []
+    for i in range(500):
+        rows.append(f"2024-01-01T00:{i // 60:02d}:{i % 60:02d}+00\t{payloads[i % 3]}")
+    data = "\n".join(rows) + "\n"
+    with db.cursor() as cur:
+        with cur.copy("COPY je FROM STDIN WITH (FORMAT deltax_compress)") as cp:
+            cp.write(data.encode())
+    db.commit()
+
+    # Confirm dict codec really was chosen by checking the meta table exists
+    # (any compression would create one; we can't easily read which codec was
+    # chosen, but the scan test below is the real regression guard).
+    db.execute("ANALYZE je")
+    db.commit()
+
+    # Sanity: SELECT the raw jsonb column back — exercises decompress +
+    # varlena construction for the jsonb column, which is the UTF-8 panic
+    # site for the Dictionary codec.
+    rows = db.execute(
+        "SELECT payload->>'terminal', count(*) FROM je GROUP BY 1 ORDER BY 1"
+    ).fetchall()
+    assert rows == [("Berlin", 167), ("Hamburg", 167), ("Munich", 166)], rows
+
+    # Also exercise containment (uses full binary jsonb, not the text-extract path):
+    cnt = db.execute(
+        "SELECT count(*) FROM je WHERE payload @> '{\"lane\": 3}'"
+    ).fetchone()[0]
+    assert cnt == 167
+
+
 def test_compression_actually_happened(rtabench_db):
     """Sanity check: the test exercises compressed segments, not a
     pass-through fallback. If this breaks, the other tests are

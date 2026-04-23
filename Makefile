@@ -12,6 +12,7 @@ VENV         = .venv
 .PHONY: dev-image image image-fresh test build clippy coverage coverage-all run psql cargo clean \
        integration-test \
        bench-clickbench bench-clickbench-keep bench-clickbench-full bench-clean \
+       bench-rtabench bench-rtabench-keep bench-rtabench-full bench-rtabench-clean \
        bench-timescaledb bench-compare bench-all \
        run-sql run-sql-file logs logs-all logs-follow
 
@@ -197,6 +198,27 @@ bench-clickbench-keep: $(VENV)/.stamp image
 # Remove benchmark containers
 bench-clean:
 	docker volume rm pg_deltax_bench_pgdata 2>/dev/null || true
+
+# RTABench local (Docker) — plain PG vs pg_deltax head-to-head on a
+# sub-GB slice of the real dataset, with per-query correctness checks.
+bench-rtabench: $(VENV)/.stamp image
+	PG_DELTAX_IMAGE=pg_deltax:pg$(PG_MAJOR) $(VENV)/bin/pytest tests/bench_rtabench.py -v -s
+
+bench-rtabench-full: $(VENV)/.stamp image
+	PG_DELTAX_IMAGE=pg_deltax:pg$(PG_MAJOR) RTABENCH_ORDERS=10010342 $(VENV)/bin/pytest tests/bench_rtabench.py -v -s
+
+# Same as bench-rtabench but persists the data volume and leaves the
+# container up so the next `bench-rtabench-keep` run skips the load and
+# you can `docker exec -it pg_deltax_inttest psql -U postgres` afterward.
+bench-rtabench-keep: $(VENV)/.stamp image
+	PG_DELTAX_IMAGE=pg_deltax:pg$(PG_MAJOR) KEEP_CONTAINER=1 BENCH_PERSIST=1 \
+		$(VENV)/bin/pytest tests/bench_rtabench.py -v -s
+
+# Wipe the container, persistent data volume, and cached CSV slices.
+bench-rtabench-clean:
+	-docker rm -f pg_deltax_inttest 2>/dev/null
+	-docker volume rm pg_deltax_bench_pgdata 2>/dev/null
+	rm -rf tests/.data/rtabench
 
 bench-timescaledb: $(VENV)/.stamp
 	TSDB_VARIANT=tsl $(VENV)/bin/pytest tests/bench_clickbench_timescaledb.py -v -s

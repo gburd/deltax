@@ -2,3 +2,11 @@ target/
 .git/
 *.md
 .DS_Store
+# Benchmark result JSONs and cached datasets (can be 10s of GB for rtabench).
+tests/.bench_results/
+tests/.data/
+# Local bench + test venvs.
+.venv/
+coverage/
+rtabench/results/
+clickbench/results/

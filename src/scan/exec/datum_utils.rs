@@ -232,11 +232,13 @@ unsafe fn decode_compressed_datums(
             } else {
                 cc.data
             };
-            let slices = compression::dictionary::decode_to_slices(dict_data, non_null_count);
             if type_oid == pg_sys::JSONBOID {
-                let byte_slices: Vec<&[u8]> = slices.iter().map(|s| s.as_bytes()).collect();
+                // Skip UTF-8 validation — stored dictionary entries are binary
+                // jsonb varlena payloads, not UTF-8 text.
+                let byte_slices = compression::dictionary::decode_to_byte_slices(dict_data, non_null_count);
                 unsafe { byte_slices_to_jsonb_datums_arena(&byte_slices) }
             } else {
+                let slices = compression::dictionary::decode_to_slices(dict_data, non_null_count);
                 unsafe { str_slices_to_text_datums_arena(&slices, type_oid, typmod) }
             }
         }
