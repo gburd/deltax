@@ -33,6 +33,10 @@ make cargo CMD="<cmd>"                # Run arbitrary cargo command in dev conta
 make clean                            # Clean Docker volumes
 make bench-clickbench                 # Run Clickbench benchmark
 make bench-clickbench-keep            # Run Clickbench benchmark, keep container running
+make bench-rtabench                   # Run RTABench (plain PG vs pg_deltax) on a 250K-order subset
+make bench-rtabench-keep              # Same, but persist data volume + keep container for iteration
+make bench-rtabench-full              # RTABench with full 10M orders locally (slow, for parity with EC2)
+make bench-rtabench-clean             # Remove RTABench container, volume, and cached CSV slices
 make bench-clean                      # Remove benchmark data volume
 make bench-all                        # Compare benchmarks with timescale
 ```
@@ -73,6 +77,51 @@ make -C clickbench ssh EC2=<ip>
 ```
 
 Results are saved to `clickbench/results/pg_deltax.json` and archived by timestamp+commit in `clickbench/results/history/`.
+
+### RTABench Workflow
+
+[RTABench](https://rtabench.com) is a real-time-analytics benchmark built on a normalized 5-table schema (customers, products, orders, order_items, order_events) — a counterpoint to ClickBench's single wide denormalized table. 31 raw queries; pg_deltax only targets those (the 10 pre-aggregated `1000_*` queries rely on TimescaleDB continuous aggregates and are intentionally skipped).
+
+Full query-by-query analysis with plan breakdowns and root causes for slow queries lives in `dev/docs/RTABENCH_QUERY_ANALYSIS.md`. RTABench queries are counted starting with 00 (filenames are `00NN_<name>.sql`).
+
+#### Local RTABench (Docker)
+
+Side-by-side plain-PG vs pg_deltax comparison on a sub-GB slice of the real dataset. Runs every query against both `order_events_plain` (plain PostgreSQL) and `order_events` (pg_deltax-managed, compressed) and requires result-set equality — so it doubles as a correctness test.
+
+1. `make bench-rtabench-keep` — first run downloads ~7 GB of upstream CSVs, slices to 250K orders (~4.6M events), loads both variants, runs 31 × 2 queries. ~5 min first time, ~1 min thereafter (data volume persists).
+2. `docker exec -it pg_deltax_inttest psql -U postgres -d bench_rtabench` — poke at plans directly after the run.
+3. `make bench-rtabench-clean` — wipes container, data volume, and cached CSV slices.
+
+Override `RTABENCH_ORDERS=<n>` to change the slice size (default 250,000; use `bench-rtabench-full` for all 10M).
+
+Results go to `tests/.bench_results/rtabench_pg_deltax.json` (latest) + `.bench_results/history/<TS>_<commit>/`.
+
+#### Full RTABench (EC2)
+
+Runs from `rtabench/Makefile` against a remote EC2 instance with the complete dataset (~181M events). Ask the user for the EC2 IP rather than launching a new instance.
+
+```bash
+# First-time setup (installs PG18, Rust, pgrx, builds extension, loads + compresses data)
+make -C rtabench setup EC2=<ip>
+
+# Iterating on code changes
+make -C rtabench deploy EC2=<ip>          # rsync source, recompile, restart PG
+make -C rtabench bench EC2=<ip>           # run all 31 queries (3x each), generate comparison HTML
+make -C rtabench report                   # regenerate HTML from existing results
+
+# Investigating specific queries (zero-padded number; Q=10 → queries/0010_*.sql)
+make -C rtabench query EC2=<ip> Q=17
+make -C rtabench query-cold EC2=<ip> Q=17 # restart PG + drop OS caches first
+
+# Ad-hoc
+make -C rtabench sql EC2=<ip> SQL="SHOW work_mem"
+make -C rtabench psql EC2=<ip>
+
+# Comparison HTML — pulls competitor results from rtabench.com
+make -C rtabench fetch-competitors        # one-time: drops Postgres/TimescaleDB/ClickHouse/... JSONs under ~/src/rtabench/<system>/results/
+```
+
+`make bench` saves `rtabench/results/pg_deltax.json`, archives by timestamp+commit in `rtabench/results/history/`, copies the JSON to `~/src/rtabench/pg_deltax/results/c6a.4xlarge.json` (ClickBench-style mirror layout), and generates `~/src/rtabench/index.html` with every system as a comparison column.
 
 If you need to reference pgrx source code, it is in ~/src/pgrx.
 If you need to reference the postgres source code, is in ~/src/postgres.
