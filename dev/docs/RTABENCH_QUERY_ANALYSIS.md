@@ -4,6 +4,14 @@ Per-query analysis of pg_deltax on the 31 raw RTABench queries, based on
 `EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS)` of every query on a warm
 cache. Raw plans live in `rtabench_explain_raw.txt`.
 
+## Status (2026-04-23)
+
+Originally captured against a serial-only `DeltaXAppend`. The table below
+(and the category analysis that follows) reflects that state and is
+preserved as the problem description. A later pass implemented the P0
+parallel-safe fix — see **§5 Progress** at the bottom for the current
+numbers and which items are done.
+
 ## Setup
 
 - **Hardware**: `c6a.4xlarge` (16 vCPU, 32 GB RAM, 500 GB gp2 EBS).
@@ -301,16 +309,96 @@ issue — TimescaleDB shows similar cold/warm ratios.
 
 ## 4 · Recommendations, priority-ordered
 
-| Priority | Fix | Est. suite impact |
-|---|---|---|
-| P0 | Make `DeltaXAppend`/`DeltaXAgg` parallel-safe | **-60 s** on Q17/Q23/Q25/Q30 + broad gains |
-| P0 | Filter-selectivity in DeltaXAppend cost estimator | **-15 s** (join-side-choice on Q17 class) |
-| P1 | Metadata-only fast path for global min/max/sum/count (DeltaXAgg) | **-700 ms** (Q02, also Q06 pattern) |
-| P2 | Trim column-blob decompress set to referenced columns only | helps Q15 (EXISTS) and any narrow-projection query |
-| P2 | Partition-level `order_id` min/max pruning hook | 5–7× on Q07, Q09–Q13 |
-| P3 | EXISTS short-circuit in `DeltaXAppend` executor | Q15 specifically |
+| Priority | Fix | Status | Est. suite impact |
+|---|---|---|---|
+| P0 | Make `DeltaXAppend` parallel-safe (partial-path + DSM cursor) | **✓ done** (2026-04) | **−49 s** realized on Q17/Q23/Q25/Q30 |
+| P0 | Filter-selectivity in DeltaXAppend cost estimator | open — attempted hook-level gate reverted (see §5.3) | **−15 s** remaining + fixes small-query regressions in §5.3 |
+| P0 | `DeltaXAgg` parallel-safe | open | unknown — likely helps Cat H queries |
+| P1 | Metadata-only fast path for global min/max/sum/count (DeltaXAgg) | open | **−700 ms** (Q02, also Q06 pattern) |
+| P2 | Trim column-blob decompress set to referenced columns only | open | helps Q15 (EXISTS) and any narrow-projection query |
+| P2 | Partition-level `order_id` min/max pruning hook | open | 5–7× on Q07, Q09–Q13 |
+| P3 | EXISTS short-circuit in `DeltaXAppend` executor | open | Q15 specifically |
 
 Fixing the top two alone should halve the total suite time and bring us
 to within spitting distance of TimescaleDB on the join-heavy queries;
 all four top fixes together would put pg_deltax clearly ahead on the 31
 raw queries.
+
+## 5 · Progress (2026-04)
+
+### 5.1 · P0 — Parallel-aware `DeltaXAppend` (done)
+
+Shipped a partial-path variant of `DeltaXAppend` gated on a new GUC
+`pg_deltax.max_parallel_workers_per_scan` (default `-1` = follow
+`max_parallel_workers_per_gather`, `0` = disabled). Work is split at
+segment granularity via a shared atomic cursor in DSM; per-worker
+timings are surfaced in EXPLAIN as `DeltaX Worker` lines. Top-N
+pushdown stays on the serial path. See the plan file at
+`~/.claude/plans/we-re-working-on-improving-gentle-reef.md` for the
+design.
+
+### 5.2 · Category A results (EC2, warm, c6a.4xlarge, 181M events)
+
+| Query | Before | After | Speedup |
+|---|---:|---:|---:|
+| Q17 `top_selling_month_product` | 25.41 s | **8.59 s** | 3.0× |
+| Q23 `top_sales_volume_product_from_terminal` | 23.71 s | **8.74 s** | 2.7× |
+| Q25 `product_category_performance` | 13.13 s | **1.64 s** | **8.0×** |
+| Q30 `customers_with_most_orders_delivered` | 10.77 s | **4.61 s** | 2.3× |
+| **Subtotal (Category A)** | **73.0 s** | **23.6 s** | **3.1×** |
+
+Total suite warm dropped from **128.6 s → ≈ 46 s**. Category C queries
+(Q19, Q20, Q27) also improved as a side effect — DeltaXAppend is no
+longer a serial inversion point above what's already a parallel plan.
+
+### 5.3 · Secondary regressions on small queries (accepted)
+
+Rollout exposed the cost-estimator blind spot on selective queries.
+With the partial path available, PG chose `Gather ×8` over
+DeltaXAppend for **point lookups** (Q07, Q09–Q13) and **selective
+filters** (Q15), because the path's row estimate doesn't account for
+WHERE-clause or segment-level pruning. Each of the 8 workers then
+re-scanned segment metadata (~2 s each) before the shared cursor
+handed one segment to one worker, so Q15 ballooned to ~18 s
+(aggregated heap_scan across workers).
+
+Attempted fix: gate partial-path emission on
+`clauselist_selectivity(child_rel->baserestrictinfo)` multiplied by the
+true companion row count (we know it from the `deltax_partition`
+catalog; `pg_class.reltuples` on the child is always 0 because
+compression empties the heap). **This didn't work**: since compressed
+children never got ANALYZE, PG falls back to default equality
+selectivity (0.005 for numeric, ~2.5e-5 observed for text-equality on
+the `event_type` column). That mis-classified Q17's `event_type='Delivered'`
++ one-month time range as `filtered_rows = 370`, suppressing its
+Gather — the 3× suite-level win collapsed back to serial.
+
+Accepted tradeoff for now: the regressions on small queries are small
+in absolute terms (total ~1 s across the affected queries on EC2 warm)
+compared to the 49 s saved on Category A. The path forward is the
+real P0 #2 work (below) rather than more hook-level heuristics.
+
+| Query | Baseline | After parallel-safe | Regression | Note |
+|---|---:|---:|---:|---|
+| Q07 point lookup | 12 ms | 80 ms | +68 ms | 8 workers race for 3 surviving segments |
+| Q11 events_for_an_order | 5 ms | 14 ms | +9 ms | idem |
+| Q12 max_satisfaction | 15 ms | 72 ms | +57 ms | idem |
+| Q13 satisfaction_with_without_backup | 13 ms | 81 ms | +68 ms | idem |
+| Q15 EXISTS (customer_id=124) | 435 ms | 1.36 s | +925 ms | 9× metadata duplication (1 of 55K segments survives) |
+
+### 5.4 · P0 #2 — Filter-selectivity in cost estimator (open)
+
+The broader cost-estimator bug — DeltaXAppend reports `rows=14.8M`
+when actual is `602K` because the `event_type='Delivered'` filter
+isn't in the estimator — still stands and would also close the
+regressions in 5.3. Properly wiring segment-level bloom + min/max
+selectivity into `src/scan/cost.rs::estimate_cost` would let the
+planner see tiny row counts for point lookups (so it picks serial
+on cost, no gate needed) **and** accurate row counts for Category A
+queries (so it picks the correct join-side hash). ANALYZE-side fix:
+populate `pg_statistic` for compressed children from our per-segment
+colstats so PG's default-selectivity fallback doesn't kick in.
+
+Together with partition-level `order_id` min/max pruning (P2) this
+should close the point-lookup regressions entirely.
+

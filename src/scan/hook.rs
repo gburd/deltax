@@ -439,6 +439,20 @@ pub unsafe extern "C-unwind" fn deltax_set_rel_pathlist(
             // Partial-path variant for PG parallel query. Top-N pushdown is
             // suppressed because per-worker top-N would be incorrect without
             // a Gather-Merge combiner.
+            //
+            // Selective queries (point lookups, EXISTS) still go through
+            // the partial path. An attempt to gate on PG's
+            // `clauselist_selectivity` was removed because selectivity
+            // estimates on compressed children are unreliable: after
+            // `deltax_compress_partition` the partition's
+            // `pg_class.reltuples` is 0, so ANALYZE never collects stats
+            // and PG falls back to equality default 0.005 (or worse for
+            // text equality — 2.5e-5 observed). That mis-classified Q17's
+            // `event_type='Delivered'` + time-range filter as returning
+            // ~370 rows and suppressed its Gather. Until the cost model
+            // wires segment-level bloom/min-max selectivity in, we accept
+            // the small absolute regression on point lookups in exchange
+            // for keeping Q17/Q23/Q25/Q30 parallel.
             if (*rel).consider_parallel && append_topn_limit == 0 {
                 let cap = crate::get_scan_parallel_workers();
                 if cap > 0 {
