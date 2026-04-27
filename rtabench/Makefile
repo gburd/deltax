@@ -79,7 +79,7 @@ setup:
 	rsync -az -e "ssh -i $(EC2_KEY) -o StrictHostKeyChecking=no" \
 		$(CURDIR)/ $(EC2_USER)@$(EC2):~/rtabench/
 	@echo "=== Running benchmark.sh (this takes a while) ==="
-	$(EC2_SSH) 'cd ~/rtabench && bash benchmark.sh'
+	$(EC2_SSH) "cd ~/rtabench && SEGMENT_SIZE='$(SEGMENT_SIZE)' bash benchmark.sh"
 
 # Sync source + rtabench scripts, recompile extension, restart PostgreSQL
 deploy:

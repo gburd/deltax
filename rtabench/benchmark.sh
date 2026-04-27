@@ -85,8 +85,11 @@ sudo -u postgres psql "$DB" -t -c \
 # Enable compression before loading (required for direct backfill).
 # order_by mirrors the TimescaleDB baseline and matches the dominant query
 # pattern (point lookups + short scans by order_id within a time window).
+# SEGMENT_SIZE is overridable to allow sweeping (e.g. 1000, 10000, 30000).
+SEGMENT_SIZE="${SEGMENT_SIZE:-30000}"
+echo "Using segment_size=$SEGMENT_SIZE"
 sudo -u postgres psql "$DB" -t -c \
-    "SELECT deltax_enable_compression('order_events', order_by => ARRAY['order_id','event_created'], segment_size => 30000)"
+    "SELECT deltax_enable_compression('order_events', order_by => ARRAY['order_id','event_created'], segment_size => $SEGMENT_SIZE)"
 
 # Load dimension / small tables via plain COPY
 LOAD_START=$(date +%s)
