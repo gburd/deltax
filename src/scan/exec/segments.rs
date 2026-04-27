@@ -81,6 +81,184 @@ pub(super) fn segment_passes_minmax_filter(
     }
 }
 
+/// Look up the per-partition btree index on `(_col_idx, _min, _max)` and
+/// compute the set of segment_ids whose stored [_min, _max] range covers
+/// every queried equality value. Returns `None` if the index isn't present
+/// (older partition compressed before the index was added) or the table
+/// can't be opened — caller falls back to the regular colstats scan.
+///
+/// `filters` is the list of `(col_idx, value_i64)` equality predicates,
+/// already encoded with the same `encode_datum_to_i64` rule used to populate
+/// `_min` / `_max` at compression time.
+unsafe fn lookup_segments_by_minmax_index(
+    colstats_oid: pg_sys::Oid,
+    filters: &[(i16, i64)],
+) -> Option<std::collections::HashSet<i32>> {
+    if filters.is_empty() {
+        return None;
+    }
+    unsafe {
+        let cs_rel = pg_sys::table_open(
+            colstats_oid,
+            pg_sys::AccessShareLock as pg_sys::LOCKMODE,
+        );
+
+        // Find the btree on (_col_idx, _min, _max). Skip the PK
+        // (`indisprimary == true`, on (_col_idx, _segment_id)).
+        let mut minmax_idx_oid = pg_sys::InvalidOid;
+        let index_list = pg_sys::RelationGetIndexList(cs_rel);
+        if !index_list.is_null() {
+            let n = (*index_list).length;
+            for i in 0..n {
+                let idx_oid = (*(*index_list).elements.add(i as usize)).oid_value;
+                let idx_rel = pg_sys::index_open(
+                    idx_oid,
+                    pg_sys::AccessShareLock as pg_sys::LOCKMODE,
+                );
+                let info = (*idx_rel).rd_index;
+                let is_target = if !info.is_null() {
+                    let is_primary = (*info).indisprimary;
+                    let nkeys = (*info).indnkeyatts as usize;
+                    // Read the indkey attribute numbers; key 1 = _col_idx (1),
+                    // key 2 = _min (3), key 3 = _max (4) — values are 1-based
+                    // attnums on the colstats table.
+                    if !is_primary && nkeys >= 3 {
+                        let indkey =
+                            (*info).indkey.values.as_ptr();
+                        *indkey.add(0) == 1
+                            && *indkey.add(1) == 3
+                            && *indkey.add(2) == 4
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                pg_sys::index_close(
+                    idx_rel,
+                    pg_sys::AccessShareLock as pg_sys::LOCKMODE,
+                );
+                if is_target {
+                    minmax_idx_oid = idx_oid;
+                    break;
+                }
+            }
+            pg_sys::list_free(index_list);
+        }
+
+        if minmax_idx_oid == pg_sys::InvalidOid {
+            pg_sys::table_close(cs_rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+            return None;
+        }
+
+        // Find the _segment_id and _max attribute positions on the heap.
+        let cs_tupdesc = (*cs_rel).rd_att;
+        let cs_natts = (*cs_tupdesc).natts as usize;
+        let mut sid_att: Option<usize> = None;
+        let mut max_att: Option<usize> = None;
+        for i in 0..cs_natts {
+            let att = &*tupdesc_get_attr(cs_tupdesc, i);
+            if att.attisdropped {
+                continue;
+            }
+            let name = std::ffi::CStr::from_ptr(att.attname.data.as_ptr())
+                .to_string_lossy();
+            if name == "_segment_id" {
+                sid_att = Some(i);
+            } else if name == "_max" {
+                max_att = Some(i);
+            }
+        }
+        let (Some(sid_att), Some(max_att)) = (sid_att, max_att) else {
+            pg_sys::table_close(cs_rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+            return None;
+        };
+
+        let snapshot = pg_sys::GetActiveSnapshot();
+        let idx_rel = pg_sys::index_open(
+            minmax_idx_oid,
+            pg_sys::AccessShareLock as pg_sys::LOCKMODE,
+        );
+        let slot = pg_sys::table_slot_create(cs_rel, std::ptr::null_mut());
+
+        // Per-filter candidate set; intersect across filters at the end.
+        let mut combined: Option<std::collections::HashSet<i32>> = None;
+
+        for &(col_idx, value) in filters {
+            let mut skey = [pg_sys::ScanKeyData::default(); 2];
+            // _col_idx = col_idx
+            pg_sys::ScanKeyInit(
+                &mut skey[0],
+                1,
+                pg_sys::BTEqualStrategyNumber as u16,
+                pg_sys::F_INT2EQ.into(),
+                pg_sys::Datum::from(col_idx),
+            );
+            // _min <= value (BTLessEqualStrategyNumber on attnum 2 = _min)
+            pg_sys::ScanKeyInit(
+                &mut skey[1],
+                2,
+                pg_sys::BTLessEqualStrategyNumber as u16,
+                pg_sys::F_INT8LE.into(),
+                pg_sys::Datum::from(value as usize),
+            );
+
+            #[cfg(any(feature = "pg14", feature = "pg15", feature = "pg16", feature = "pg17"))]
+            let scan = pg_sys::index_beginscan(cs_rel, idx_rel, snapshot, 2, 0);
+            #[cfg(feature = "pg18")]
+            let scan = pg_sys::index_beginscan(
+                cs_rel,
+                idx_rel,
+                snapshot,
+                std::ptr::null_mut(),
+                2,
+                0,
+            );
+            pg_sys::index_rescan(scan, skey.as_mut_ptr(), 2, std::ptr::null_mut(), 0);
+
+            let mut this: std::collections::HashSet<i32> = std::collections::HashSet::new();
+            loop {
+                if !pg_sys::index_getnext_slot(
+                    scan,
+                    pg_sys::ScanDirection::ForwardScanDirection,
+                    slot,
+                ) {
+                    break;
+                }
+                pg_sys::slot_getallattrs(slot);
+                let tts_values = (*slot).tts_values;
+                let tts_isnull = (*slot).tts_isnull;
+                if *tts_isnull.add(sid_att) || *tts_isnull.add(max_att) {
+                    continue;
+                }
+                // Post-filter: _max >= value.
+                let max_v = (*tts_values.add(max_att)).value() as i64;
+                if max_v < value {
+                    continue;
+                }
+                let seg_id = (*tts_values.add(sid_att)).value() as i32;
+                this.insert(seg_id);
+            }
+            pg_sys::index_endscan(scan);
+
+            combined = Some(match combined.take() {
+                None => this,
+                Some(prev) => prev.intersection(&this).copied().collect(),
+            });
+            // Early-exit if intersection is already empty.
+            if combined.as_ref().is_some_and(|s| s.is_empty()) {
+                break;
+            }
+        }
+
+        pg_sys::ExecDropSingleTupleTableSlot(slot);
+        pg_sys::index_close(idx_rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+        pg_sys::table_close(cs_rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+
+        combined
+    }
+}
+
 /// Encode a pg_sys::Datum to i64 for the given type OID, matching the order-preserving
 /// encoding used in the colstats table.
 ///
@@ -1223,6 +1401,48 @@ pub(super) unsafe fn load_segments_heap(
                         has_oid,
                     );
                 });
+
+                // Indexed minmax pruning: when every column we need from
+                // colstats is the target of an equality minmax filter (the
+                // common point-lookup shape), use the per-partition btree on
+                // `(_col_idx, _min, _max)` to compute the surviving seg_ids
+                // directly. Skips iterating ~all colstats rows on the slow
+                // PK-scan path (heap_scan: ~30 ms → ~1 ms for queries like
+                // `WHERE order_id = N`). Mirrors TimescaleDB's
+                // `compress_hyper_*__ts_meta_min_*__ts_meta_max_*__t_idx`.
+                let eq_filter_cols: Vec<(i16, i64)> = cs_minmax_filters
+                    .iter()
+                    .filter(|f| matches!(f.op, BatchCompareOp::Eq))
+                    .map(|f| (f.col_idx, f.const_i64))
+                    .collect();
+                let all_needed_are_eq_filters = !eq_filter_cols.is_empty()
+                    && needed_col_idxs.len() == eq_filter_cols.len()
+                    && eq_filter_cols
+                        .iter()
+                        .all(|(ci, _)| needed_col_idxs.contains(ci));
+                if all_needed_are_eq_filters
+                    && let Some(survivors) = lookup_segments_by_minmax_index(
+                        colstats_oid,
+                        &eq_filter_cols,
+                    )
+                {
+                    // Mark every seg_id NOT in the survivor set as pruned.
+                    for &sid in &surviving_segment_ids {
+                        if !cs_pruned_ids.contains(&sid)
+                            && !survivors.contains(&sid)
+                        {
+                            cs_pruned_ids.insert(sid);
+                            segments_minmax_skipped += 1;
+                        }
+                    }
+                    // Bypass the colstats heap scan — we already have every
+                    // seg_id we need, and the caller didn't ask for cached
+                    // min/max or sums (load_minmax false + empty
+                    // needed_minmax_cols / needed_stats_cols is implied by
+                    // needed_col_idxs == filter cols).
+                    needed_col_idxs.clear();
+                }
+
                 if needed_col_idxs.is_empty() {
                     // Remove colstats-pruned segments
                     if !cs_pruned_ids.is_empty() {

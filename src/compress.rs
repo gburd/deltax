@@ -1772,6 +1772,24 @@ fn compress_partition_streaming(
                 .expect("failed to analyze text_lengths table");
         }
 
+        // Add a btree index on `(_col_idx, _min, _max)` for point-lookup
+        // pruning. Lets `WHERE col = N` queries skip directly to the
+        // segments whose [_min,_max] range covers N — start at the smallest
+        // `_min`, iterate while `_min <= N`, post-filter `_max >= N`. Mirrors
+        // what TimescaleDB does on its compressed chunks (their index is
+        // similar but explicit min/max columns vs our normalized colstats
+        // table). PG auto-names the index (truncates to 63 bytes if needed).
+        client
+            .update(
+                &format!(
+                    "CREATE INDEX ON {} (_col_idx, _min, _max)",
+                    ddl.colstats_fqn
+                ),
+                None,
+                &[],
+            )
+            .expect("failed to create colstats minmax index");
+
         // ANALYZE meta, colstats, and blobs tables for planner statistics
         client
             .update(&format!("ANALYZE {}", ddl.meta_fqn), None, &[])

@@ -1160,6 +1160,160 @@ pub(super) unsafe fn decompress_text_blob_with_selection(
     }
 }
 
+/// Selection-aware decompression for jsonb columns. Mirrors
+/// `decompress_text_blob_with_selection` exactly: decodes the column
+/// blob in full (LZ4 / Dictionary; the underlying codecs aren't
+/// row-skippable, except `Lz4Blocked` which uses the selection mask
+/// to skip whole blocks), but only allocates the per-row jsonb varlena
+/// for rows whose `selection[i] == true`. Filtered-out rows get a
+/// placeholder `Datum::from(0)` — the row-emission loop in
+/// `try_emit_next_row` skips those rows via the selection vector, so
+/// the placeholder is never read.
+///
+/// Big win for queries like Q0023 where a Phase 1 batch_qual filter
+/// (e.g. event_type='Delivered' + time range) eliminates ~95% of rows
+/// before Phase 2, but jsonb columns referenced by un-pushdownable
+/// predicates (`event_payload->>'terminal' = 'Berlin'`) or by
+/// projection still need to be decompressed for the survivors.
+pub(super) unsafe fn decompress_jsonb_blob_with_selection(
+    blob: &[u8],
+    selection: &[bool],
+) -> Vec<(pg_sys::Datum, bool)> {
+    if blob.is_empty() {
+        return Vec::new();
+    }
+
+    let cc = CompressedColumnRef::from_bytes(blob);
+    let total_count = cc.row_count as usize;
+    let non_null_count = count_non_null(cc.null_bitmap, total_count);
+
+    // Build a non-null selection vector (strip out null positions).
+    let nn_selection: Vec<bool> = if cc.null_bitmap.is_empty() {
+        selection.to_vec()
+    } else {
+        let mut nn_sel = Vec::with_capacity(non_null_count);
+        for (i, &sel) in selection.iter().enumerate().take(total_count) {
+            let is_null = (cc.null_bitmap[i / 8] >> (i % 8)) & 1 == 1;
+            if !is_null {
+                nn_sel.push(sel);
+            }
+        }
+        nn_sel
+    };
+
+    let nn_datums: Vec<pg_sys::Datum> = match cc.type_tag {
+        CompressionType::Dictionary | CompressionType::DictionaryLz4 => {
+            let norm_buf;
+            let dict_data = if cc.type_tag == CompressionType::DictionaryLz4 {
+                norm_buf = compression::dictionary::normalize_lz4(cc.data);
+                &norm_buf
+            } else {
+                cc.data
+            };
+            let byte_slices =
+                compression::dictionary::decode_to_byte_slices(dict_data, non_null_count);
+
+            // Allocate jsonb datums only for selected rows.
+            let matched_slices: Vec<&[u8]> = byte_slices
+                .iter()
+                .zip(nn_selection.iter())
+                .filter(|&(_, &sel)| sel)
+                .map(|(&b, _)| b)
+                .collect();
+            let matched_datums = unsafe { byte_slices_to_jsonb_datums_arena(&matched_slices) };
+
+            let mut datums = Vec::with_capacity(non_null_count);
+            let mut match_idx = 0;
+            for &sel in &nn_selection {
+                if sel {
+                    datums.push(matched_datums[match_idx]);
+                    match_idx += 1;
+                } else {
+                    datums.push(pg_sys::Datum::from(0));
+                }
+            }
+            datums
+        }
+        CompressionType::Lz4 => {
+            let (buf, ranges) =
+                compression::lz4::decode_to_ranges(cc.data, non_null_count);
+
+            let matched_slices: Vec<&[u8]> = ranges
+                .iter()
+                .zip(nn_selection.iter())
+                .filter(|&(_, &sel)| sel)
+                .map(|(&(off, len), _)| &buf[off..off + len])
+                .collect();
+            let matched_datums = unsafe { byte_slices_to_jsonb_datums_arena(&matched_slices) };
+
+            let mut datums = Vec::with_capacity(non_null_count);
+            let mut match_idx = 0;
+            for &sel in &nn_selection {
+                if sel {
+                    datums.push(matched_datums[match_idx]);
+                    match_idx += 1;
+                } else {
+                    datums.push(pg_sys::Datum::from(0));
+                }
+            }
+            datums
+        }
+        CompressionType::Lz4Blocked => {
+            // Partial decompression: only decode blocks containing selected rows.
+            let (buf, ranges) = compression::lz4::decode_to_ranges_blocked(
+                cc.data,
+                non_null_count,
+                Some(&nn_selection),
+            );
+
+            let matched_slices: Vec<&[u8]> = ranges
+                .iter()
+                .zip(nn_selection.iter())
+                .filter(|&(_, &sel)| sel)
+                .map(|(&(off, len), _)| &buf[off..off + len])
+                .collect();
+            let matched_datums = unsafe { byte_slices_to_jsonb_datums_arena(&matched_slices) };
+
+            let mut datums = Vec::with_capacity(non_null_count);
+            let mut match_idx = 0;
+            for &sel in &nn_selection {
+                if sel {
+                    datums.push(matched_datums[match_idx]);
+                    match_idx += 1;
+                } else {
+                    datums.push(pg_sys::Datum::from(0));
+                }
+            }
+            datums
+        }
+        _ => {
+            // Unexpected compression type — fall back to full decompression.
+            let full = unsafe {
+                decompress_blob_to_datums(blob, "jsonb", pg_sys::JSONBOID, -1)
+            };
+            return full;
+        }
+    };
+
+    // Reinsert nulls.
+    if cc.null_bitmap.is_empty() {
+        nn_datums.into_iter().map(|d| (d, false)).collect()
+    } else {
+        let mut result = Vec::with_capacity(total_count);
+        let mut val_idx = 0;
+        for i in 0..total_count {
+            let is_null = (cc.null_bitmap[i / 8] >> (i % 8)) & 1 == 1;
+            if is_null {
+                result.push((pg_sys::Datum::from(0), true));
+            } else {
+                result.push((nn_datums[val_idx], false));
+                val_idx += 1;
+            }
+        }
+        result
+    }
+}
+
 /// Create a text/varchar/bpchar datum from a Rust string.
 /// Allocates in the current memory context.
 /// Compare two strings using PG's collation-aware comparison.

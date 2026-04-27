@@ -2602,6 +2602,13 @@ fn finalize_partition(
     // Flush colstats sorted by (_col_idx, _segment_id) for column-major heap layout
     flush_colstats_buffer(buf);
 
+    // Btree index on (_col_idx, _min, _max) for point-lookup segment pruning.
+    // See compress::compress_partition_streaming for the rationale.
+    spi_exec(&format!(
+        "CREATE INDEX ON {} (_col_idx, _min, _max)",
+        ddl.colstats_fqn
+    ));
+
     // Encode + insert per-segment value-presence bitmaps. The buffer holds
     // per-segment value sets; finalize the partition-level value→bit_idx
     // map, drop columns that overflowed VALBITMAP_MAX_DISTINCT, encode each

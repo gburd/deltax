@@ -12,7 +12,8 @@ use super::batch_qual::{BatchQual, BatchCompareOp, evaluate_batch_quals, extract
 use super::datum_utils::{
     decompress_blob_to_datums, decompress_blob_to_datums_truncated,
     decompress_text_blob_with_like_filter, decompress_text_blob_with_eq_filter,
-    decompress_text_blob_with_selection, string_to_datum, pg_type_name,
+    decompress_text_blob_with_selection, decompress_jsonb_blob_with_selection,
+    string_to_datum, pg_type_name,
     exec_project, exec_qual,
 };
 use super::segments::{
@@ -3243,18 +3244,34 @@ unsafe fn load_next_segment(
                         let typmod = state.col_typmods[col_idx];
 
                         let t_col = if instrument { Some(Instant::now()) } else { None };
+                        // Variable-length types (TEXT family + JSONB) have a
+                        // selection-aware path that skips the per-row varlena
+                        // palloc/memcpy for rows already filtered out by the
+                        // Phase 1 batch_quals. Fixed-width types have no win
+                        // (sequential codecs can't skip rows; the per-row
+                        // datum cost is just an `as usize` cast).
                         let is_text = is_text_type(type_oid);
-                        let datums = if is_text && !state.selection_vector.is_empty() {
-                            decompress_text_blob_with_selection(
-                                blob, type_oid, typmod, &state.selection_vector,
-                            )
+                        let is_varlena_selectable =
+                            is_text || type_oid == pg_sys::JSONBOID;
+                        let datums = if is_varlena_selectable
+                            && !state.selection_vector.is_empty()
+                        {
+                            if is_text {
+                                decompress_text_blob_with_selection(
+                                    blob, type_oid, typmod, &state.selection_vector,
+                                )
+                            } else {
+                                decompress_jsonb_blob_with_selection(
+                                    blob, &state.selection_vector,
+                                )
+                            }
                         } else {
                             let type_name = pg_type_name(type_oid);
                             decompress_blob_to_datums(blob, &type_name, type_oid, typmod)
                         };
                         if let Some(t) = t_col {
                             let col_us = t.elapsed().as_micros() as u64;
-                            if is_text {
+                            if is_varlena_selectable {
                                 state.timing.phase2_text_us += col_us;
                                 state.timing.phase2_text_cols += 1;
                             } else {
