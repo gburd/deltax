@@ -372,13 +372,22 @@ pub fn parse_raw_field_and_append(
             Ok(())
         }
         ColumnKind::Jsonb => {
-            // Direct backfill: unescape the field to canonical JSON text
-            // and convert to jsonb's binary form once. Scan side just
-            // wraps the stored bytes in a varlena (no per-row jsonb_in).
+            // Direct backfill: unescape the field to canonical JSON text.
+            // Main-thread callers pass a `Bytes` column and we convert to
+            // jsonb's binary varlena here (so the scan path can skip jsonb_in
+            // per row). Worker-thread callers pass a `Text` column to defer
+            // the conversion — `jsonb_in` touches PG memory contexts and
+            // function-manager globals, which are not thread-safe.
             let unescaped = unescape_field_always(raw);
-            let bytes = unsafe { crate::compress::jsonb_text_to_binary(&unescaped) };
-            if let TypedColumn::Bytes(vec) = typed_col {
-                vec.push(Some(bytes));
+            match typed_col {
+                TypedColumn::Bytes(vec) => {
+                    let bytes = unsafe { crate::compress::jsonb_text_to_binary(&unescaped) };
+                    vec.push(Some(bytes));
+                }
+                TypedColumn::Text(vec) => {
+                    vec.push(Some(unescaped));
+                }
+                _ => {}
             }
             Ok(())
         }
@@ -520,12 +529,17 @@ fn parse_str_and_append(
             Ok(())
         }
         ColumnKind::Jsonb => {
-            // Direct backfill from COPY: the raw field bytes are canonical
-            // JSON text; convert once to jsonb's binary form so the scan
-            // path can return it directly without per-row jsonb_in.
-            let bytes = unsafe { crate::compress::jsonb_text_to_binary(s) };
-            if let TypedColumn::Bytes(vec) = typed_col {
-                vec.push(Some(bytes));
+            // See `parse_raw_field_and_append`'s Jsonb arm — workers pass a
+            // `Text` column so binary conversion is deferred to the main thread.
+            match typed_col {
+                TypedColumn::Bytes(vec) => {
+                    let bytes = unsafe { crate::compress::jsonb_text_to_binary(s) };
+                    vec.push(Some(bytes));
+                }
+                TypedColumn::Text(vec) => {
+                    vec.push(Some(s.to_string()));
+                }
+                _ => {}
             }
             Ok(())
         }

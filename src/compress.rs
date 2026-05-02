@@ -573,6 +573,19 @@ pub(crate) fn new_typed_column(kind: ColumnKind) -> TypedColumn {
     }
 }
 
+/// Worker-thread variant of `new_typed_column`. Identical except that JSONB
+/// columns are accumulated as `Text` instead of `Bytes`, because converting
+/// JSON text to the binary jsonb varlena requires `jsonb_in`, which calls
+/// PG memory-context and function-manager APIs that are not safe to invoke
+/// from a non-backend thread. The merge phase converts Text → Bytes on the
+/// main thread before the data reaches the partition buffer.
+pub(crate) fn new_worker_typed_column(kind: ColumnKind) -> TypedColumn {
+    match kind {
+        ColumnKind::Jsonb => TypedColumn::Text(Vec::new()),
+        _ => new_typed_column(kind),
+    }
+}
+
 /// Create empty TypedColumn vectors for all columns based on their ColumnKind.
 pub(crate) fn init_typed_columns(columns: &[ColumnMeta], kinds: &[ColumnKind]) -> Vec<TypedColumn> {
     columns

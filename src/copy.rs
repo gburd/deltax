@@ -19,6 +19,7 @@ use crate::compress::{
     compute_segment_blooms, compute_segment_ndistinct,
     compute_typed_minmax, compute_typed_sum, compute_minmax_encoded_i64,
     format_minmax_for_insert, init_typed_columns, is_text_data_type, new_typed_column,
+    new_worker_typed_column,
     get_column_metadata, sort_typed_columns, supports_minmax, supports_sum,
 };
 use crate::copyparse::{
@@ -906,9 +907,11 @@ fn parse_lines_worker(
             });
         }
 
-        // Lazily initialize partition buffers
+        // Lazily initialize partition buffers. Workers cannot call into PG
+        // (jsonb_in is not thread-safe), so JSONB columns accumulate as Text
+        // and the merge phase converts them to binary on the main thread.
         let wp = partitions[part_idx].get_or_insert_with(|| {
-            let typed_cols: Vec<TypedColumn> = kinds.iter().map(|k| new_typed_column(*k)).collect();
+            let typed_cols: Vec<TypedColumn> = kinds.iter().map(|k| new_worker_typed_column(*k)).collect();
             WorkerPartitionResult {
                 typed_cols,
                 row_count: 0,
@@ -1096,7 +1099,22 @@ fn handle_copy_from_file(
                     })
                     .collect::<Vec<_>>()
                     .into_iter()
-                    .map(|h| h.join().unwrap())
+                    .map(|h| h.join().unwrap_or_else(|payload| {
+                        // Surface the actual panic message rather than the
+                        // opaque `Any { .. }` Display impl on Box<dyn Any>.
+                        let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+                            (*s).to_string()
+                        } else if let Some(s) = payload.downcast_ref::<String>() {
+                            s.clone()
+                        } else {
+                            "unknown panic payload".to_string()
+                        };
+                        Err(crate::copyparse::ParseError {
+                            message: format!("worker thread panicked: {}", msg),
+                            column: 0,
+                            line: 0,
+                        })
+                    }))
                     .collect()
             });
 
@@ -1253,7 +1271,22 @@ fn merge_and_flush_results(
             if let Some(wp) = worker_part {
                 let pbuf = &mut part_buffers[part_idx];
                 for (i, worker_col) in wp.typed_cols.into_iter().enumerate() {
-                    pbuf.typed_cols[i].extend(worker_col);
+                    // JSONB came back from the worker as raw text; convert to
+                    // the binary jsonb varlena now (we're back on the PG
+                    // backend thread, so jsonb_in is safe to call).
+                    let merged = match (state.kinds[i], worker_col) {
+                        (ColumnKind::Jsonb, TypedColumn::Text(texts)) => {
+                            let bytes: Vec<Option<Vec<u8>>> = texts
+                                .into_iter()
+                                .map(|opt| opt.map(|s| unsafe {
+                                    crate::compress::jsonb_text_to_binary(&s)
+                                }))
+                                .collect();
+                            TypedColumn::Bytes(bytes)
+                        }
+                        (_, other) => other,
+                    };
+                    pbuf.typed_cols[i].extend(merged);
                 }
                 pbuf.row_count += wp.row_count;
                 *total_rows += wp.row_count as i64;
