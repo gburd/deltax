@@ -434,7 +434,7 @@ unsafe fn rewrite_walker(
 }
 
 /// Build the `custom_scan_tlist` for a json-extract-enabled DeltaXDecompress.
-#[allow(dead_code)] // Wired up in step 4 follow-up.
+#[allow(dead_code)] // Activated by the upper-plan rewrite follow-up.
 /// Layout:
 ///   resno = 1..physical_natts:    Var(rti, attno=k, vartype=physical type)
 ///   resno = physical_natts+1..M:  the original chain Expr (kept verbatim so
@@ -510,7 +510,7 @@ pub(crate) unsafe fn build_custom_scan_tlist(
 
 /// Construct the Expr `( ... ((Var(rti, src_attno) -> 'k1') -> 'k2') ->> 'kN' )`,
 /// optionally wrapped in `CoerceViaIO(target_kind)` when the target isn't text.
-#[allow(dead_code)] // Wired up in step 4 follow-up.
+#[allow(dead_code)] // Activated by the upper-plan rewrite follow-up.
 unsafe fn build_chain_expr_for_spec(
     rti: pg_sys::Index,
     _rel_oid: pg_sys::Oid,
@@ -604,7 +604,7 @@ unsafe fn build_chain_expr_for_spec(
     }
 }
 
-#[allow(dead_code)] // Wired up in step 4 follow-up.
+#[allow(dead_code)] // Activated by the upper-plan rewrite follow-up.
 unsafe fn make_text_const(s: &str) -> *mut pg_sys::Const {
     unsafe {
         // cstring_to_text_with_len allocates a varlena in CurrentMemoryContext;

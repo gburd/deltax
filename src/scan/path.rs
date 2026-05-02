@@ -274,13 +274,18 @@ pub unsafe extern "C-unwind" fn plan_custom_path(
         let extract_specs: Vec<crate::compress::ExtractSpec> =
             load_extract_specs_for_rel(scan_rel_oid);
 
-        // Plan-side scaffolding for json_extract is wired up but the actual
-        // upper-plan / scan-qual rewriting is not yet enabled — `setrefs`
-        // matches against `subplan->targetlist` (not `custom_scan_tlist`),
-        // so to make rewriting fire we need to also publish the chain Exprs
-        // in `cscan->scan.plan.targetlist` and re-do projection. Until then
-        // the scaffolding just confirms config plumbing works end-to-end.
-        let _ = (scan_rel_oid, &extract_specs, rti); // suppress unused warnings
+        // Chain rewriting is intentionally not yet activated. The naive
+        // `set custom_scan_tlist + add chain Expr to scan.plan.targetlist`
+        // breaks down at upper-plan setrefs: after `set_customscan_references`
+        // rewrites scan.plan.targetlist to `Var(INDEX_VAR, k)`, the upper
+        // plan's `set_upper_references` cannot match its chain Expr against
+        // the subplan's now-Var-only tlist (`tlist_member` uses `equal()`).
+        // The proper fix is to manually rewrite the upper plan tree before
+        // setrefs, similar to how `fix_indexqual_operand` substitutes
+        // expression-index references — but that's a deeper change than this
+        // commit aims for. The recognizer + chain builder are in place for
+        // follow-up; this stub keeps everything else working.
+        let _ = (scan_rel_oid, &extract_specs, rti);
 
         // Build int-form custom_private: [companion_oid_as_int, -1 (sentinel), col0, col1, ...]
         let mut private_list =
