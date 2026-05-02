@@ -986,16 +986,25 @@ unsafe fn subplan_tlist_from_deltax_decompress(
             return None;
         }
 
-        // custom_scan_tlist null → no synthetic columns; treat as plain
-        // physical-only scan and let the caller fall through.
-        // BLOCKER: PG's `set_customscan_references` (line 1706 of setrefs.c
-        // in pg17) reassigns `cscan->custom_scan_tlist` via `fix_scan_list`,
-        // which empirically returns NIL for our chain Expr lists even though
-        // the input is non-empty. The plumbing is in place but disabled
-        // pending diagnosis of which field on our synthesized chain Exprs
-        // (OpExpr / CoerceViaIO / Const / inner Var) is causing
-        // expression_tree_mutator to bail. Until then the walker visits the
-        // tree but always returns empty SubplanTlists.
+        // KNOWN BLOCKER: empirically, by the time `planner_hook` runs (after
+        // `standard_planner` → `set_plan_references` completes),
+        // `cscan->custom_scan_tlist` is NIL even though `plan_custom_path`
+        // set it to a 3-entry list a moment earlier. Verified via
+        // `nodeToString` dumps on both sides:
+        //   - At `plan_custom_path` return: list has [Var(ts), Var(data),
+        //     OpExpr(data->>'kind')] (well-formed).
+        //   - At walker entry: list is NIL; `cscan->scan.plan.targetlist`
+        //     still has its original `Var(varno=rti)` form (i.e.,
+        //     `set_customscan_references`'s rewrite branch wasn't taken,
+        //     which only happens when `custom_scan_tlist == NIL` on entry).
+        //   - All other CustomScan fields (custom_private, methods, scanrelid,
+        //     flags) survive intact.
+        // Only place PG core can null this field is setrefs.c line 1706's
+        // `cscan->custom_scan_tlist = fix_scan_list(...)`, which is itself
+        // guarded by `if (cscan->custom_scan_tlist != NIL)`. Something
+        // between `plan_custom_path` and `set_customscan_references` is
+        // clearing the field — needs a fresh debugging pass with a deeper
+        // bisection of the planner pipeline.
         let cstlist = (*cscan).custom_scan_tlist;
         if cstlist.is_null() {
             return None;
