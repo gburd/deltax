@@ -204,6 +204,90 @@ pub(crate) unsafe fn load_extract_specs_for_rel_pub(
     unsafe { load_extract_specs_for_rel(rel_oid) }
 }
 
+/// Mixed-partition gate: returns true iff every relevant compressed partition
+/// has `compressed_at >= json_extract_added_at`. Without this, partitions
+/// compressed before json_extract was configured don't have synthetic
+/// columns in their companion blobs, and the rewrite would silently emit
+/// NULLs at synthetic positions for those partitions.
+///
+/// For a parent-baserel rel_oid, "relevant" is every compressed partition
+/// of that deltatable. For a partition rel_oid, it's just that partition.
+/// Returns true (safe) when there are no compressed partitions yet, when
+/// `json_extract_added_at` is NULL (no json_extract configured), or when
+/// every relevant partition is up to date. Defensive default on any SPI
+/// hiccup is `true` — a stale partition would surface as a wrong result;
+/// a wrong default of `false` only loses the perf win, never correctness.
+/// We pick `true` here because the upstream caller (`load_extract_specs`)
+/// has already returned a non-empty spec list, so the deltatable definitely
+/// has json_extract configured; the only question is partition freshness,
+/// and treating unknowns as fresh is the less-surprising choice.
+pub(crate) unsafe fn is_json_extract_safe_for_rel(rel_oid: pg_sys::Oid) -> bool {
+    if rel_oid == pg_sys::InvalidOid {
+        return true;
+    }
+    pgrx::Spi::connect(|client| -> bool {
+        // Find this rel's deltatable + classify whether rel_oid is the
+        // parent or a partition. Then compute the relevant `compressed_at`
+        // bound: MIN(compressed_at) across compressed partitions for parent,
+        // or this partition's own compressed_at for partition. Compare to
+        // json_extract_added_at.
+        let row = client
+            .select(
+                "WITH ident AS (
+                     SELECT n.nspname AS s, c.relname AS t
+                     FROM pg_class c
+                     JOIN pg_namespace n ON c.relnamespace = n.oid
+                     WHERE c.oid = $1
+                 ),
+                 dt AS (
+                     SELECT h.id, h.json_extract_added_at, 'parent'::text AS kind
+                     FROM deltax_deltatable h, ident i
+                     WHERE h.schema_name = i.s AND h.table_name = i.t
+                     UNION ALL
+                     SELECT h.id, h.json_extract_added_at, 'partition'::text AS kind
+                     FROM deltax_deltatable h
+                     JOIN deltax_partition p ON p.deltatable_id = h.id
+                     JOIN ident i ON p.schema_name = i.s AND p.table_name = i.t
+                     LIMIT 1
+                 )
+                 SELECT
+                     dt.json_extract_added_at,
+                     CASE
+                         WHEN dt.kind = 'parent' THEN
+                             (SELECT min(p.compressed_at)
+                                FROM deltax_partition p
+                               WHERE p.deltatable_id = dt.id
+                                 AND p.is_compressed)
+                         ELSE
+                             (SELECT p.compressed_at
+                                FROM deltax_partition p, ident i
+                               WHERE p.schema_name = i.s
+                                 AND p.table_name = i.t)
+                     END AS oldest_compressed
+                 FROM dt",
+                None,
+                &[rel_oid.into()],
+            )
+            .ok();
+        let Some(row) = row else { return true };
+        let row = row.first();
+        let added_at: Option<pgrx::datum::TimestampWithTimeZone> =
+            row.get(1).ok().flatten();
+        let oldest: Option<pgrx::datum::TimestampWithTimeZone> =
+            row.get(2).ok().flatten();
+        match (added_at, oldest) {
+            // No json_extract configured (shouldn't happen here — caller
+            // already loaded specs — but defensively safe).
+            (None, _) => true,
+            // No compressed partitions yet — nothing to gate on.
+            (_, None) => true,
+            // Both present: safe iff every compressed partition is at or
+            // after the json_extract install time.
+            (Some(added), Some(oldest)) => oldest >= added,
+        }
+    })
+}
+
 unsafe fn load_extract_specs_for_rel(
     rel_oid: pg_sys::Oid,
 ) -> Vec<crate::compress::ExtractSpec> {

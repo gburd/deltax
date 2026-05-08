@@ -700,7 +700,16 @@ pub(crate) unsafe fn rewrite_plan_tree(plan: *mut pg_sys::Plan, rtable: *mut pg_
         ) {
             return;
         }
+        // Phase 1: rewrite chain Exprs in upper plans to Var(OUTER_VAR, k) refs
+        // into our scan's synthetic forwarder positions.
         let _ = rewrite_plan_subtree(plan, rtable);
+        // Phase 2: ref-count upper-plan Var(OUTER_VAR, k) refs and rewrite each
+        // touched cscan's custom_private to load only the col_idx values that
+        // are actually needed (referenced in upper plans, or by scan-level
+        // qual). Without this we'd over-fetch — and worse, the overlap with
+        // the plan_custom_path-supplied Section::Cols would re-include `data`
+        // even when no upper-plan ref to it survives.
+        prune_cscans_by_ref_count(plan);
     }
 }
 
@@ -1035,26 +1044,18 @@ unsafe fn subplan_tlist_from_deltax_decompress(
         // the right slot positions.
         let _ = extend_scan_targetlist_with_forwarders(cscan, cstlist);
 
-        // Append synthetic col_idx values to custom_private under the `-3`
-        // sentinel so the executor's `build_needed_cols_from_custom_private`
-        // loads the corresponding companion-blob columns. cstlist is
-        // physical-first, synthetic-after; physical entries are top-level
-        // Vars, synthetic entries are chain Exprs. Position k (0-indexed)
-        // in cstlist == col_idx k in `col_names`.
-        append_synthetic_col_indices_to_custom_private(cscan, cstlist);
+        // Rewrite chain Exprs in the cscan's own scan-level qual to use
+        // `Var(INDEX_VAR, synth_position)` refs into the synthetic columns.
+        // Without this, filters like `WHERE data ->> 'kind' = 'commit'` get
+        // evaluated by per-row JSONB chain expression — `data` is loaded just
+        // for the qual, and 86× slower than letting the filter run against
+        // the dictionary-encoded synthetic column.
+        rewrite_scan_qual_chains(cscan, cstlist);
 
-        // Drop the original Section::Cols (the col_idx values between -1 and
-        // -2/-3 that `plan_custom_path` populated). They were computed before
-        // the walker ran and reflect the pre-rewrite needs (e.g. raw `data`
-        // for chain Exprs that have since been rewritten to synthetic Vars).
-        // Keeping them forces the executor to decompress columns nothing
-        // references — defeats the whole point of json_extract.
-        //
-        // For json_extract paths that cover all upper-plan references to a
-        // physical column, dropping Section::Cols entirely is safe. JSONBench
-        // queries fit this profile; queries that reference raw `data`
-        // alongside chain Exprs would need a ref-count to be correct (TODO).
-        prune_section_cols_in_custom_private(cscan);
+        // (custom_private rewriting is deferred to phase 2 in
+        // `rewrite_plan_tree`. Phase 1 only sets up cstlist + scan tlist
+        // forwarders and returns the SubplanTlist; phase 2 ref-counts upper
+        // plans and writes back the correct Section::Cols + Section::Synth.)
 
         // Build SubplanTlist by walking scan.plan.targetlist, NOT
         // custom_scan_tlist. Upper plans' OUTER_VAR refs index into
@@ -1117,83 +1118,752 @@ unsafe fn build_subplan_tlist_from_scan_targetlist(
     }
 }
 
-/// Strip Section::Cols (the col_idx values between sentinels `-1` and
-/// `-2`/`-3`) from `cscan->custom_private`. Preserves companion OIDs (before
-/// `-1`), Top-N info (after `-2`), and synthetic col_idx values (after `-3`).
-/// Leaves the `-1` sentinel in place.
-unsafe fn prune_section_cols_in_custom_private(cscan: *mut pg_sys::CustomScan) {
-    unsafe {
-        let cp = (*cscan).custom_private;
-        if cp.is_null() {
-            return;
-        }
-        let n = (*cp).length;
-        let mut new_list: *mut pg_sys::List = std::ptr::null_mut();
-        #[derive(PartialEq)]
-        enum Phase {
-            BeforeMinus1,
-            InCols,
-            After,
-        }
-        let mut phase = Phase::BeforeMinus1;
-        for i in 0..n {
-            let v = pg_sys::list_nth_int(cp, i);
-            match phase {
-                Phase::BeforeMinus1 => {
-                    new_list = pg_sys::lappend_int(new_list, v);
-                    if v == -1 {
-                        phase = Phase::InCols;
-                    }
-                }
-                Phase::InCols => {
-                    if v == -2 || v == -3 {
-                        new_list = pg_sys::lappend_int(new_list, v);
-                        phase = Phase::After;
-                    }
-                    // else: drop (was a Section::Cols col_idx)
-                }
-                Phase::After => {
-                    new_list = pg_sys::lappend_int(new_list, v);
-                }
-            }
-        }
-        (*cscan).custom_private = new_list;
-    }
-}
-
-/// Append `[-3, col_idx_0, col_idx_1, ...]` to `cscan->custom_private` for
-/// each synthetic column in `cstlist`. The executor's
-/// `build_needed_cols_from_custom_private` recognizes the `-3` sentinel and
-/// adds these col_idx values to the needed-cols mask so the decompress
-/// loop loads them from companion blobs.
-unsafe fn append_synthetic_col_indices_to_custom_private(
+/// Rewrite chain Exprs in `cscan.scan.plan.qual` (the scan-level filter list)
+/// to `Var(INDEX_VAR, synth_position, target_kind_oid)` refs into the
+/// synthetic columns of `cstlist`.
+///
+/// Differs from the upper-plan rewrite in `match_chain_against_child_stl`:
+/// at the scan level the inner Var is `Var(varno=rti, varattno=src_attno)`
+/// (post-setrefs scan-level Var), not `Var(varno=OUTER_VAR, ...)`. Match by
+/// `(src_var_attno, path, target_kind)` against cstlist synthetics; the
+/// physical attno comparison goes against the `Var.varattno` directly.
+unsafe fn rewrite_scan_qual_chains(
     cscan: *mut pg_sys::CustomScan,
     cstlist: *mut pg_sys::List,
 ) {
     unsafe {
-        if cstlist.is_null() {
+        let qual = (*cscan).scan.plan.qual;
+        if qual.is_null() || cstlist.is_null() {
             return;
         }
-        let mut col_indices: Vec<i32> = Vec::new();
+
+        // Build a lookup of cstlist synthetics: (src_var_attno, path, kind) → cstlist position.
+        let mut synths: Vec<SynthInfo> = Vec::new();
         for i in 0..(*cstlist).length {
             let tle = pg_sys::list_nth(cstlist, i) as *mut pg_sys::TargetEntry;
             if tle.is_null() || (*tle).expr.is_null() {
                 continue;
             }
             let expr = (*tle).expr as *mut pg_sys::Node;
-            // Synthetic = non-Var entry. Position i in cstlist == col_idx i
-            // in `col_names` (load_metadata layout).
-            if (*expr).type_ != pg_sys::NodeTag::T_Var {
-                col_indices.push(i);
+            // Skip physical entries (Var); we only care about chain-Expr synthetics.
+            if (*expr).type_ == pg_sys::NodeTag::T_Var {
+                continue;
+            }
+            if let SubplanColumn::Synthetic {
+                path,
+                target_kind,
+                src_var_attno,
+                ..
+            } = classify_custom_scan_tlist_entry(expr, (*tle).resno)
+            {
+                synths.push(SynthInfo {
+                    src_attno: src_var_attno,
+                    path,
+                    kind: target_kind,
+                    position: (i + 1) as i16,
+                });
             }
         }
-        if col_indices.is_empty() {
+        if synths.is_empty() {
             return;
         }
-        // Append sentinel + col_idx values to custom_private.
-        (*cscan).custom_private = pg_sys::lappend_int((*cscan).custom_private, -3);
-        for idx in col_indices {
-            (*cscan).custom_private = pg_sys::lappend_int((*cscan).custom_private, idx);
+
+        // Walk each qual element and rewrite in place.
+        for i in 0..(*qual).length {
+            let cell_ptr = pg_sys::list_nth(qual, i) as *mut pg_sys::Node;
+            let new_node = substitute_scan_chains_in_node(cell_ptr, &synths);
+            // Update the list cell.
+            let cell = (*qual).elements.add(i as usize);
+            (*cell).ptr_value = new_node as *mut std::ffi::c_void;
+        }
+    }
+}
+
+unsafe fn substitute_scan_chains_in_node(
+    node: *mut pg_sys::Node,
+    synths: &[SynthInfo],
+) -> *mut pg_sys::Node {
+    unsafe {
+        if node.is_null() {
+            return node;
+        }
+        if let Some(replacement) = match_scan_chain_against_synths(node, synths) {
+            return replacement;
+        }
+        match (*node).type_ {
+            pg_sys::NodeTag::T_OpExpr => {
+                let op = node as *mut pg_sys::OpExpr;
+                (*op).args = substitute_scan_chains_in_list((*op).args, synths);
+            }
+            pg_sys::NodeTag::T_BoolExpr => {
+                let b = node as *mut pg_sys::BoolExpr;
+                (*b).args = substitute_scan_chains_in_list((*b).args, synths);
+            }
+            pg_sys::NodeTag::T_FuncExpr => {
+                let f = node as *mut pg_sys::FuncExpr;
+                (*f).args = substitute_scan_chains_in_list((*f).args, synths);
+            }
+            pg_sys::NodeTag::T_CoerceViaIO => {
+                let c = node as *mut pg_sys::CoerceViaIO;
+                (*c).arg =
+                    substitute_scan_chains_in_node((*c).arg as *mut pg_sys::Node, synths)
+                        as *mut pg_sys::Expr;
+            }
+            pg_sys::NodeTag::T_RelabelType => {
+                let r = node as *mut pg_sys::RelabelType;
+                (*r).arg =
+                    substitute_scan_chains_in_node((*r).arg as *mut pg_sys::Node, synths)
+                        as *mut pg_sys::Expr;
+            }
+            pg_sys::NodeTag::T_NullTest => {
+                let n = node as *mut pg_sys::NullTest;
+                (*n).arg =
+                    substitute_scan_chains_in_node((*n).arg as *mut pg_sys::Node, synths)
+                        as *mut pg_sys::Expr;
+            }
+            pg_sys::NodeTag::T_ScalarArrayOpExpr => {
+                let s = node as *mut pg_sys::ScalarArrayOpExpr;
+                (*s).args = substitute_scan_chains_in_list((*s).args, synths);
+            }
+            _ => {}
+        }
+        node
+    }
+}
+
+unsafe fn substitute_scan_chains_in_list(
+    list: *mut pg_sys::List,
+    synths: &[SynthInfo],
+) -> *mut pg_sys::List {
+    unsafe {
+        if list.is_null() {
+            return list;
+        }
+        for i in 0..(*list).length {
+            let elt = pg_sys::list_nth(list, i) as *mut pg_sys::Node;
+            let new_elt = substitute_scan_chains_in_node(elt, synths);
+            let cell = (*list).elements.add(i as usize);
+            (*cell).ptr_value = new_elt as *mut std::ffi::c_void;
+        }
+        list
+    }
+}
+
+unsafe fn match_scan_chain_against_synths(
+    node: *mut pg_sys::Node,
+    synths: &[SynthInfo],
+) -> Option<*mut pg_sys::Node> {
+    unsafe {
+        if node.is_null() {
+            return None;
+        }
+        let (chain_root, leaf_kind) = strip_outer_cast(node);
+        let mut path_keys: Vec<String> = Vec::new();
+        let mut cursor = chain_root;
+        let (k, deeper) = match_op_step(cursor, JSONB_OBJECT_FIELD_TEXT_OPNO)?;
+        path_keys.push(k);
+        cursor = deeper;
+        loop {
+            cursor = unwrap_relabel(cursor);
+            match match_op_step(cursor, JSONB_OBJECT_FIELD_OPNO) {
+                Some((k, deeper)) => {
+                    path_keys.push(k);
+                    cursor = deeper;
+                }
+                None => break,
+            }
+        }
+        cursor = unwrap_relabel(cursor);
+        if (*cursor).type_ != pg_sys::NodeTag::T_Var {
+            return None;
+        }
+        let inner_var = cursor as *mut pg_sys::Var;
+        // At scan level, the inner var should be `Var(varno = rti)`; we
+        // accept any varno except OUTER/INNER (those are upper-plan refs).
+        if (*inner_var).varno == pg_sys::OUTER_VAR
+            || (*inner_var).varno == pg_sys::INNER_VAR
+        {
+            return None;
+        }
+        path_keys.reverse();
+        let src_attno = (*inner_var).varattno;
+
+        for s in synths {
+            if s.src_attno == src_attno && s.kind == leaf_kind && s.path == path_keys {
+                let new_var = pg_sys::makeVar(
+                    pg_sys::INDEX_VAR,
+                    s.position,
+                    kind_to_type_oid(s.kind),
+                    -1,
+                    if matches!(s.kind, ColumnKind::Text) {
+                        pg_sys::DEFAULT_COLLATION_OID
+                    } else {
+                        pg_sys::InvalidOid
+                    },
+                    0,
+                );
+                return Some(new_var as *mut pg_sys::Node);
+            }
+        }
+        None
+    }
+}
+
+/// Helper alias so the qual rewriter's signatures don't need the inline
+/// struct definition (Rust doesn't let us name a struct defined inside a fn).
+struct SynthInfo {
+    src_attno: i16,
+    path: Vec<String>,
+    kind: ColumnKind,
+    position: i16,
+}
+
+// ============================================================================
+// Phase-2 ref counter
+//
+// After phase 1 has rewritten chain Exprs into `Var(OUTER_VAR, k)` refs, walk
+// the plan tree top-down to determine, per touched cscan, which positions in
+// its `scan.plan.targetlist` are still referenced by some upper plan. Use
+// that to rebuild `custom_private`'s Section::Cols (physical col_idx values
+// the executor must load) and Section::Synth (synthetic col_idx values).
+//
+// Without this we either over-fetch (still loading `data` even though the
+// chain was rewritten away — pre-fix behavior, blocking the JSONBench warm
+// speedup) or silently NULL out positions that ARE still referenced (the
+// unconditional-prune hack, which broke `SELECT data, data->>'kind'`-style
+// queries).
+// ============================================================================
+
+/// Set of position numbers (1-indexed AttrNumber) referenced in some plan's
+/// targetlist. Stored in a small Vec since these sets are tiny.
+type PosSet = Vec<i16>;
+
+unsafe fn descend_for_refs(
+    plan: *mut pg_sys::Plan,
+    my_refs: &PosSet,
+) {
+    unsafe {
+        if plan.is_null() {
+            return;
+        }
+
+        // Leaf: if this is a touched cscan, rebuild its custom_private from
+        // `my_refs`. Don't recurse — the cscan IS the underlying data source.
+        if (*plan).type_ == pg_sys::NodeTag::T_CustomScan {
+            let cscan = plan as *mut pg_sys::CustomScan;
+            if cscan_is_touched(cscan) {
+                rebuild_cscan_custom_private(cscan, my_refs);
+            }
+            return;
+        }
+
+        // Compute child_refs: positions in lefttree's tlist that this plan
+        // reads, by walking `Var(OUTER_VAR, k)` refs in:
+        //   (a) my tlist entries at `my_refs` positions
+        //   (b) always-evaluated exprs (qual, having, run conditions, ...)
+        //   (c) tlist entries at indirectly-referenced positions (sort keys,
+        //       group keys, partition/order keys for window) — these must be
+        //       evaluated even if the parent doesn't read them.
+        let mut effective: PosSet = my_refs.clone();
+        add_node_specific_referenced_positions(plan, &mut effective);
+
+        let mut child_refs: PosSet = Vec::new();
+        let tlist = (*plan).targetlist;
+        if !tlist.is_null() {
+            let len = (*tlist).length as i16;
+            for &p in &effective {
+                if p < 1 || p > len {
+                    continue;
+                }
+                let tle = pg_sys::list_nth(tlist, (p - 1) as i32) as *mut pg_sys::TargetEntry;
+                if tle.is_null() || (*tle).expr.is_null() {
+                    continue;
+                }
+                collect_outer_var_attnos(
+                    (*tle).expr as *mut pg_sys::Node,
+                    &mut child_refs,
+                );
+            }
+        }
+        // Always-evaluated exprs.
+        collect_outer_var_attnos_in_list((*plan).qual, &mut child_refs);
+        add_node_specific_outer_var_refs(plan, &mut child_refs);
+
+        // Recurse.
+        if !(*plan).lefttree.is_null() {
+            descend_for_refs((*plan).lefttree, &child_refs);
+        }
+        // Inner side of joins uses INNER_VAR; we don't track those for now.
+        // Touched cscans on the inner side would not get pruned correctly — a
+        // future improvement.
+        if !(*plan).righttree.is_null() {
+            descend_for_refs_conservative((*plan).righttree);
+        }
+        // Append/MergeAppend: each child gets the same child_refs (Append's
+        // child tlists are aligned 1:1 with Append's tlist by construction).
+        match (*plan).type_ {
+            pg_sys::NodeTag::T_Append => {
+                let app = plan as *mut pg_sys::Append;
+                let lst = (*app).appendplans;
+                if !lst.is_null() {
+                    for i in 0..(*lst).length {
+                        let child = pg_sys::list_nth(lst, i) as *mut pg_sys::Plan;
+                        descend_for_refs(child, &child_refs);
+                    }
+                }
+            }
+            pg_sys::NodeTag::T_MergeAppend => {
+                let mapp = plan as *mut pg_sys::MergeAppend;
+                let lst = (*mapp).mergeplans;
+                if !lst.is_null() {
+                    for i in 0..(*lst).length {
+                        let child = pg_sys::list_nth(lst, i) as *mut pg_sys::Plan;
+                        descend_for_refs(child, &child_refs);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Conservative pass for plan subtrees we can't reason about precisely (e.g.
+/// inner side of a join — INNER_VAR refs we don't track). Treats every
+/// position in every tlist as referenced. Safe but defeats the prune for
+/// any cscan reached this way.
+unsafe fn descend_for_refs_conservative(plan: *mut pg_sys::Plan) {
+    unsafe {
+        if plan.is_null() {
+            return;
+        }
+        if (*plan).type_ == pg_sys::NodeTag::T_CustomScan {
+            let cscan = plan as *mut pg_sys::CustomScan;
+            if cscan_is_touched(cscan) {
+                let scan_tlist = (*cscan).scan.plan.targetlist;
+                let n = if scan_tlist.is_null() {
+                    0
+                } else {
+                    (*scan_tlist).length as i16
+                };
+                let all: PosSet = (1..=n).collect();
+                rebuild_cscan_custom_private(cscan, &all);
+            }
+            return;
+        }
+        if !(*plan).lefttree.is_null() {
+            descend_for_refs_conservative((*plan).lefttree);
+        }
+        if !(*plan).righttree.is_null() {
+            descend_for_refs_conservative((*plan).righttree);
+        }
+        match (*plan).type_ {
+            pg_sys::NodeTag::T_Append => {
+                let app = plan as *mut pg_sys::Append;
+                let lst = (*app).appendplans;
+                if !lst.is_null() {
+                    for i in 0..(*lst).length {
+                        let child = pg_sys::list_nth(lst, i) as *mut pg_sys::Plan;
+                        descend_for_refs_conservative(child);
+                    }
+                }
+            }
+            pg_sys::NodeTag::T_MergeAppend => {
+                let mapp = plan as *mut pg_sys::MergeAppend;
+                let lst = (*mapp).mergeplans;
+                if !lst.is_null() {
+                    for i in 0..(*lst).length {
+                        let child = pg_sys::list_nth(lst, i) as *mut pg_sys::Plan;
+                        descend_for_refs_conservative(child);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+unsafe fn prune_cscans_by_ref_count(root: *mut pg_sys::Plan) {
+    unsafe {
+        if root.is_null() {
+            return;
+        }
+        // Root is the query output: every targetlist position is referenced.
+        let tlist = (*root).targetlist;
+        let n = if tlist.is_null() { 0 } else { (*tlist).length as i16 };
+        let initial: PosSet = (1..=n).collect();
+        descend_for_refs(root, &initial);
+    }
+}
+
+/// `cscan` was touched by phase 1 if `custom_scan_tlist` is non-NULL — that's
+/// the bit `subplan_tlist_from_deltax_decompress` set when it rebuilt the
+/// tlist with synthetic forwarders. Also gates on the methods name so we
+/// don't rewrite somebody else's CustomScan.
+unsafe fn cscan_is_touched(cscan: *mut pg_sys::CustomScan) -> bool {
+    unsafe {
+        if cscan.is_null() || (*cscan).custom_scan_tlist.is_null() {
+            return false;
+        }
+        let methods = (*cscan).methods;
+        if methods.is_null() {
+            return false;
+        }
+        let name_ptr = (*methods).CustomName;
+        if name_ptr.is_null() {
+            return false;
+        }
+        let name = std::ffi::CStr::from_ptr(name_ptr);
+        name == crate::scan::CUSTOM_NAME || name == crate::scan::DELTAX_APPEND_NAME
+    }
+}
+
+/// Add positions in `plan.targetlist` that are referenced by node-specific
+/// indirect mechanisms (sort keys, group keys, etc.) — i.e., positions that
+/// must be evaluated even if the parent doesn't read them.
+unsafe fn add_node_specific_referenced_positions(
+    plan: *mut pg_sys::Plan,
+    out: &mut PosSet,
+) {
+    unsafe {
+        match (*plan).type_ {
+            pg_sys::NodeTag::T_Sort => {
+                let s = plan as *mut pg_sys::Sort;
+                push_attr_array(out, (*s).sortColIdx, (*s).numCols);
+            }
+            pg_sys::NodeTag::T_IncrementalSort => {
+                let s = plan as *mut pg_sys::IncrementalSort;
+                push_attr_array(out, (*s).sort.sortColIdx, (*s).sort.numCols);
+            }
+            pg_sys::NodeTag::T_Agg => {
+                let a = plan as *mut pg_sys::Agg;
+                push_attr_array(out, (*a).grpColIdx, (*a).numCols);
+            }
+            pg_sys::NodeTag::T_Group => {
+                let g = plan as *mut pg_sys::Group;
+                push_attr_array(out, (*g).grpColIdx, (*g).numCols);
+            }
+            pg_sys::NodeTag::T_WindowAgg => {
+                let w = plan as *mut pg_sys::WindowAgg;
+                push_attr_array(out, (*w).partColIdx, (*w).partNumCols);
+                push_attr_array(out, (*w).ordColIdx, (*w).ordNumCols);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Collect `Var(OUTER_VAR, k)` refs from node-specific expression-bearing
+/// fields beyond `tlist` and `qual` (which the caller already walks).
+unsafe fn add_node_specific_outer_var_refs(
+    plan: *mut pg_sys::Plan,
+    out: &mut PosSet,
+) {
+    unsafe {
+        match (*plan).type_ {
+            pg_sys::NodeTag::T_Agg => {
+                let a = plan as *mut pg_sys::Agg;
+                collect_outer_var_attnos_in_list((*a).chain, out);
+            }
+            pg_sys::NodeTag::T_WindowAgg => {
+                let w = plan as *mut pg_sys::WindowAgg;
+                collect_outer_var_attnos_in_list((*w).runCondition, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+unsafe fn push_attr_array(out: &mut PosSet, arr: *mut pg_sys::AttrNumber, n: i32) {
+    unsafe {
+        if arr.is_null() || n <= 0 {
+            return;
+        }
+        for i in 0..n as usize {
+            let v = *arr.add(i);
+            if !out.contains(&v) {
+                out.push(v);
+            }
+        }
+    }
+}
+
+// PG's pull_var_clause flag bits — extracted from optimizer.h. Recursing
+// into aggregates/windowfuncs/placeholders means a single call covers any
+// node tree the planner might hand us, including JsonValueExpr,
+// CoalesceExpr, RowExpr, etc. — node types our ref-counter would otherwise
+// have to enumerate by hand.
+const PVC_RECURSE_AGGREGATES: i32 = 0x0002;
+const PVC_RECURSE_WINDOWFUNCS: i32 = 0x0008;
+const PVC_RECURSE_PLACEHOLDERS: i32 = 0x0020;
+const PVC_FLAGS_FULL: i32 =
+    PVC_RECURSE_AGGREGATES | PVC_RECURSE_WINDOWFUNCS | PVC_RECURSE_PLACEHOLDERS;
+
+/// Collect attnos of every `Var(OUTER_VAR, k)` reachable from `node`.
+/// Delegates the tree walk to PG's `pull_var_clause` so we cover every node
+/// type PG knows about, not just the ones we hand-roll.
+unsafe fn collect_outer_var_attnos(node: *mut pg_sys::Node, out: &mut PosSet) {
+    unsafe {
+        if node.is_null() {
+            return;
+        }
+        let var_list = pg_sys::pull_var_clause(node, PVC_FLAGS_FULL);
+        if var_list.is_null() {
+            return;
+        }
+        for i in 0..(*var_list).length {
+            let v = pg_sys::list_nth(var_list, i) as *mut pg_sys::Var;
+            if v.is_null() || (*(v as *mut pg_sys::Node)).type_ != pg_sys::NodeTag::T_Var {
+                continue;
+            }
+            if (*v).varno == pg_sys::OUTER_VAR {
+                let k = (*v).varattno;
+                if !out.contains(&k) {
+                    out.push(k);
+                }
+            }
+        }
+    }
+}
+
+unsafe fn collect_outer_var_attnos_in_list(list: *mut pg_sys::List, out: &mut PosSet) {
+    unsafe {
+        if list.is_null() {
+            return;
+        }
+        // pull_var_clause accepts a List* directly when treated as a Node*,
+        // walking each element. Saves a per-element loop.
+        collect_outer_var_attnos(list as *mut pg_sys::Node, out);
+    }
+}
+
+/// Rewrite `cscan->custom_private` so the executor loads only the col_idx
+/// values that are actually needed. Inputs:
+///   * `referenced` — positions in `cscan.scan.plan.targetlist` that some
+///     upper plan still references (post-rewrite). For each `p`, the entry
+///     `scan_tlist[p-1]` is `Var(INDEX_VAR, k)` indexing into
+///     `custom_scan_tlist`; `cstlist[k-1]` is either a physical Var
+///     (Section::Cols) or a synthetic chain Expr (Section::Synth).
+///   * `cscan.scan.plan.qual` — scan-level qual exprs (e.g. time-range
+///     filters used for segment pruning) reference physical columns directly
+///     via `Var(varno=rti)`. Those columns must remain in Section::Cols
+///     regardless of upper-plan refs, otherwise pruning breaks.
+///
+/// New encoding (preserving everything the executor expects):
+///   `[oid_0, oid_1, ..., -1, cols..., (-2, topn0..topn3,)? -3, synth...]`
+unsafe fn rebuild_cscan_custom_private(
+    cscan: *mut pg_sys::CustomScan,
+    referenced: &PosSet,
+) {
+    unsafe {
+        let cstlist = (*cscan).custom_scan_tlist;
+        let scan_tlist = (*cscan).scan.plan.targetlist;
+        if cstlist.is_null() || scan_tlist.is_null() {
+            return;
+        }
+
+        // Map referenced scan-tlist positions → cstlist indices, partition
+        // into Cols vs Synth based on cstlist entry type.
+        let mut new_cols: Vec<i32> = Vec::new();
+        let mut new_synth: Vec<i32> = Vec::new();
+        let cs_len = (*cstlist).length as i16;
+        for &p in referenced {
+            if p < 1 || p > (*scan_tlist).length as i16 {
+                continue;
+            }
+            let tle = pg_sys::list_nth(scan_tlist, (p - 1) as i32) as *mut pg_sys::TargetEntry;
+            if tle.is_null() || (*tle).expr.is_null() {
+                continue;
+            }
+            let expr = (*tle).expr as *mut pg_sys::Node;
+            if (*expr).type_ != pg_sys::NodeTag::T_Var {
+                continue;
+            }
+            let v = expr as *mut pg_sys::Var;
+            if (*v).varno != pg_sys::INDEX_VAR {
+                continue;
+            }
+            let k = (*v).varattno;
+            if k < 1 || k > cs_len {
+                continue;
+            }
+            let cs_tle = pg_sys::list_nth(cstlist, (k - 1) as i32) as *mut pg_sys::TargetEntry;
+            if cs_tle.is_null() || (*cs_tle).expr.is_null() {
+                continue;
+            }
+            let col_idx = (k - 1) as i32; // 0-based col_idx into col_names
+            let cs_expr = (*cs_tle).expr as *mut pg_sys::Node;
+            if (*cs_expr).type_ == pg_sys::NodeTag::T_Var {
+                if !new_cols.contains(&col_idx) {
+                    new_cols.push(col_idx);
+                }
+            } else if !new_synth.contains(&col_idx) {
+                new_synth.push(col_idx);
+            }
+        }
+
+        // Add columns referenced by scan-level qual via direct Var refs.
+        // After set_plan_references, scan-level Vars carry varno=INDEX_VAR
+        // (custom_scan_tlist active) — same shape we already mapped.
+        // Vars that are NOT INDEX_VAR (still varno=rti) reference the underlying
+        // relation by attno — find a physical entry in cstlist whose Var has
+        // matching varattno.
+        let scan_qual = (*cscan).scan.plan.qual;
+        if !scan_qual.is_null() {
+            let mut qual_outer: PosSet = Vec::new();
+            collect_outer_var_attnos_in_list(scan_qual, &mut qual_outer);
+            // Reuse the OUTER_VAR collector for INDEX_VAR — easier: walk and
+            // find any Var refs to the cstlist or the underlying rel.
+            let mut qual_index: PosSet = Vec::new();
+            let mut qual_relvar_attnos: PosSet = Vec::new();
+            collect_index_and_rel_var_attnos_in_list(
+                scan_qual,
+                &mut qual_index,
+                &mut qual_relvar_attnos,
+            );
+            for &k in &qual_index {
+                if k < 1 || k > cs_len {
+                    continue;
+                }
+                let col_idx = (k - 1) as i32;
+                let cs_tle = pg_sys::list_nth(cstlist, (k - 1) as i32) as *mut pg_sys::TargetEntry;
+                if cs_tle.is_null() || (*cs_tle).expr.is_null() {
+                    continue;
+                }
+                let cs_expr = (*cs_tle).expr as *mut pg_sys::Node;
+                if (*cs_expr).type_ == pg_sys::NodeTag::T_Var {
+                    if !new_cols.contains(&col_idx) {
+                        new_cols.push(col_idx);
+                    }
+                } else if !new_synth.contains(&col_idx) {
+                    new_synth.push(col_idx);
+                }
+            }
+            for &attno in &qual_relvar_attnos {
+                // Find cstlist entry with physical Var(varattno == attno).
+                for k in 1..=cs_len {
+                    let cs_tle =
+                        pg_sys::list_nth(cstlist, (k - 1) as i32) as *mut pg_sys::TargetEntry;
+                    if cs_tle.is_null() || (*cs_tle).expr.is_null() {
+                        continue;
+                    }
+                    let cs_expr = (*cs_tle).expr as *mut pg_sys::Node;
+                    if (*cs_expr).type_ != pg_sys::NodeTag::T_Var {
+                        continue;
+                    }
+                    let cs_v = cs_expr as *mut pg_sys::Var;
+                    if (*cs_v).varattno == attno {
+                        let col_idx = (k - 1) as i32;
+                        if !new_cols.contains(&col_idx) {
+                            new_cols.push(col_idx);
+                        }
+                        break;
+                    }
+                }
+            }
+            // OUTER_VAR refs in scan-level qual shouldn't normally appear
+            // here, but if they do we'd already have accounted for them
+            // via `referenced` (they came from the parent's descent).
+            let _ = qual_outer;
+        }
+
+        // Walk the existing custom_private to:
+        //   * preserve oids (before -1)
+        //   * preserve top-n payload (after -2 if present)
+        //   * replace Section::Cols and Section::Synth
+        let cp = (*cscan).custom_private;
+        let mut new_cp: *mut pg_sys::List = std::ptr::null_mut();
+        if !cp.is_null() {
+            #[derive(PartialEq)]
+            enum Phase {
+                BeforeMinus1,
+                InCols,
+                InTopn,
+                InSynth,
+            }
+            let mut phase = Phase::BeforeMinus1;
+            for i in 0..(*cp).length {
+                let v = pg_sys::list_nth_int(cp, i);
+                match phase {
+                    Phase::BeforeMinus1 => {
+                        new_cp = pg_sys::lappend_int(new_cp, v);
+                        if v == -1 {
+                            for &c in &new_cols {
+                                new_cp = pg_sys::lappend_int(new_cp, c);
+                            }
+                            phase = Phase::InCols;
+                        }
+                    }
+                    Phase::InCols => {
+                        if v == -2 {
+                            new_cp = pg_sys::lappend_int(new_cp, v);
+                            phase = Phase::InTopn;
+                        } else if v == -3 {
+                            // Skip ahead; we'll emit -3 ourselves below.
+                            phase = Phase::InSynth;
+                        }
+                        // else: drop (was a stale Section::Cols col_idx)
+                    }
+                    Phase::InTopn => {
+                        if v == -3 {
+                            phase = Phase::InSynth;
+                        } else {
+                            new_cp = pg_sys::lappend_int(new_cp, v);
+                        }
+                    }
+                    Phase::InSynth => {
+                        // Skip; we emit fresh synth list at the end.
+                    }
+                }
+            }
+        }
+        if !new_synth.is_empty() {
+            new_cp = pg_sys::lappend_int(new_cp, -3);
+            for &c in &new_synth {
+                new_cp = pg_sys::lappend_int(new_cp, c);
+            }
+        }
+        (*cscan).custom_private = new_cp;
+    }
+}
+
+/// Walk a node tree (typically a qual list) and partition every Var by
+/// varno: `INDEX_VAR` refs go into `out_index`, refs that don't have one of
+/// the special varnos (`OUTER_VAR`/`INNER_VAR`/`INDEX_VAR`) are treated as
+/// relation-level Vars and their attnos go into `out_relvar`. The latter
+/// arise when scan-level quals haven't been mapped through `custom_scan_tlist`
+/// — typical for quals our walker hasn't rewritten.
+///
+/// Uses `pull_var_clause` so node-type coverage matches PG core.
+unsafe fn collect_index_and_rel_var_attnos_in_list(
+    list: *mut pg_sys::List,
+    out_index: &mut PosSet,
+    out_relvar: &mut PosSet,
+) {
+    unsafe {
+        if list.is_null() {
+            return;
+        }
+        let var_list = pg_sys::pull_var_clause(list as *mut pg_sys::Node, PVC_FLAGS_FULL);
+        if var_list.is_null() {
+            return;
+        }
+        for i in 0..(*var_list).length {
+            let v = pg_sys::list_nth(var_list, i) as *mut pg_sys::Var;
+            if v.is_null() || (*(v as *mut pg_sys::Node)).type_ != pg_sys::NodeTag::T_Var {
+                continue;
+            }
+            let varno = (*v).varno;
+            if varno == pg_sys::INDEX_VAR {
+                let k = (*v).varattno;
+                if !out_index.contains(&k) {
+                    out_index.push(k);
+                }
+            } else if varno != pg_sys::OUTER_VAR && varno != pg_sys::INNER_VAR {
+                let k = (*v).varattno;
+                if k > 0 && !out_relvar.contains(&k) {
+                    out_relvar.push(k);
+                }
+            }
         }
     }
 }
@@ -1445,6 +2115,14 @@ unsafe fn rebuild_custom_scan_tlist_from_catalog(
         // SPI lookup of json_extract for this rel.
         let specs = crate::scan::path::load_extract_specs_for_rel_pub(rel_oid);
         if specs.is_empty() {
+            return None;
+        }
+        // Mixed-partition gate: if any relevant compressed partition
+        // predates `json_extract_added_at`, its companion blobs lack the
+        // synthetic columns and the rewrite would emit NULLs at synthetic
+        // positions. Skip the rewrite — falls through to the slow chain-Expr
+        // path which still works correctly on those partitions.
+        if !crate::scan::path::is_json_extract_safe_for_rel(rel_oid) {
             return None;
         }
 

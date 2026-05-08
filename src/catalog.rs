@@ -243,9 +243,16 @@ pub fn update_deltatable_compression(
     let seg_vec = segment_by.to_vec();
     let ord_vec = order_by.to_vec();
     if let Some(jx) = json_extract {
+        // Stamp `json_extract_added_at` whenever json_extract is (re)set so
+        // the planner can gate the rewrite on partitions compressed before
+        // this point. Any change (add/remove a path, replace the list) bumps
+        // the timestamp; partitions whose `compressed_at < json_extract_added_at`
+        // are missing the synthetic columns and must fall through to the slow
+        // path.
         client.update(
             "UPDATE deltax_deltatable
-             SET segment_by = $1, order_by = $2, segment_size = $3, json_extract = $4
+             SET segment_by = $1, order_by = $2, segment_size = $3,
+                 json_extract = $4, json_extract_added_at = now()
              WHERE id = $5",
             None,
             &[

@@ -202,5 +202,5 @@ sudo -u postgres psql -c "ALTER DATABASE $DB SET jit TO off"
 sudo -u postgres psql "$DB" -c "SELECT * FROM deltax_partition_info('bluesky')"
 sudo -u postgres psql "$DB" -c "SELECT count(*) AS default_partition_rows FROM bluesky_default"
 
-echo "Setup complete. Database '$DB' is ready (SCALE=$SCALE, dataset=$DATASET_SIZE_LABEL)."
+echo "Setup complete. Database '$DB' is ready (SCALE=$SCALE, dataset=${SCALE}m)."
 echo "Run all queries with: ./run.sh"
