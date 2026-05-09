@@ -1,15 +1,26 @@
 # Parallel-aware DeltaXAgg — implementation plan
 
-> **Note (2026-05)**: this doc has been revised in place after a mid-flight design pivot. The original plan (Phases A–F, all built around DSM-slab worker parallelism for the complete CustomScan path) was abandoned in favour of a partial+Gather+FinalAgg model — see "C.2 activation followup". As a result, items C.2.b–e and C.4 are marked superseded (⊘) rather than deleted; the body of the doc still describes the original DSM design in places (Phase C "Approach", Critical files, Reuse list) for historical context. The Status section + the C.2 activation followup + Partial-path coverage extensions sections together describe **what's actually live and what's open**.
+> **Status: closed (2026-05)**. The doc was revised in place after a mid-flight design pivot (DSM-slab parallelism abandoned in favour of partial+Gather+FinalAgg) and is now retrospective rather than active planning. The original goal — improve JSONBench performance without ClickBench/RTABench regressions — was met (total warm 68s → ~26s, ~2.6×), but mostly by an out-of-band fix (JSON-extract chain eligibility) rather than by completing the planned phases. See "Status as of close" below for what's live and what's deferred. Further parallel-agg work, if any, is tracked separately.
 
-## What's actually open
+## Status as of close
 
-After the pivot:
-- **C.3** — tri-state `BatchEval` + `SegmentEval` per-segment fast path. Independent of pivot, still useful.
-- **Partial-path coverage extensions** (modern C.4 equivalent) — text WHERE, SUM(int8) / AVG, HAVING, COUNT(DISTINCT). Each broadens the partial+Gather+FinalAgg path's eligibility.
-- **Phase E** — HAVING in the partial path (overlaps with the coverage extensions).
-- **Phase F** — EXPLAIN per-worker stats + GUCs + hardening.
-- **Phase G follow-ups** for high-cardinality COUNT(DISTINCT text)** — pre-hashed text sidecars / hash-as-storage encodings / approximate count-distinct (HLL). Not in original doc; surfaced when Phase D didn't move JSONBench Q1.
+**Live in production**:
+- Phase A, B (refactor + DSM hook scaffolding — scaffolding compiled but dormant; the DSM hooks are kept around in case the model is ever revived).
+- Partial+Gather+FinalAgg path (the C.2 activation followup model). Active for queries with numeric WHERE + integer-packable group keys + aggs in `agg_specs_partial_emittable`. Contributed the original ~19% RTABench / ~6% ClickBench wins documented under "C.2 activation followup".
+- C.3 per-segment fast path. `classify_segment_quals` + the new `classify_segment_quals_numeric` variant skip NonePass segments without decompression and skip `evaluate_batch_quals` on AllPass.
+- JSON-extract chain eligibility for DeltaXAgg path (out-of-band — the actual JSONBench Q1 win, 49s → 2.1s warm).
+- Phase D infrastructure (`Bitset`, `DictDistinctRemap`, parallel pre-pass, `CdKind::DictBitset`). Activates when every relevant segment is dict-encoded for the COUNT(DISTINCT text) column AND post-dedup global cardinality fits the memory budget. Dormant on JSONBench (x_did is Lz4Blocked, fails the dict heuristic) but exercised by `test_meta_agg.py::test_phase_d_*`.
+- Phase F GUC `pg_deltax.disable_parallel_agg` — operator escape hatch that disables `add_agg_partial_path` and routes everything through the complete CustomScan path.
+
+**Deferred — not load-bearing on any current benchmark**:
+- **Partial-path coverage extensions** (modern C.4 equivalent — text WHERE, SUM(int8) / AVG, HAVING). Lifting the WHERE-numeric gate was attempted in this session: the runtime dispatch in `run_partial_aggregate_in_process` to `process_segments_mixed` works correctly + tests pass, but local benches showed a 5-7% RTABench / 6% ClickBench regression because the planner picks the partial path for queries where the complete path's internal-rayon was faster (PG worker fork overhead exceeds the parallelism gain on bench-class shapes). Both code changes were reverted; the comment on `is_partial_eligible_var_type` captures the lesson. Re-enabling needs `cost::estimate_agg_cost` to penalise fork overhead first.
+- **Phase E** (HAVING in the partial path). Half-day per the original plan, but no current benchmark depends on it; wait for a real workload need.
+- **Phase F** EXPLAIN per-worker stats. The runtime dispatches `process_segments_mixed` / `process_segments_compact` chunk-by-chunk so per-PG-worker stats don't have a natural home; deferred.
+
+**Deferred — speculative / harder follow-ups**:
+- **Phase G — high-cardinality COUNT(DISTINCT text)**. Surfaced when Phase D didn't move JSONBench Q1 (x_did is 3.6M unique, Lz4Blocked-encoded). Three plausible directions: pre-hashed text sidecars (store `Vec<u128>` alongside the text blob, populated at compress time); hash-as-storage encodings for high-cardinality text columns (xxhash3 fingerprints instead of raw bytes — opt-in, narrowly useful); approximate count-distinct (HLL). All three are speculative — none directly target a current benchmark gap below 2× of ClickHouse.
+
+The body of the doc below still describes the original DSM-slab plan in places (Phase C "Approach", Critical files, Reuse list) for historical context. Items C.2.b–e and C.4 are marked superseded (⊘) rather than deleted.
 
 ## Status
 

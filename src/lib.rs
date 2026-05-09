@@ -37,6 +37,16 @@ pub(crate) static MAX_PARALLEL_WORKERS_PER_SCAN: GucSetting<i32> =
 pub(crate) static DISABLE_META_AGG_FASTPATH: GucSetting<bool> =
     GucSetting::<bool>::new(false);
 
+/// When true, `add_agg_partial_path` returns early and the planner only
+/// sees the complete CustomScan DeltaXAgg path. Escape hatch for the
+/// partial+Gather+FinalAgg model (PARALLEL_AGG.md "C.2 activation
+/// followup"); useful for bisecting suspected regressions on the
+/// partial path or comparing the two paths' end-to-end timings on the
+/// same query. The complete path's internal-rayon parallelism still
+/// runs — this only disables the PG-level partial-path activation.
+pub(crate) static DISABLE_PARALLEL_AGG: GucSetting<bool> =
+    GucSetting::<bool>::new(false);
+
 /// Controls how COPY ... FORMAT deltax_compress extracts JSON paths into
 /// extra columnar columns alongside the original JSONB, and whether the
 /// planner_hook walker rewrites upper-plan chain Exprs to read from
@@ -197,6 +207,14 @@ pub extern "C-unwind" fn _PG_init() {
         c"Disable DeltaXCount/DeltaXMinMax fast paths for queries with WHERE clauses",
         c"When ON, queries that could be answered from per-segment metadata fall through to the generic DeltaXAgg path instead. Used for correctness A/B testing.",
         &DISABLE_META_AGG_FASTPATH,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_bool_guc(
+        c"pg_deltax.disable_parallel_agg",
+        c"Disable the partial+Gather+FinalAgg path for DeltaXAgg",
+        c"When ON, add_agg_partial_path is a no-op and the planner only sees the complete CustomScan DeltaXAgg. Escape hatch for bisecting suspected regressions on the partial path; the complete path's internal-rayon parallelism still runs.",
+        &DISABLE_PARALLEL_AGG,
         GucContext::Userset,
         GucFlags::default(),
     );

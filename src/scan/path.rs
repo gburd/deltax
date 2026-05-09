@@ -1227,6 +1227,12 @@ pub unsafe fn add_agg_partial_path(
 ) {
     unsafe {
         // -------- Eligibility --------
+        // Operator escape hatch: when `pg_deltax.disable_parallel_agg = on`,
+        // the planner only sees the complete CustomScan DeltaXAgg path.
+        // The complete path's internal-rayon parallelism still runs.
+        if crate::DISABLE_PARALLEL_AGG.get() {
+            return;
+        }
         if extra.is_null() {
             return;
         }

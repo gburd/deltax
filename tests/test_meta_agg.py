@@ -377,6 +377,26 @@ def test_phase_d_count_distinct_with_where(db):
     assert fast == ref, f"Phase D + WHERE: fast={fast} ref={ref}"
 
 
+def test_disable_parallel_agg_guc(db):
+    """`pg_deltax.disable_parallel_agg = on` is the operator escape hatch
+    for the partial+Gather+FinalAgg path. With it on, only the complete
+    CustomScan DeltaXAgg path runs (still internally parallel via rayon).
+    Correctness gate: numeric-WHERE queries on a multi-segment table —
+    the shape that *would* trigger the partial path — produce identical
+    results either way."""
+    _seed(db, n_partitions=3, rows_per_partition=30_000)
+    sql = "SELECT count(*), sum(val) FROM events WHERE val > 100"
+    default = db.execute(sql).fetchone()
+    db.execute("SET pg_deltax.disable_parallel_agg = on")
+    try:
+        disabled = db.execute(sql).fetchone()
+    finally:
+        db.execute("RESET pg_deltax.disable_parallel_agg")
+    assert default == disabled, (
+        f"disable_parallel_agg results differ: default={default} disabled={disabled}"
+    )
+
+
 def test_c3_segment_skipping_with_numeric_where(db):
     """C.3 per-segment fast path: a numeric WHERE that rejects an entire
     segment via col_minmax should let the worker skip it without
