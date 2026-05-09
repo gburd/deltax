@@ -7475,6 +7475,42 @@ pub(super) unsafe extern "C-unwind" fn exec_agg_scan(
         let scan_slot = (*node).ss.ss_ScanTupleSlot;
         let state = &mut *((*node).custom_ps as *mut AggScanState);
 
+        // Phase C.2 activation: partial-mode runtime. Every process (leader
+        // and workers) claims segments via the shared DSM cursor, builds a
+        // process-local accumulator, finalises into per-group partial-state
+        // rows, and emits them. PG's Gather concatenates rows from N
+        // processes; the Final Aggregate above combines partials per group
+        // via aggcombinefn. No DSM-slab serialise / spin-wait / leader
+        // merge — each process is independent.
+        let is_partial_mode = state
+            .exec_ctx
+            .as_ref()
+            .map(|c| c.is_partial)
+            .unwrap_or(false);
+        if is_partial_mode {
+            let already_done = state
+                .exec_ctx
+                .as_ref()
+                .map(|c| c.merged)
+                .unwrap_or(true);
+            if !already_done {
+                run_partial_aggregate_in_process(state);
+            }
+            if state.result_idx < state.result_rows.len() {
+                pg_sys::ExecClearTuple(scan_slot);
+                let row = &state.result_rows[state.result_idx];
+                for (i, &(datum, is_null)) in row.iter().enumerate() {
+                    (*scan_slot).tts_values.add(i).write(datum);
+                    (*scan_slot).tts_isnull.add(i).write(is_null);
+                }
+                pg_sys::ExecStoreVirtualTuple(scan_slot);
+                state.result_idx += 1;
+                return scan_slot;
+            }
+            pg_sys::ExecClearTuple(scan_slot);
+            return scan_slot;
+        }
+
         // Phase C.2.d: parallel workers run the claim+aggregate+serialise
         // loop on their first exec call. Subsequent calls return EOF — the
         // leader picks up partial slabs in C.2.e via a spin-wait on
@@ -7728,6 +7764,92 @@ unsafe fn finalise_compact_into_result_rows(
             rows.push(row);
         }
         rows
+    }
+}
+
+/// Phase C.2 activation — partial-mode in-process aggregation. Every
+/// process (leader and workers) calls this on its first `exec_agg_scan`
+/// invocation. Claims segments via the shared DSM cursor, accumulates into
+/// a process-local `ParallelCompactResult`, then finalises into
+/// `state.result_rows` using `compact_emit_partial` per slot. PG's Gather
+/// + Final Aggregate above combine partials per group via the aggregate's
+/// `aggcombinefn`.
+///
+/// Differs from `run_worker_partial_aggregate` (complete-mode workers
+/// writing to DSM) and `run_leader_merge_and_finalise` (complete-mode
+/// leader merging worker DSM slabs) — neither is invoked in partial mode
+/// because there's no inter-process DSM merge step.
+unsafe fn run_partial_aggregate_in_process(state: &mut AggScanState) {
+    unsafe {
+        if state.pscan.is_null() {
+            return;
+        }
+        let total_segments = (*state.pscan).total_segments;
+
+        let ctx = match state.exec_ctx.as_mut() {
+            Some(c) => c,
+            None => return,
+        };
+
+        let mut local = ParallelCompactResult::empty(&ctx.agg_specs);
+
+        if total_segments > 0 {
+            let cfg = ParallelCompactConfig {
+                agg_specs: &ctx.agg_specs,
+                group_specs: &ctx.group_specs,
+                col_names: &ctx.meta.col_names,
+                col_types: &ctx.meta.col_types,
+                segment_by: &ctx.meta.segment_by,
+                needed_cols: &ctx.needed_cols,
+                batch_quals: &ctx.batch_quals,
+                seg_filters: &ctx.seg_filters,
+                time_min: ctx.time_min,
+                time_max: ctx.time_max,
+                topn_spec: None,
+            };
+            const CHUNK: u64 = 4;
+            loop {
+                let start = (*state.pscan).next_segment.fetch_add(CHUNK, Ordering::Relaxed);
+                if start >= total_segments {
+                    break;
+                }
+                let end = (start + CHUNK).min(total_segments);
+                let slice = &ctx.all_segments[start as usize..end as usize];
+                let chunk_result = process_segments_compact(slice, &cfg);
+                merge_compact_results(
+                    &mut local.compact_map,
+                    &mut local.compact_storage,
+                    &mut local.cd_sidecar,
+                    &chunk_result.compact_map,
+                    &chunk_result.compact_storage,
+                    &chunk_result.cd_sidecar,
+                    &ctx.agg_specs,
+                );
+                local.segments_processed += chunk_result.segments_processed;
+                local.rows_processed += chunk_result.rows_processed;
+                local.decompress_us = local.decompress_us.max(chunk_result.decompress_us);
+            }
+        }
+
+        // Finalise into per-group partial-state rows. is_partial=true →
+        // compact_emit_partial chooses the right `aggtranstype` value per
+        // slot; PG's Final Aggregate above combines via aggcombinefn.
+        let result_rows = finalise_compact_into_result_rows(
+            &local.compact_map,
+            &local.compact_storage,
+            &ctx.agg_specs,
+            &ctx.group_specs,
+            &ctx.output_map,
+            ctx.num_result_cols,
+            /* is_partial */ true,
+        );
+
+        state.total_segments = local.segments_processed;
+        state.total_rows_processed = local.rows_processed;
+        state.decompress_us = local.decompress_us;
+        state.result_rows = result_rows;
+        state.result_idx = 0;
+        ctx.merged = true;
     }
 }
 

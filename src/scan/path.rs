@@ -1104,6 +1104,35 @@ fn parallel_compact_aggs_ok(agg_specs: &[AggSpec]) -> bool {
     })
 }
 
+/// Phase C.2 activation — predicate restricting partial-mode emit to the
+/// aggregate shapes `compact_emit_partial` knows how to serialise. Today:
+/// COUNT/COUNT(*) → int8; SUM(int2/int4) → int8; SUM(float4/float8) →
+/// float8; MIN/MAX(text) → text. Excludes SUM(int8) (transtype=internal,
+/// needs int8_avg_serialize), AVG (same), and COUNT(DISTINCT) (no
+/// aggcombinefn in PG core).
+#[allow(dead_code)] // wired by the next-iteration partial-path constructor
+fn agg_specs_partial_emittable(agg_specs: &[AggSpec]) -> bool {
+    if agg_specs.is_empty() {
+        return false;
+    }
+    agg_specs.iter().all(|spec| match spec.agg_type {
+        super::exec::AggType::CountStar | super::exec::AggType::Count => true,
+        super::exec::AggType::Sum => {
+            let t = spec.col_type_oid;
+            t == pg_sys::INT2OID
+                || t == pg_sys::INT4OID
+                || t == pg_sys::FLOAT4OID
+                || t == pg_sys::FLOAT8OID
+        }
+        super::exec::AggType::Min | super::exec::AggType::Max => {
+            let t = spec.col_type_oid;
+            t == pg_sys::TEXTOID || t == pg_sys::VARCHAROID || t == pg_sys::BPCHAROID
+        }
+        // SUM(int8) / AVG / COUNT(DISTINCT) excluded.
+        _ => false,
+    })
+}
+
 /// Add a DeltaXAgg custom path to the grouped relation's pathlist.
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn add_agg_path(

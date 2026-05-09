@@ -30,14 +30,21 @@ The DSM-merge model from C.2.b–e turned out to be a poor fit for PG's `Gather`
 
 **Initial scaffolding (this commit)**: `AggSpec` (path-side) and `AggExecSpec` (exec-side) gain `is_partial: bool` + `transtype_oid: Oid`. Default `false` / `InvalidOid` everywhere — no behaviour change. Wired through every constructor in `hook.rs`, `path.rs`, `agg.rs`, `agg_wire.rs` test fixtures.
 
-**Remaining work** (~3-5 commits):
-1. `compact_emit_partial(storage, group_idx, slot, spec) -> (Datum, bool)` alongside `compact_finalize`. For COUNT it's identical to the existing `Count` finalize; for SUM(int4) it's the i64 sum (combinefn `int8pl`); for MIN/MAX(text) it's the text directly. SUM(int8) and AVG need `int8_avg_serialize` calls (defer until later iteration).
-2. `add_agg_partial_path(root, output_rel, ...)` in `path.rs`: build partial CustomPath with `parallel_aware = true`, fetch `partially_grouped_rel`, manually call `create_gather_path` + `create_agg_path(AGGSPLIT_FINAL_DESERIAL, ...)` + `add_path(grouped_rel, ...)`. Eligibility: COUNT-only initially (broaden as the partial emit code grows).
-3. Plumb `is_partial` through `parse_agg_private` + custom_private serialisation (bit flag in the int list).
-4. `exec_agg_scan` and `finalise_compact_into_result_rows` branch on `ctx.is_partial` to call `compact_emit_partial` instead of `compact_finalize`. The output target type comes from `partially_grouped_rel.reltarget` so each col's Datum/typeOid must line up.
-5. Validation: ClickBench (43 queries — keep correct, no >20% regression on existing serial DeltaXAgg picks), RTABench (31 queries vs plain PG), JSONBench Q3/Q4 (target 3.2s → ~0.8s).
+**Progress so far**:
+1. ✅ `compact_emit_partial(storage, group_idx, slot, spec) -> (Datum, bool)` alongside `compact_finalize`. Coverage: Count → int8; SumIntNarrow (SUM only) → int8; SumFloat (SUM only) → float8; MinStr/MaxStr → text. Unsupported branches `unreachable!()`.
+2. ✅ `is_partial: bool` + `transtype_oid: Oid` added to `AggSpec` (path-side) and `AggExecSpec` (exec-side). Trailer plumbed through path-private (built by `add_agg_path` / `build_agg_path_private`), through plan-private (re-emitted by `plan_agg_path`), through `parse_agg_private` + `ParsedAggPlan` + `AggExecContext`.
+3. ✅ `finalise_compact_into_result_rows` branches on `ctx.is_partial` → calls `compact_emit_partial` instead of `compact_finalize`.
+4. ✅ `exec_agg_scan` partial-mode runtime: `run_partial_aggregate_in_process` (every process claims segments via the shared DSM cursor, accumulates locally, emits per-group partial rows; PG's Gather + Final Aggregate combine). No DSM slabs, no leader-merge.
+5. ⏸️ `add_agg_partial_path` planner-side construction (build partial CustomPath, manually wrap in `create_gather_path` + `create_agg_path(AGGSPLIT_FINAL_DESERIAL)`, `add_path(grouped_rel, ...)`). **First attempt removed** because `process_segments_compact` only handles numeric columns — when the WHERE clause references TEXT columns (e.g. RTABench Q9's `event_type='Departed'`), `evaluate_batch_quals` silently skips the qual on the unloaded text col → over-counts (Q9: 22 instead of 5). Lesson: partial-path eligibility must reject any query that references non-numeric columns in agg specs, group keys, OR `where_quals`. The text-handling parallel-mixed code path exists in serial mode; partial mode would need to mirror it (or restrict to numeric-only queries up front).
+6. ⏸️ Validation pass.
 
-Risk areas: making sure the CustomScan's tuple slot values match the Aggref result types in `partially_grouped_rel.reltarget` so PG's executor + Final Aggregate work; making sure cost estimates favor parallel only where it actually wins (high segment count, low-medium group cardinality).
+**Remaining**:
+- Eligibility predicate at planning time that walks `(*root).parse->jointree->quals` for non-numeric Var references (or load metadata via SPI to check needed-col types). Reject conservatively.
+- Optional: extend partial-mode runtime to cover text quals too (mirror parallel-mixed in `process_segments_compact_with_text` or similar).
+- Re-introduce `add_agg_partial_path` with the corrected eligibility.
+- ClickBench (43 queries — keep correct, no >20% regression), RTABench (31 queries vs plain PG), JSONBench Q3/Q4 (target 3.2s → ~0.8s).
+
+The plumbing (all 4 ✅ items above) is correct and dormant — `add_agg_path` always sets `is_partial = false`. None of `compact_emit_partial`, `run_partial_aggregate_in_process`, or the `is_partial` branches in `finalise_compact_into_result_rows` are reachable until a future correctly-gated `add_agg_partial_path` is added.
   - [ ] **C.3**: extend `evaluate_batch_quals` (`batch_qual.rs:495`) to return tri-state `BatchEval { AllPass, AllReject, Selective(Bitmap) }`; add `enum SegmentEval { FullMetadata, PerSegmentByGroup, PerRow }` so per-segment metadata (`col_minmax / col_sums / row_count`) can short-circuit decompression for full-segment cases.
   - [ ] **C.4**: gate `add_agg_path` for parallel (`parallel_safe = true, parallel_workers = recommend_agg_workers(...)`). Update `cost::estimate_agg_cost` so the planner picks the parallel variant on large inputs. Add `tests/test_aggregate_pushdown.py` (parametrize over `max_parallel_workers_per_gather ∈ {0, 2, 4, 8}`) for correctness, and an EXPLAIN assertion that DeltaXAgg picks `parallel_workers > 0` on Q3/Q4-shaped queries.
 - [ ] Phase D — parallel `COUNT(DISTINCT)` for dictionary-encoded text columns.
