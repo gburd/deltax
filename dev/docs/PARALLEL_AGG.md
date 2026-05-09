@@ -114,31 +114,65 @@ Leader's `exec_agg_scan` first call: deserialise all partial states from DSM, ru
 
 **Expected JSONBench impact**: Q3 3.2s → ~0.8s, Q4 3.6s → ~0.8s. Q0/Q2 unaffected.
 
-### Phase D — Parallel COUNT(DISTINCT) for dict-encoded text — ~1-2 days
+### Phase D — Parallel COUNT(DISTINCT) for dict-encoded text — ~3-5 days (revised post-exploration)
 
 Load-bearing piece for Q1. Each segment's dictionary already enumerates the distinct values in that segment.
 
-**Algorithm**: during `initialize_dsm_deltax_agg`, the leader scans every relevant segment's dict blob (cheap — dict headers are small, ~few KB per segment) and builds a global string interner mapping each unique value to a final `u32` ID. Workers, on segment claim, decode the local dict, remap segment-local IDs → final global IDs, then for each group accumulator union the matching IDs into a `BitVec` keyed by global ID. **No per-row string work.**
+**Architecture revision (after exploring the existing code in this repo)**:
 
-`DistinctAcc` enum:
+Phase D was originally specced around the DSM-parallel infrastructure. After the C.2 activation lessons, Phase D is independent of the partial+Gather+FinalAgg path — PG core has no `aggcombinefn` for COUNT(DISTINCT) so the partial path can't carry it. Phase D uses **internal rayon** (one PG process, multiple threads inside it) — same model as today's `all_count_distinct` rayon path at `agg.rs:5398–5660` (which only fires for ungrouped DISTINCT-only queries with no WHERE). JSONBench Q1 has GROUP BY + COUNT(*) + COUNT(DISTINCT), so it doesn't hit that fast path; it goes through a slower grouped CountDistinct emit loop that's currently single-threaded.
+
+**Two orthogonal optimisations** (both needed for the full Q1 win):
+
+1. **Bitset instead of HashSet** for dict-encoded text (~10×). Today's grouped CountDistinct path stores per-group hashes as `HashSet<u128>`. Replace with a `BitVec` indexed by a **leader-precomputed global string ID** so per-row work collapses to a single bit-set.
+2. **Parallelism across segments** via rayon (~4–6×). Today's grouped CountDistinct path is single-threaded; the existing `all_count_distinct` path's `std::thread::scope` chunking shows the shape to mirror.
+
+Both together: 43s → ~3s warm for Q1.
+
+**Algorithm**:
+
+1. **Eligibility detection** (in `begin_agg_scan` after segments load): for each `COUNT(DISTINCT col)` target, check ALL relevant segments have `col` in `CompressionType::Dictionary` or `DictionaryLz4`. If yes → bitset path; otherwise → direct HashSet fallback (today's behaviour).
+2. **Leader pre-pass**: walk all eligible segments' dict blobs via `compression::dictionary::parse_header` (zero string allocations — borrows the dict entries from the input buffer). Build a global `HashMap<&str, u32>` interner per dict-eligible column. Build `Vec<Vec<u32>>` per-(column, segment) local-→-global remap tables.
+3. **Per-segment work** (rayon thread): decode each row's dict ID → look up `global_remap[col][seg][local_id]` → set that bit in the per-group `BitVec`. **No per-row string work.**
+4. **Merge** (rayon collect): union `BitVec` pairwise (`a | b`). Cost: O(global_id_count / 8) per merge, not O(distinct_count).
+5. **Finalise**: `bitset.count_ones()` per group.
+
+**`DistinctAcc` enum** (replaces today's `CdEntry.sets_int` / `sets_str` split):
 
 ```rust
 enum DistinctAcc {
     TextDictBitset(BitVec),         // dict-encoded text — load-bearing for Q1
-    TextDirectSet(HashSet<Box<str>>), // raw text fallback
-    Int64Set(HashSet<i64>),
-    F64BitsSet(HashSet<u64>),
-    Bool(u8),
+    TextDirectSet(HashSet<u128>),   // raw text fallback (current behaviour)
+    Int64Set(HashSet<i64>),         // integer DISTINCT (current behaviour)
+    F64BitsSet(HashSet<u64>),       // float DISTINCT (future)
+    Bool(u8),                        // bitset of {seen_false, seen_true}
 }
 ```
 
-Merge: union the bitsets pairwise (`worker_a | worker_b`). Final `count_distinct = bitset.count_ones()`.
+NULL handling: `COUNT(DISTINCT col)` excludes NULLs. Dict NULL sentinel filtered before bit-set insertion. Direct sets skip NULLs (today's behaviour).
 
-For non-dict-encoded columns the path still parallelises via direct `HashSet` per worker + leader-side union — slower per row but still parallel.
+**Concrete edits**:
 
-NULL handling: `COUNT(DISTINCT col)` excludes NULLs. Dict NULL sentinel filtered before bitset insertion. Direct sets skip NULLs.
+| Where (file:approx-line) | Change |
+|---|---|
+| `agg.rs::AggScanState` (~line 399) | Add `dict_global_interner: Option<HashMap<String, u32>>` and `dict_local_remaps: Vec<Vec<u32>>` (per col × per segment). |
+| `agg.rs::begin_agg_scan` after segments loaded (~line 2041) | New eligibility predicate + leader pre-pass building interner + remap tables. |
+| `agg.rs::CdEntry` (~line 8157) | Refactor `sets_int` / `sets_str` to `accs: Vec<DistinctAcc>` per group. `insert_*` dispatches by variant. |
+| `agg.rs` grouped CountDistinct emit loop (the path Q1 takes — ~line 5480 area) | When dict-eligible, set bits via `global_remap` lookup; otherwise fall back to today's `hash128_str` + `HashSet` path. |
+| `agg.rs::merge_compact_results` (~line 9530) | Bitset OR for `TextDictBitset`; existing `union_from` semantics for other variants. |
+| `agg.rs::compact_finalize` CountDistinctStr branch (~line 8646) | `bitset.count_ones()` for `TextDictBitset`; `set.len()` for the rest. |
+| `agg.rs::process_segments_compact` (~line 9350) | The `unreachable!("CountDistinctStr in compact parallel worker")` becomes reachable when dict-eligible (uses bitset, no string ops). |
+| Parallelism | Mirror `all_count_distinct`'s `std::thread::scope` chunking (`agg.rs:5398–5660`) for the grouped path so segments process in parallel too. |
+| Tests | Extend `test_meta_agg.py` with `COUNT(DISTINCT dict_text)` shapes — single-segment, multi-segment, NULL excluded, GROUP BY + DISTINCT, merge correctness. Unit `#[pg_test]` for `DistinctAcc::TextDictBitset` OR + `count_ones`. |
 
-In `add_agg_path`: when an aggregate is `COUNT(DISTINCT col)` and `col`'s segment dict shape is detected at metadata load, allow `parallel_workers > 0`. Otherwise fall back to leader-only.
+**What's unrelated (don't touch)**: C.2 activation, partial+Gather+FinalAgg path, `add_agg_partial_path`, `compact_emit_partial`. Phase D fits entirely within the existing complete-aggregate CustomScan; the partial-mode runtime stays inert for COUNT(DISTINCT).
+
+**Validation gates**:
+- Unit: `DistinctAcc::TextDictBitset` OR + `count_ones` (no PG fixture needed).
+- Integration: extend `test_meta_agg.py` with COUNT(DISTINCT) on dict-encoded text shapes.
+- Local correctness: same query results vs `pg_deltax.disable_meta_agg_fastpath=on` baseline.
+- ClickBench (43 queries) + RTABench (31 queries) regression sweep — must stay correct, no >20% regression.
+- JSONBench Q1 EC2: target 43s → ~3s warm.
 
 **Expected JSONBench impact**: Q1 43s → ~3s warm. Remaining gap is dict-union itself (fundamental).
 
