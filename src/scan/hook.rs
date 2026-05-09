@@ -3069,6 +3069,25 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
             pg_estimated_groups,
             pathkeys,
         );
+
+        // Phase C.2 activation — add a partial-mode CustomPath through PG's
+        // Gather + Final Aggregate model. add_agg_partial_path self-gates
+        // (eligibility predicate inside) and silently no-ops when not
+        // viable. Both paths compete on cost; the planner picks whichever
+        // is cheaper. add_agg_path's complete variant always lands first
+        // so correctness is never at risk if the partial variant is
+        // rejected for any reason.
+        if !topn_active && having_filters.is_empty() {
+            path::add_agg_partial_path(
+                root,
+                output_rel,
+                &companion_oids,
+                &classified_aggs,
+                &group_specs,
+                pg_estimated_groups,
+                extra as *mut pg_sys::GroupPathExtraData,
+            );
+        }
     }
 }
 

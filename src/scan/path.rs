@@ -1110,7 +1110,6 @@ fn parallel_compact_aggs_ok(agg_specs: &[AggSpec]) -> bool {
 /// float8; MIN/MAX(text) → text. Excludes SUM(int8) (transtype=internal,
 /// needs int8_avg_serialize), AVG (same), and COUNT(DISTINCT) (no
 /// aggcombinefn in PG core).
-#[allow(dead_code)] // wired by the next-iteration partial-path constructor
 fn agg_specs_partial_emittable(agg_specs: &[AggSpec]) -> bool {
     if agg_specs.is_empty() {
         return false;
@@ -1131,6 +1130,230 @@ fn agg_specs_partial_emittable(agg_specs: &[AggSpec]) -> bool {
         // SUM(int8) / AVG / COUNT(DISTINCT) excluded.
         _ => false,
     })
+}
+
+/// Phase C.2 activation — true iff every `Var` reachable from `qual_list`
+/// has a numeric `vartype` (int / float / timestamp / date / bool). Used
+/// to gate the partial-mode CustomPath: `process_segments_compact` only
+/// decompresses numeric columns, so a WHERE qual on a non-numeric col
+/// would silently get its filter skipped (the per-row evaluator sees an
+/// empty Vec for that column and `continue`s past the qual). Rejecting
+/// such queries up front keeps the complete-aggregate path correct.
+///
+/// `pull_var_clause` walks `OpExpr` / `BoolExpr` / `FuncExpr` /
+/// `ScalarArrayOpExpr` / etc. transparently; `flags = 0` skips into
+/// aggregate args and placeholder vars (none of which appear in WHERE
+/// clauses anyway).
+#[allow(dead_code)] // wired by add_agg_partial_path below
+unsafe fn quals_reference_only_numeric_vars(qual_list: *mut pg_sys::List) -> bool {
+    if qual_list.is_null() {
+        return true;
+    }
+    unsafe {
+        let nquals = (*qual_list).length;
+        for i in 0..nquals {
+            let cell = (*qual_list).elements.add(i as usize);
+            let node = (*cell).ptr_value as *mut pg_sys::Node;
+            if node.is_null() {
+                continue;
+            }
+            let vars = pg_sys::pull_var_clause(node, 0);
+            if vars.is_null() {
+                continue;
+            }
+            let nvars = (*vars).length;
+            for j in 0..nvars {
+                let v = (*(*vars).elements.add(j as usize)).ptr_value as *mut pg_sys::Var;
+                if v.is_null() {
+                    continue;
+                }
+                if !is_partial_eligible_var_type((*v).vartype) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Set of `vartype` OIDs that `process_segments_compact` can correctly
+/// decompress + filter. Mirrors `batch_quals_all_numeric` in
+/// `agg.rs::batch_quals_all_numeric`. Diverging from that set would let
+/// the planner gate accept queries the runtime mishandles.
+fn is_partial_eligible_var_type(t: pg_sys::Oid) -> bool {
+    matches!(
+        t,
+        pg_sys::INT2OID
+            | pg_sys::INT4OID
+            | pg_sys::INT8OID
+            | pg_sys::FLOAT4OID
+            | pg_sys::FLOAT8OID
+            | pg_sys::TIMESTAMPOID
+            | pg_sys::TIMESTAMPTZOID
+            | pg_sys::DATEOID
+            | pg_sys::BOOLOID
+    )
+}
+
+/// Phase C.2 activation — adds a partial-mode DeltaXAgg CustomPath to
+/// `partially_grouped_rel.partial_pathlist`, wraps it in `Gather` (via
+/// `create_gather_path`), wraps that in a Final Aggregate
+/// (`create_agg_path` with `AGGSPLIT_FINAL_DESERIAL`), and adds the
+/// result to `grouped_rel.pathlist`. PG core's `create_grouping_paths`
+/// already populated `partially_grouped_rel.reltarget` with the partial
+/// target (Aggrefs marked `AGGSPLIT_INITIAL_SERIAL`); we piggyback on
+/// that. The planner then picks whichever of (complete-DeltaXAgg) or
+/// (partial-DeltaXAgg + Gather + Final Aggregate) is cheaper.
+///
+/// Eligibility — must all hold or we skip:
+/// - `extra` non-null and `havingQual` null (HAVING is Phase E).
+/// - `agg_specs_partial_emittable` (Count, SUM int4/float, MIN/MAX text;
+///   excludes SUM(int8) / AVG / COUNT(DISTINCT)).
+/// - Group keys empty or `can_use_compact_keys_path` (compact-eligible
+///   numeric keys).
+/// - `quals_reference_only_numeric_vars` — rejects WHERE on text /
+///   varchar / json columns. Otherwise `process_segments_compact` would
+///   silently skip the qual and over-count.
+/// - `recommend_agg_workers > 0` (worth parallelising).
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn add_agg_partial_path(
+    root: *mut pg_sys::PlannerInfo,
+    output_rel: *mut pg_sys::RelOptInfo,
+    companion_oids: &[pg_sys::Oid],
+    agg_specs: &[AggSpec],
+    group_specs: &[super::exec::GroupByColSpec],
+    pg_estimated_groups: f64,
+    extra: *mut pg_sys::GroupPathExtraData,
+) {
+    unsafe {
+        // -------- Eligibility --------
+        if extra.is_null() {
+            return;
+        }
+        let having_qual = (*extra).havingQual;
+        if !having_qual.is_null() {
+            return;
+        }
+        if !agg_specs_partial_emittable(agg_specs) {
+            return;
+        }
+        if !group_specs.is_empty() && !super::exec::can_use_compact_keys_path(group_specs) {
+            return;
+        }
+        // Reject WHERE clauses that reference non-numeric columns. See
+        // `quals_reference_only_numeric_vars` for the rationale.
+        let parse = (*root).parse;
+        if !parse.is_null() {
+            let jointree = (*parse).jointree;
+            if !jointree.is_null() && !(*jointree).quals.is_null() {
+                let q = (*jointree).quals;
+                let wrap = pg_sys::lappend(std::ptr::null_mut(), q as *mut _);
+                let ok = quals_reference_only_numeric_vars(wrap);
+                if !ok {
+                    return;
+                }
+            }
+        }
+        let workers = cost::recommend_agg_workers(companion_oids);
+        if workers <= 0 {
+            return;
+        }
+
+        // -------- Fetch partially_grouped_rel --------
+        let pgr = pg_sys::fetch_upper_rel(
+            root,
+            pg_sys::UpperRelationKind::UPPERREL_PARTIAL_GROUP_AGG,
+            (*output_rel).relids,
+        );
+        if pgr.is_null() {
+            return;
+        }
+        if (*pgr).reltarget.is_null() {
+            return;
+        }
+
+        // -------- Build partial CustomPath --------
+        let cpath =
+            pg_sys::palloc0(std::mem::size_of::<pg_sys::CustomPath>()) as *mut pg_sys::CustomPath;
+        (*cpath).path.type_ = pg_sys::NodeTag::T_CustomPath;
+        (*cpath).path.pathtype = pg_sys::NodeTag::T_CustomScan;
+        (*cpath).path.parent = pgr;
+        (*cpath).path.pathtarget = (*pgr).reltarget;
+
+        let estimated_rows = if group_specs.is_empty() {
+            1.0
+        } else if pg_estimated_groups > 0.0 {
+            pg_estimated_groups
+        } else {
+            100.0
+        };
+        (*cpath).path.rows = estimated_rows;
+
+        let (startup, total) = cost::estimate_agg_cost(
+            companion_oids,
+            agg_specs.len(),
+            estimated_rows,
+            /* num_having_filters */ 0,
+            workers as usize,
+        );
+        (*cpath).path.startup_cost = startup;
+        (*cpath).path.total_cost = total;
+        (*cpath).path.parallel_workers = workers;
+        (*cpath).path.parallel_aware = true;
+        (*cpath).path.parallel_safe = true;
+        (*cpath).path.pathkeys = std::ptr::null_mut();
+
+        let private_list = build_agg_path_private(
+            companion_oids,
+            agg_specs,
+            group_specs,
+            /* is_partial */ true,
+        );
+        (*cpath).custom_private = private_list;
+        (*cpath).custom_paths = std::ptr::null_mut();
+        (*cpath).custom_restrictinfo = std::ptr::null_mut();
+        (*cpath).methods = &DELTAX_AGG_PATH_METHODS.0;
+
+        pg_sys::add_partial_path(pgr, cpath as *mut pg_sys::Path);
+
+        // -------- Wrap in Gather --------
+        let mut gather_rows: f64 = (estimated_rows * workers as f64).max(1.0);
+        let gather_path = pg_sys::create_gather_path(
+            root,
+            pgr,
+            cpath as *mut pg_sys::Path,
+            (*pgr).reltarget,
+            std::ptr::null_mut(),
+            &mut gather_rows,
+        );
+        if gather_path.is_null() {
+            return;
+        }
+
+        // -------- Wrap Gather in Final Aggregate (AGGSPLIT_FINAL_DESERIAL) --------
+        let agg_strategy = if group_specs.is_empty() {
+            pg_sys::AggStrategy::AGG_PLAIN
+        } else {
+            pg_sys::AggStrategy::AGG_HASHED
+        };
+        let final_path = pg_sys::create_agg_path(
+            root,
+            output_rel,
+            gather_path as *mut pg_sys::Path,
+            (*output_rel).reltarget,
+            agg_strategy,
+            pg_sys::AggSplit::AGGSPLIT_FINAL_DESERIAL,
+            (*root).processed_groupClause,
+            having_qual as *mut pg_sys::List,
+            &(*extra).agg_final_costs,
+            pg_estimated_groups.max(1.0),
+        );
+        if final_path.is_null() {
+            return;
+        }
+
+        pg_sys::add_path(output_rel, final_path as *mut pg_sys::Path);
+    }
 }
 
 /// Add a DeltaXAgg custom path to the grouped relation's pathlist.

@@ -7772,8 +7772,8 @@ unsafe fn finalise_compact_into_result_rows(
 /// invocation. Claims segments via the shared DSM cursor, accumulates into
 /// a process-local `ParallelCompactResult`, then finalises into
 /// `state.result_rows` using `compact_emit_partial` per slot. PG's Gather
-/// + Final Aggregate above combine partials per group via the aggregate's
-/// `aggcombinefn`.
+/// and the Final Aggregate above combine partials per group via the
+/// aggregate's `aggcombinefn`.
 ///
 /// Differs from `run_worker_partial_aggregate` (complete-mode workers
 /// writing to DSM) and `run_leader_merge_and_finalise` (complete-mode

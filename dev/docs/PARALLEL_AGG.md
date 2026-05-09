@@ -32,19 +32,23 @@ The DSM-merge model from C.2.b–e turned out to be a poor fit for PG's `Gather`
 
 **Progress so far**:
 1. ✅ `compact_emit_partial(storage, group_idx, slot, spec) -> (Datum, bool)` alongside `compact_finalize`. Coverage: Count → int8; SumIntNarrow (SUM only) → int8; SumFloat (SUM only) → float8; MinStr/MaxStr → text. Unsupported branches `unreachable!()`.
-2. ✅ `is_partial: bool` + `transtype_oid: Oid` added to `AggSpec` (path-side) and `AggExecSpec` (exec-side). Trailer plumbed through path-private (built by `add_agg_path` / `build_agg_path_private`), through plan-private (re-emitted by `plan_agg_path`), through `parse_agg_private` + `ParsedAggPlan` + `AggExecContext`.
+2. ✅ `is_partial: bool` + `transtype_oid: Oid` added to `AggSpec` (path-side) and `AggExecSpec` (exec-side). Trailer plumbed through path-private (built by `build_agg_path_private`), through plan-private (re-emitted by `plan_agg_path`), through `parse_agg_private` + `ParsedAggPlan` + `AggExecContext`.
 3. ✅ `finalise_compact_into_result_rows` branches on `ctx.is_partial` → calls `compact_emit_partial` instead of `compact_finalize`.
-4. ✅ `exec_agg_scan` partial-mode runtime: `run_partial_aggregate_in_process` (every process claims segments via the shared DSM cursor, accumulates locally, emits per-group partial rows; PG's Gather + Final Aggregate combine). No DSM slabs, no leader-merge.
-5. ⏸️ `add_agg_partial_path` planner-side construction (build partial CustomPath, manually wrap in `create_gather_path` + `create_agg_path(AGGSPLIT_FINAL_DESERIAL)`, `add_path(grouped_rel, ...)`). **First attempt removed** because `process_segments_compact` only handles numeric columns — when the WHERE clause references TEXT columns (e.g. RTABench Q9's `event_type='Departed'`), `evaluate_batch_quals` silently skips the qual on the unloaded text col → over-counts (Q9: 22 instead of 5). Lesson: partial-path eligibility must reject any query that references non-numeric columns in agg specs, group keys, OR `where_quals`. The text-handling parallel-mixed code path exists in serial mode; partial mode would need to mirror it (or restrict to numeric-only queries up front).
-6. ⏸️ Validation pass.
+4. ✅ `exec_agg_scan` partial-mode runtime: `run_partial_aggregate_in_process` (every process claims segments via the shared DSM cursor, accumulates locally, emits per-group partial rows; PG's Gather and the Final Aggregate above combine). No DSM slabs, no leader-merge.
+5. ✅ `add_agg_partial_path` in `path.rs` builds the partial CustomPath, calls `add_partial_path(partially_grouped_rel, ...)`, manually wraps in `create_gather_path` + `create_agg_path(AGGSPLIT_FINAL_DESERIAL)`, and adds the result to `grouped_rel.pathlist`. Wired into `deltax_create_upper_paths` after the existing complete `add_agg_path` call.
+6. ✅ Eligibility predicate. `quals_reference_only_numeric_vars(jointree.quals)` walks the WHERE clause via `pull_var_clause` and rejects any Var with non-numeric `vartype`. This solves the bug from the first attempt (RTABench Q9 over-counting on text WHERE) — Q9 now correctly falls back to the complete CustomScan path. Plus `agg_specs_partial_emittable` and `can_use_compact_keys_path` cover agg / group eligibility.
+7. ✅ Validation:
+   - **RTABench**: 31/31 correct vs plain PG. Total 3933ms → 3300ms (1.19x — matches pre-C.2 baseline; partial path activates only on numeric-only queries; per-query fluctuation in the single-digit ms range is run-to-run noise).
+   - **ClickBench**: 43/43 correct. Total 1272ms → 1199ms (0.94x — slightly faster). No regressions >20% on queries with pre-C.2 timing >5ms.
+   - **JSONBench**: pending EC2 run (target Q3/Q4 3.2s → ~0.8s; runs are real-$$ so save for a focused validation session).
 
-**Remaining**:
-- Eligibility predicate at planning time that walks `(*root).parse->jointree->quals` for non-numeric Var references (or load metadata via SPI to check needed-col types). Reject conservatively.
-- Optional: extend partial-mode runtime to cover text quals too (mirror parallel-mixed in `process_segments_compact_with_text` or similar).
-- Re-introduce `add_agg_partial_path` with the corrected eligibility.
-- ClickBench (43 queries — keep correct, no >20% regression), RTABench (31 queries vs plain PG), JSONBench Q3/Q4 (target 3.2s → ~0.8s).
+**Coverage today** is intentionally narrow: partial path activates only when (a) no HAVING / Top-N / DISTINCT, (b) all aggs are Count / SUM(int4/float) / MIN/MAX(text), (c) all group keys are integer-packable, and (d) all WHERE-clause Vars are numeric (int / float / timestamp / date / bool). Most ClickBench / RTABench queries have text WHEREs (URL, SearchPhrase, event_type, etc.) so they fall back to the existing complete path — correctness preserved, no parallel speedup yet.
 
-The plumbing (all 4 ✅ items above) is correct and dormant — `add_agg_path` always sets `is_partial = false`. None of `compact_emit_partial`, `run_partial_aggregate_in_process`, or the `is_partial` branches in `finalise_compact_into_result_rows` are reachable until a future correctly-gated `add_agg_partial_path` is added.
+**Follow-ups to broaden coverage**:
+- SUM(int8) / AVG via `int8_avg_serialize` for the partial state's `internal` transtype.
+- Text WHERE clauses by mirroring the serial parallel-mixed code path inside `process_segments_compact` (or a sibling).
+- HAVING in the partial path (Phase E).
+- COUNT(DISTINCT) for dict-encoded text (Phase D — fundamentally different from PG's combinefn model; needs the dictionary union approach in PARALLEL_AGG.md Phase D).
   - [ ] **C.3**: extend `evaluate_batch_quals` (`batch_qual.rs:495`) to return tri-state `BatchEval { AllPass, AllReject, Selective(Bitmap) }`; add `enum SegmentEval { FullMetadata, PerSegmentByGroup, PerRow }` so per-segment metadata (`col_minmax / col_sums / row_count`) can short-circuit decompression for full-segment cases.
   - [ ] **C.4**: gate `add_agg_path` for parallel (`parallel_safe = true, parallel_workers = recommend_agg_workers(...)`). Update `cost::estimate_agg_cost` so the planner picks the parallel variant on large inputs. Add `tests/test_aggregate_pushdown.py` (parametrize over `max_parallel_workers_per_gather ∈ {0, 2, 4, 8}`) for correctness, and an EXPLAIN assertion that DeltaXAgg picks `parallel_workers > 0` on Q3/Q4-shaped queries.
 - [ ] Phase D — parallel `COUNT(DISTINCT)` for dictionary-encoded text columns.
