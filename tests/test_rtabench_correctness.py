@@ -83,10 +83,17 @@ def _create_schema(db):
         "'1 day'::interval, 20)"
     )
     # Small segment_size exercises multi-segment paths on a tiny dataset.
+    # `event_payload->>'terminal'` is the only JSONB chain RTABench
+    # queries touch (Q0, Q1, Q3, Q4, Q8, Q23). Pre-extract it so the
+    # planner_hook walker can rewrite chain Exprs to synthetic-Var refs
+    # and DeltaXAgg picks those queries up directly.
     db.execute(
         "SELECT deltax_enable_compression('order_events', "
-        "order_by => ARRAY['order_id','event_created'], segment_size => 100)"
+        "order_by => ARRAY['order_id','event_created'], segment_size => 100, "
+        "json_extract => '[{\"src\":\"event_payload\","
+        "\"path\":[\"terminal\"],\"name\":\"x_terminal\",\"type\":\"text\"}]'::jsonb)"
     )
+    db.execute("SET pg_deltax.json_extract_mode = 'fields'")
     db.commit()
 
 

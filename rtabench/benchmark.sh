@@ -88,8 +88,17 @@ sudo -u postgres psql "$DB" -t -c \
 # SEGMENT_SIZE is overridable to allow sweeping (e.g. 1000, 10000, 30000).
 SEGMENT_SIZE="${SEGMENT_SIZE:-30000}"
 echo "Using segment_size=$SEGMENT_SIZE"
+# `event_payload->>'terminal'` is the only chain RTABench queries touch
+# (Q0/Q1/Q3/Q4/Q8/Q23). Pre-extract it so the planner_hook walker can
+# rewrite chains to synthetic-Var refs and DeltaXAgg picks the queries
+# up directly.
 sudo -u postgres psql "$DB" -t -c \
-    "SELECT deltax_enable_compression('order_events', order_by => ARRAY['order_id','event_created'], segment_size => $SEGMENT_SIZE)"
+    "SELECT deltax_enable_compression('order_events', order_by => ARRAY['order_id','event_created'], segment_size => $SEGMENT_SIZE, \
+        json_extract => '[{\"src\":\"event_payload\",\"path\":[\"terminal\"],\"name\":\"x_terminal\",\"type\":\"text\"}]'::jsonb)"
+
+# Activate the planner_hook walker by default so chain Exprs use the
+# pre-extracted synthetic column.
+sudo -u postgres psql -c "ALTER DATABASE $DB SET pg_deltax.json_extract_mode = 'fields'"
 
 # Load dimension / small tables via plain COPY
 LOAD_START=$(date +%s)
