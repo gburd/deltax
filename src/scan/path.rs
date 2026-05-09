@@ -1177,6 +1177,12 @@ pub unsafe fn add_agg_path(
         if !having_filters.is_empty() {
             set_agg_having_filters(having_filters.to_vec());
         }
+
+        // Phase C.2 activation trailer: complete-path always 0. The partial
+        // path constructor (add_agg_partial_path) appends 1 at the same
+        // position so plan_agg_path can route to compact_emit_partial.
+        private_list = pg_sys::lappend_int(private_list, 0);
+
         (*cpath).custom_private = private_list;
 
         (*cpath).custom_paths = std::ptr::null_mut();
@@ -1280,6 +1286,10 @@ pub unsafe extern "C-unwind" fn plan_agg_path(
         let mut companion_oids: Vec<u32> = Vec::new();
         let mut parsed_aggs: Vec<ParsedAgg> = Vec::new();
         let mut parsed_groups: Vec<ParsedGroup> = Vec::new();
+        // Phase C.2 activation: trailing is_partial flag from path_private.
+        // Default false for paths that don't write the trailer (current
+        // complete-path code path).
+        let mut path_is_partial: bool = false;
 
         // Sequential parse with index
         let mut idx = 0;
@@ -1401,6 +1411,15 @@ pub unsafe extern "C-unwind" fn plan_agg_path(
                 parsed_groups.push(ParsedGroup { col_idx, type_oid, expr });
             }
         }
+
+        // Phase C.2 activation: trailing `is_partial` flag (one int, 0/1).
+        // Older paths that don't write it default to false. add_agg_path
+        // and add_agg_partial_path are responsible for appending it.
+        if idx < path_len {
+            path_is_partial = pg_sys::list_nth_int(path_private, idx) != 0;
+            idx += 1;
+        }
+        let _ = idx;
 
         // Eliminate redundant GROUP BY expressions.
         // If multiple specs reference the same col_idx and are all Column/AddConst,
@@ -1812,10 +1831,11 @@ pub unsafe extern "C-unwind" fn plan_agg_path(
             private_list = pg_sys::lappend_int(private_list, 0);
         }
 
-        // Phase C.2 activation trailer: is_partial flag. False for now;
-        // C.2 activation flips this to true on the partial-mode CustomPath.
-        // parse_agg_private treats absence as false for backward-compat.
-        private_list = pg_sys::lappend_int(private_list, 0);
+        // Phase C.2 activation trailer: is_partial flag, propagated from
+        // path_private (set by add_agg_partial_path) into the runtime
+        // plan_private. parse_agg_private treats absence as false for
+        // backward-compat.
+        private_list = pg_sys::lappend_int(private_list, if path_is_partial { 1 } else { 0 });
 
         (*cscan).custom_private = private_list;
         (*cscan).scan.plan.qual = std::ptr::null_mut();
