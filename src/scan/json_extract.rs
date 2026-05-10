@@ -517,6 +517,16 @@ unsafe fn rewrite_walker(
                 let a = node as *mut pg_sys::Aggref;
                 (*a).args = rewrite_chains_in_list((*a).args, rti, specs, phys, physical_natts);
             }
+            pg_sys::NodeTag::T_ScalarArrayOpExpr => {
+                // `chain IN (...)` / `chain = ANY(ARRAY[...])`. The planner
+                // gate in `deltax_create_upper_paths` accepts SAOP with a
+                // chain LHS; without rewriting here, the chain stays as a
+                // T_OpExpr in the serialised qual list and `extract_batch_quals`
+                // (which keys off T_Var) silently drops the entire qual at
+                // exec time → wrong results for `IN`-on-chain queries.
+                let s = node as *mut pg_sys::ScalarArrayOpExpr;
+                (*s).args = rewrite_chains_in_list((*s).args, rti, specs, phys, physical_natts);
+            }
             // Vars, Consts, Params, etc. are leaves.
             _ => {}
         }
