@@ -93,14 +93,21 @@ printf '%s\n' "${RAW_FILES[@]:0:$SCALE}" | \
         f="{}"
         out="'"$TSV_DIR"'/$(basename "$f" .json.gz).tsv"
         if [ -s "$out" ]; then exit 0; fi
-        # Strip null bytes both pre- and post-jq:
-        #   pre-jq sed: removes  escapes already in the source ndjson
-        #   post-jq sed: jq tojson can re-emit  escapes for embedded NULs
+        # Tolerant ndjson parse:
+        #   `jq -R` reads each input line as a raw string, `fromjson?` yields
+        #   the parsed JSON (or empty on parse error). Without this, a single
+        #   record containing an unescaped raw control byte (Bluesky firehose
+        #   data has these in user-text fields) makes jq abort and the rest
+        #   of the file is silently dropped — observed loss of ~5.6M rows
+        #   out of 100M before this fix.
+        # Null-byte sanitisation:
+        #   pre-jq sed: removes \\u0000 escapes already in the source ndjson
+        #   post-jq sed: jq tojson can re-emit \\u0000 escapes for embedded NULs
         #   tr: belt-and-suspenders against any raw \0 byte that might survive
-        # Postgres rejects  in jsonb_in, and CString::new fails on raw \0.
+        # Postgres rejects \0 in jsonb_in, and CString::new fails on raw \0.
         pigz -dc "$f" \
             | sed "s/\\\\u0000//g" \
-            | jq -rc "select(.time_us != null) | [(.time_us|tonumber/1000000|todate), tojson] | @tsv" \
+            | jq -rcR "fromjson? | select(.time_us != null) | [(.time_us|tonumber/1000000|todate), tojson] | @tsv" \
             | sed "s/\\\\u0000//g" \
             | tr -d "\000" \
             > "$out.tmp"
