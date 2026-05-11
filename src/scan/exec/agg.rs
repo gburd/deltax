@@ -4104,15 +4104,22 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
             });
 
             // Pipeline detoast with parallel processing when enough segments.
-            // Use fewer batches than the compact path (4 vs n_workers*2) because
+            // Use fewer batches than the compact path (2 vs n_workers*2) because
             // the mixed path processes text columns which have high per-segment
             // cost. Fewer batches = fewer thread scope synchronization points.
             let use_pipeline = use_lazy && all_segments.len() >= n_workers * 16;
+            // Pipeline uses 2 batches: workers run on current batch while leader
+            // detoasts the next. Pre-detoast must cover the *entire* first batch
+            // before workers spawn, otherwise workers on un-detoasted segments
+            // see empty blobs → SegTextColumn::Lz4 returns None → group keys
+            // collapse to NULL and distinct group values are lost. Must match
+            // PIPELINE_N_BATCHES below.
+            const PIPELINE_N_BATCHES: usize = 2;
 
             if use_lazy {
                 let t_detoast = Instant::now();
                 if use_pipeline {
-                    let n_batches = (n_workers * 2).max(2).min(all_segments.len());
+                    let n_batches = PIPELINE_N_BATCHES.min(all_segments.len());
                     let batch_size = all_segments.len().div_ceil(n_batches);
                     let first_end = batch_size.min(all_segments.len());
                     for seg in &mut all_segments[..first_end] {
@@ -4189,7 +4196,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
 
             let mut pipeline_detoast_us: u64 = 0;
             let partial_results: Vec<ParallelMixedResult> = if use_pipeline {
-                let n_batches = 2.min(all_segments.len());
+                let n_batches = PIPELINE_N_BATCHES.min(all_segments.len());
                 let batch_size = all_segments.len().div_ceil(n_batches);
                 let mut results: Vec<ParallelMixedResult> = Vec::new();
                 let mut batch_start = 0;
