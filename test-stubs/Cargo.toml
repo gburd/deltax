@@ -1,0 +1,12 @@
+[package]
+name = "pg_deltax_test_stubs"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Weak stubs for Postgres backend symbols so pgrx unit-test binaries can load on Linux x86_64. Dev-dependency only — never linked into the cdylib."
+
+[lib]
+path = "src/lib.rs"
+
+[build-dependencies]
+cc = "1"

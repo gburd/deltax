@@ -1224,11 +1224,19 @@ dependencies = [
  "memchr",
  "num_cpus",
  "parquet",
+ "pg_deltax_test_stubs",
  "pgrx",
  "pgrx-tests",
  "regex",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "pg_deltax_test_stubs"
+version = "0.0.0"
+dependencies = [
+ "cc",
 ]
 
 [[package]]

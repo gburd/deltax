@@ -130,10 +130,18 @@ def test_parallel_produces_same_rows_as_serial(db):
     parallel = db.execute(query).fetchall()
 
     # Counts must match exactly; sums are floats, so compare per-row with
-    # a tight tolerance (they're computed over identical input sets).
+    # a tight tolerance (they're computed over identical input sets). A
+    # NULL sum on either side is only acceptable if the other side also
+    # produced NULL — that's still consistent between serial and parallel.
     assert [(r[0], r[1]) for r in serial] == [(r[0], r[1]) for r in parallel]
     for s, p in zip(serial, parallel):
-        assert abs(s[2] - p[2]) < 1e-6, f"sum mismatch for kind={s[0]}: {s[2]} vs {p[2]}"
+        assert (s[2] is None) == (p[2] is None), (
+            f"NULL mismatch for kind={s[0]}: serial={s[2]} parallel={p[2]}"
+        )
+        if s[2] is not None:
+            assert abs(s[2] - p[2]) < 1e-6, (
+                f"sum mismatch for kind={s[0]}: {s[2]} vs {p[2]}"
+            )
 
 
 def test_explain_shows_gather_over_deltax_append(db):

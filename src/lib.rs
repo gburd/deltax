@@ -3,6 +3,12 @@ use std::ffi::CString;
 use pgrx::guc::{GucContext, GucFlags, GucRegistry, GucSetting};
 use pgrx::prelude::*;
 
+// Pull the weak-stub static library into the test binary on Linux. The cdylib
+// (built via `cargo build --lib`) skips this dev-dependency entirely, so
+// Postgres keeps providing the real backend symbols when it loads the .so.
+#[cfg(test)]
+extern crate pg_deltax_test_stubs as _;
+
 mod bloom;
 mod catalog;
 mod compress;
