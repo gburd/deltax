@@ -2018,10 +2018,16 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
             // source column type. NUMERIC output (SUM(int8)/SUM(numeric))
             // isn't handled by the current sum_i128_to_datum (would need
             // numeric_in, see count_minmax.rs). Fall through to DeltaXAgg.
+            //
+            // `AggExpr::AddConst` (i.e. `SUM(col + N)`) qualifies: the offset
+            // is folded in at finalize as `sum + const_offset * nonnull_count`,
+            // both quantities available from per-segment metadata. This is
+            // load-bearing for ClickBench Q29 (90× `SUM(col + N)` over 100M
+            // rows — 7.7s → ~0.05s when the meta path fires).
             let sum_meta_ok = matches!(
                 effective_col_type_oid,
                 pg_sys::INT2OID | pg_sys::INT4OID | pg_sys::FLOAT4OID | pg_sys::FLOAT8OID
-            ) && matches!(expr_kind, AggExpr::Column);
+            ) && matches!(expr_kind, AggExpr::Column | AggExpr::AddConst);
             let count_meta_ok = matches!(expr_kind, AggExpr::Column);
 
             match func_name {
@@ -2176,24 +2182,14 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                         break;
                     }
                 };
-                // For non-CountStar, extract varattno from the aggref's arg Var.
+                // Use the classified `AggSpec.col_idx` directly — it was
+                // resolved upstream and already handles the `Var + Const`
+                // shape (AggExpr::AddConst). varattno is 1-based attno;
+                // col_idx is 0-based. CountStar has col_idx = -1.
                 let varattno: i16 = if matches!(kind, path::MetaAggKind::CountStar) {
                     0
                 } else {
-                    let args = (*aggref).args;
-                    if args.is_null() || (*args).length == 0 {
-                        ok = false;
-                        break;
-                    }
-                    let arg_te = pg_sys::list_nth(args, 0) as *const pg_sys::TargetEntry;
-                    let arg_expr = (*arg_te).expr as *const pg_sys::Node;
-                    let arg_expr = unwrap_relabel_node(arg_expr);
-                    if (*arg_expr).type_ != pg_sys::NodeTag::T_Var {
-                        ok = false;
-                        break;
-                    }
-                    let var = arg_expr as *const pg_sys::Var;
-                    (*var).varattno
+                    (agg.col_idx + 1) as i16
                 };
                 let result_type_oid = (*aggref).aggtype;
                 let mut typlen: i16 = 0;
@@ -2206,6 +2202,7 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                     col_type_oid: agg.col_type_oid,
                     typlen,
                     typbyval,
+                    const_offset: agg.const_offset,
                 });
             }
 
@@ -2309,6 +2306,7 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                     col_type_oid,
                     typlen,
                     typbyval,
+                    const_offset: 0,
                 });
             }
 

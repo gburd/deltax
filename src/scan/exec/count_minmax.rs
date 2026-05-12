@@ -312,6 +312,9 @@ pub(crate) struct ExecAggSpec {
     pub(crate) typlen: i16,
     #[allow(dead_code)]
     pub(crate) typbyval: bool,
+    /// For `SUM(col + N)` the meta-path adds `const_offset * nonnull_count`
+    /// to the metadata-derived sum at finalize. Zero for every other shape.
+    pub(crate) const_offset: i64,
 }
 
 /// BeginCustomScan callback for DeltaXMinMax: load segment metadata and find global min/max.
@@ -350,10 +353,13 @@ pub(super) unsafe extern "C-unwind" fn begin_minmax_scan(
         let num_aggs = pg_sys::list_nth_int(custom_private, idx);
         idx += 1;
         for _ in 0..num_aggs {
-            let fields: Vec<i32> = (0..6)
+            let fields: Vec<i32> = (0..8)
                 .map(|off| pg_sys::list_nth_int(custom_private, idx + off))
                 .collect();
-            idx += 6;
+            idx += 8;
+            // Reassemble i64 const_offset from two i32 halves (low, high).
+            let const_offset = (fields[6] as u32 as i64)
+                | ((fields[7] as i64) << 32);
             agg_specs.push(ExecAggSpec {
                 kind: crate::scan::path::MetaAggKind::from_i32(fields[0]),
                 varattno: fields[1],
@@ -361,6 +367,7 @@ pub(super) unsafe extern "C-unwind" fn begin_minmax_scan(
                 col_type_oid: pg_sys::Oid::from(fields[3] as u32),
                 typlen: fields[4] as i16,
                 typbyval: fields[5] != 0,
+                const_offset,
             });
         }
         if idx < list_len {
@@ -451,8 +458,11 @@ pub(super) unsafe extern "C-unwind" fn begin_minmax_scan(
         // Per-spec accumulators. Indices match `agg_specs`.
         enum Acc {
             MinMax { datum: pg_sys::Datum, null: bool, type_oid: pg_sys::Oid, is_min: bool },
-            SumI128 { acc: i128, seen: bool, result_oid: pg_sys::Oid },
-            SumF64  { acc: f64, seen: bool, result_oid: pg_sys::Oid },
+            // `nonnull` tracks total non-null input rows for the offset-finalize
+            // step (`sum(col + N) = sum(col) + N * nonnull`). Stays 0 for plain
+            // SUM(col) since const_offset is 0 then — multiplication is a no-op.
+            SumI128 { acc: i128, nonnull: i64, seen: bool, result_oid: pg_sys::Oid, const_offset: i64 },
+            SumF64  { acc: f64, nonnull: i64, seen: bool, result_oid: pg_sys::Oid, const_offset: i64 },
             Count { acc: i64 },
         }
         let mut accs: Vec<Acc> = agg_specs
@@ -468,9 +478,17 @@ pub(super) unsafe extern "C-unwind" fn begin_minmax_scan(
                 },
                 MetaAggKind::Sum => {
                     if matches!(spec.col_type_oid, pg_sys::FLOAT4OID | pg_sys::FLOAT8OID) {
-                        Acc::SumF64 { acc: 0.0, seen: false, result_oid: spec.result_type_oid }
+                        Acc::SumF64 {
+                            acc: 0.0, nonnull: 0, seen: false,
+                            result_oid: spec.result_type_oid,
+                            const_offset: spec.const_offset,
+                        }
                     } else {
-                        Acc::SumI128 { acc: 0, seen: false, result_oid: spec.result_type_oid }
+                        Acc::SumI128 {
+                            acc: 0, nonnull: 0, seen: false,
+                            result_oid: spec.result_type_oid,
+                            const_offset: spec.const_offset,
+                        }
                     }
                 }
                 MetaAggKind::CountCol | MetaAggKind::CountStar => Acc::Count { acc: 0 },
@@ -524,7 +542,7 @@ pub(super) unsafe extern "C-unwind" fn begin_minmax_scan(
                                 if dominated { *datum = seg_datum; }
                             }
                         }
-                        Acc::SumI128 { acc, seen, .. } => {
+                        Acc::SumI128 { acc, nonnull, seen, .. } => {
                             let col_name = match &agg_col_names[spec_idx] {
                                 Some(n) => n, None => continue,
                             };
@@ -532,10 +550,11 @@ pub(super) unsafe extern "C-unwind" fn begin_minmax_scan(
                                 && let Some(v) = cs.sum_i128
                             {
                                 *acc = acc.saturating_add(v);
+                                *nonnull = nonnull.saturating_add(cs.nonnull_count);
                                 *seen = true;
                             }
                         }
-                        Acc::SumF64 { acc, seen, .. } => {
+                        Acc::SumF64 { acc, nonnull, seen, .. } => {
                             let col_name = match &agg_col_names[spec_idx] {
                                 Some(n) => n, None => continue,
                             };
@@ -543,6 +562,7 @@ pub(super) unsafe extern "C-unwind" fn begin_minmax_scan(
                                 && let Some(v) = cs.sum_f64
                             {
                                 *acc += v;
+                                *nonnull = nonnull.saturating_add(cs.nonnull_count);
                                 *seen = true;
                             }
                         }
@@ -581,35 +601,44 @@ pub(super) unsafe extern "C-unwind" fn begin_minmax_scan(
                         datum, is_null: null, col_name: col_name_str,
                         kind, type_oid,
                     },
-                    Acc::SumI128 { acc, seen, result_oid } => {
+                    Acc::SumI128 { acc, nonnull, seen, result_oid, const_offset } => {
                         if !seen {
                             MinMaxResult {
                                 datum: pg_sys::Datum::from(0usize), is_null: true,
                                 col_name: col_name_str, kind, type_oid: result_oid,
                             }
                         } else {
-                            let datum = sum_i128_to_datum(acc, result_oid, spec.col_type_oid);
+                            // `sum(col + N) = sum(col) + N * nonnull`. const_offset
+                            // is 0 for plain `SUM(col)`, so the add is free.
+                            let shifted = acc.saturating_add(
+                                (const_offset as i128).saturating_mul(nonnull as i128),
+                            );
+                            let datum = sum_i128_to_datum(shifted, result_oid, spec.col_type_oid);
                             MinMaxResult {
                                 datum, is_null: false, col_name: col_name_str,
                                 kind, type_oid: result_oid,
                             }
                         }
                     }
-                    Acc::SumF64 { acc, seen, result_oid } => {
+                    Acc::SumF64 { acc, nonnull, seen, result_oid, const_offset } => {
                         if !seen {
                             MinMaxResult {
                                 datum: pg_sys::Datum::from(0usize), is_null: true,
                                 col_name: col_name_str, kind, type_oid: result_oid,
                             }
                         } else {
+                            // Same offset shift as the i128 path, in f64. Float
+                            // SUM is already non-associative across workers so
+                            // this preserves the existing accuracy regime.
+                            let shifted = acc + (const_offset as f64) * (nonnull as f64);
                             // PG's sum(real) → real (FLOAT4); sum(double) → double (FLOAT8).
                             // Pack the accumulator into the bit-width PG expects.
                             let datum = match result_oid {
                                 pg_sys::FLOAT4OID => {
-                                    let f32_val = acc as f32;
+                                    let f32_val = shifted as f32;
                                     pg_sys::Datum::from(f32_val.to_bits() as usize)
                                 }
-                                _ => pg_sys::Datum::from(acc.to_bits() as usize),
+                                _ => pg_sys::Datum::from(shifted.to_bits() as usize),
                             };
                             MinMaxResult {
                                 datum, is_null: false, col_name: col_name_str,

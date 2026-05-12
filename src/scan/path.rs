@@ -651,6 +651,10 @@ pub struct MinMaxAggSpec {
     pub col_type_oid: pg_sys::Oid,      // source column type (InvalidOid for CountStar)
     pub typlen: i16,
     pub typbyval: bool,
+    /// Constant offset for `SUM(col + N)` shape. Adds `const_offset *
+    /// nonnull_count` to the metadata-derived sum at finalize. Zero for
+    /// all other aggregate shapes (MIN/MAX, COUNT, SUM with plain Var arg).
+    pub const_offset: i64,
 }
 
 /// Add a DeltaXMinMax custom path to the grouped relation's pathlist.
@@ -687,8 +691,10 @@ pub unsafe fn add_minmax_path(
         // Store in custom_private:
         // [oid1, oid2, ..., -1, num_aggs,
         //  kind_0, varattno_0, result_type_0, col_type_0, typlen_0, typbyval_0,
+        //    const_offset_lo_0, const_offset_hi_0,
         //  kind_1, varattno_1, ...,
         //  qual_bytes_len, qual_byte0, qual_byte1, ...]
+        // 8 ints per spec (was 6 before const_offset was added for SUM(col+N)).
         let mut private_list: *mut pg_sys::List = std::ptr::null_mut();
         for &oid in companion_oids {
             private_list = pg_sys::lappend_int(private_list, u32::from(oid) as i32);
@@ -702,6 +708,8 @@ pub unsafe fn add_minmax_path(
             private_list = pg_sys::lappend_int(private_list, u32::from(spec.col_type_oid) as i32);
             private_list = pg_sys::lappend_int(private_list, spec.typlen as i32);
             private_list = pg_sys::lappend_int(private_list, if spec.typbyval { 1 } else { 0 });
+            private_list = pg_sys::lappend_int(private_list, spec.const_offset as i32);
+            private_list = pg_sys::lappend_int(private_list, (spec.const_offset >> 32) as i32);
         }
         // Serialize quals via nodeToString so they survive plan caching.
         if !qual_list.is_null() {
@@ -734,6 +742,7 @@ struct PlanAggSpec {
     col_type_oid: pg_sys::Oid,
     typlen: i32,
     typbyval: bool,
+    const_offset: i64,
 }
 
 /// PlanCustomPath callback for DeltaXMinMax.
@@ -786,12 +795,15 @@ pub unsafe extern "C-unwind" fn plan_minmax_path(
         let num_aggs = pg_sys::list_nth_int(path_private, i);
         i += 1;
 
-        // Parse 6 ints per agg spec.
+        // Parse 8 ints per agg spec.
         for _ in 0..num_aggs {
-            let fields: Vec<i32> = (0..6)
+            let fields: Vec<i32> = (0..8)
                 .map(|off| pg_sys::list_nth_int(path_private, i + off))
                 .collect();
-            i += 6;
+            i += 8;
+            // i64 reassembled from two i32s (low first, then high).
+            let const_offset = (fields[6] as u32 as i64)
+                | ((fields[7] as i64) << 32);
             agg_specs.push(PlanAggSpec {
                 kind: MetaAggKind::from_i32(fields[0]),
                 varattno: fields[1],
@@ -799,6 +811,7 @@ pub unsafe extern "C-unwind" fn plan_minmax_path(
                 col_type_oid: pg_sys::Oid::from(fields[3] as u32),
                 typlen: fields[4],
                 typbyval: fields[5] != 0,
+                const_offset,
             });
         }
 
@@ -876,6 +889,8 @@ pub unsafe extern "C-unwind" fn plan_minmax_path(
             plan_private = pg_sys::lappend_int(plan_private, u32::from(spec.col_type_oid) as i32);
             plan_private = pg_sys::lappend_int(plan_private, spec.typlen);
             plan_private = pg_sys::lappend_int(plan_private, if spec.typbyval { 1 } else { 0 });
+            plan_private = pg_sys::lappend_int(plan_private, spec.const_offset as i32);
+            plan_private = pg_sys::lappend_int(plan_private, (spec.const_offset >> 32) as i32);
         }
         plan_private = pg_sys::lappend_int(plan_private, qual_bytes.len() as i32);
         for &b in &qual_bytes {
