@@ -3858,11 +3858,13 @@ pub(super) unsafe extern "C-unwind" fn init_worker_deltax_append(
             let num_blob_cols = state.col_names.iter()
                 .filter(|n| !state.segment_by.contains(*n))
                 .count();
+            let mut compressed_blobs: Vec<super::segments::BlobBytes> = Vec::with_capacity(num_blob_cols);
+            compressed_blobs.resize_with(num_blob_cols, super::segments::BlobBytes::default);
             segments_data.push(SegmentData {
                 companion_oid: b.companion_oid,
                 segment_id: b.segment_id,
                 segment_values: b.segment_values,
-                compressed_blobs: vec![Vec::new(); num_blob_cols],
+                compressed_blobs,
                 text_length_blobs: vec![Vec::new(); num_blob_cols],
                 row_count: b.row_count,
                 min_time: b.min_time,

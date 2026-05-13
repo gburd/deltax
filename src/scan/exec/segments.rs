@@ -535,7 +535,7 @@ pub(super) fn segment_skippable_by_dict(
     batch_quals: &[BatchQual],
     col_names: &[String],
     segment_by: &[String],
-    compressed_blobs: &[Vec<u8>],
+    compressed_blobs: &[BlobBytes],
 ) -> bool {
     for bq in batch_quals {
         // Determine which operation we're checking
@@ -612,6 +612,50 @@ pub(super) fn segment_skippable_by_dict(
     false
 }
 
+/// One per-column compressed blob stored in `SegmentData`. Lets cache
+/// hits skip the `to_vec()` copy: instead of materialising the cached
+/// bytes into a backend-heap `Vec<u8>`, `Cached` keeps a raw pointer into
+/// the DSA-backed `BlobCachePin` allocation. The corresponding pin lives
+/// in `SegmentData::cached_blob_pins`, which is declared AFTER
+/// `compressed_blobs` so Rust drops `compressed_blobs` first — the raw
+/// pointers go out of scope before the pins release the entry.
+///
+/// `Deref<Target = [u8]>` so existing consumer code that takes `&[u8]`
+/// keeps working without changes.
+pub(crate) enum BlobBytes {
+    Owned(Vec<u8>),
+    /// Borrowed bytes from the blob cache. Valid for the lifetime of
+    /// the surrounding `SegmentData` (i.e. until the matching pin in
+    /// `cached_blob_pins` drops).
+    Cached { data: *const u8, len: u32 },
+}
+
+impl Default for BlobBytes {
+    fn default() -> Self {
+        Self::Owned(Vec::new())
+    }
+}
+
+impl std::ops::Deref for BlobBytes {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            BlobBytes::Owned(v) => v.as_slice(),
+            BlobBytes::Cached { data, len } => unsafe {
+                std::slice::from_raw_parts(*data, *len as usize)
+            },
+        }
+    }
+}
+
+// SAFETY: Cached's raw pointer references DSA shared memory whose
+// lifetime is guaranteed by the matching `BlobCachePin` in the same
+// `SegmentData`. The pin uses atomic pin_count to keep the entry
+// resident across all readers and prevents eviction. The bytes are
+// only ever read, never written.
+unsafe impl Send for BlobBytes {}
+unsafe impl Sync for BlobBytes {}
+
 pub(super) struct SegmentData {
     /// Source companion-table OID. Populated by the caller after
     /// `load_segments_heap` returns; used by `fetch_segment_blobs` to re-open
@@ -621,7 +665,7 @@ pub(super) struct SegmentData {
     /// the main load).
     pub(super) segment_id: i32,
     pub(super) segment_values: Vec<Option<String>>,
-    pub(super) compressed_blobs: Vec<Vec<u8>>,
+    pub(super) compressed_blobs: Vec<BlobBytes>,
     /// Per-text-column length sidecar blobs (parallel to compressed_blobs).
     /// Non-empty when the planner has marked a text column as sidecar-only;
     /// holds the compressed u32-per-row length array instead of the main blob.
@@ -1272,8 +1316,10 @@ pub(super) unsafe fn load_segments_heap(
                 });
             }
 
-            // Pre-allocate empty blob slots — will be filled in Phase 2
-            let compressed_blobs: Vec<Vec<u8>> = vec![Vec::new(); num_blob_cols];
+            // Pre-allocate empty blob slots — will be filled in Phase 2.
+            // resize_with avoids requiring BlobBytes: Clone (it isn't).
+            let mut compressed_blobs: Vec<BlobBytes> = Vec::with_capacity(num_blob_cols);
+            compressed_blobs.resize_with(num_blob_cols, BlobBytes::default);
             let text_length_blobs: Vec<Vec<u8>> = vec![Vec::new(); num_blob_cols];
             let toast_pointers: Vec<Vec<u8>> = vec![Vec::new(); num_blob_cols];
 
@@ -2372,8 +2418,9 @@ pub(super) unsafe fn load_segments_heap(
                                     meta_oid, seg_id, blob_slot,
                                 );
                                 if let Some(pin) = crate::blob_cache::get_pinned(&cache_key) {
+                                    let s = pin.as_slice();
                                     segments[seg_idx].compressed_blobs[blob_slot] =
-                                        pin.as_slice().to_vec();
+                                        BlobBytes::Cached { data: s.as_ptr(), len: s.len() as u32 };
                                     segments[seg_idx].cached_blob_pins.push(pin);
                                 } else {
                                     let varlena_ptr: *mut pg_sys::varlena = blob_values[2].cast_mut_ptr();
@@ -2391,7 +2438,7 @@ pub(super) unsafe fn load_segments_heap(
                                         pg_sys::pfree(detoasted as *mut _);
                                     }
                                     crate::blob_cache::insert(&cache_key, &bytes);
-                                    segments[seg_idx].compressed_blobs[blob_slot] = bytes;
+                                    segments[seg_idx].compressed_blobs[blob_slot] = BlobBytes::Owned(bytes);
                                 }
                             }
                         }
@@ -2452,8 +2499,9 @@ pub(super) unsafe fn load_segments_heap(
                                 meta_oid, seg_id, blob_slot,
                             );
                             if let Some(pin) = crate::blob_cache::get_pinned(&cache_key) {
+                                let s = pin.as_slice();
                                 segments[seg_idx].compressed_blobs[blob_slot] =
-                                    pin.as_slice().to_vec();
+                                    BlobBytes::Cached { data: s.as_ptr(), len: s.len() as u32 };
                                 segments[seg_idx].cached_blob_pins.push(pin);
                             } else {
                                 let varlena_ptr: *mut pg_sys::varlena = bv[2].cast_mut_ptr();
@@ -2464,7 +2512,7 @@ pub(super) unsafe fn load_segments_heap(
                                 let bytes = std::slice::from_raw_parts(data as *const u8, len).to_vec();
                                 if detoasted != varlena_ptr { pg_sys::pfree(detoasted as *mut _); }
                                 crate::blob_cache::insert(&cache_key, &bytes);
-                                segments[seg_idx].compressed_blobs[blob_slot] = bytes;
+                                segments[seg_idx].compressed_blobs[blob_slot] = BlobBytes::Owned(bytes);
                             }
                         }
                     }
@@ -2688,7 +2736,8 @@ pub(super) unsafe fn fetch_segment_blobs(
             .filter(|n| !segment_by.contains(*n))
             .count();
         if seg.compressed_blobs.is_empty() {
-            seg.compressed_blobs = vec![Vec::new(); num_blob_cols];
+            seg.compressed_blobs = Vec::with_capacity(num_blob_cols);
+            seg.compressed_blobs.resize_with(num_blob_cols, BlobBytes::default);
         }
 
         // Derive `{partition}_blobs` OID from meta OID.
@@ -2776,7 +2825,9 @@ pub(super) unsafe fn fetch_segment_blobs(
             let cache_key =
                 crate::blob_cache::BlobCacheKey::new(companion_oid, segment_id, blob_slot);
             if let Some(pin) = crate::blob_cache::get_pinned(&cache_key) {
-                seg.compressed_blobs[blob_slot] = pin.as_slice().to_vec();
+                let s = pin.as_slice();
+                seg.compressed_blobs[blob_slot] =
+                    BlobBytes::Cached { data: s.as_ptr(), len: s.len() as u32 };
                 seg.cached_blob_pins.push(pin);
                 continue;
             }
@@ -2823,7 +2874,7 @@ pub(super) unsafe fn fetch_segment_blobs(
                         pg_sys::pfree(detoasted as *mut _);
                     }
                     crate::blob_cache::insert(&cache_key, &bytes);
-                    seg.compressed_blobs[blob_slot] = bytes;
+                    seg.compressed_blobs[blob_slot] = BlobBytes::Owned(bytes);
                 }
             }
 
@@ -2854,11 +2905,12 @@ unsafe fn detoast_blob_slot(seg: &mut SegmentData, bi: usize) -> (u64, bool) {
         if let Some(pin) = crate::blob_cache::get_pinned(&key) {
             let slice = pin.as_slice();
             let len = slice.len() as u64;
-            // The pipeline still expects `Vec<u8>` in `compressed_blobs`.
-            // The `to_vec()` is the targeted follow-up (BLOB_CACHE.md Phase 5);
-            // until then we copy out and keep the pin alive for the
-            // query's lifetime via `cached_blob_pins`.
-            seg.compressed_blobs[bi] = slice.to_vec();
+            // Borrow directly from the pin — no memcpy. The pin lives
+            // in cached_blob_pins until SegmentData drops, and
+            // compressed_blobs is declared before cached_blob_pins so
+            // the BlobBytes::Cached pointers drop first.
+            seg.compressed_blobs[bi] =
+                BlobBytes::Cached { data: slice.as_ptr(), len: slice.len() as u32 };
             seg.toast_pointers[bi].clear();
             seg.cached_blob_pins.push(pin);
             return (len, true);
@@ -2874,7 +2926,7 @@ unsafe fn detoast_blob_slot(seg: &mut SegmentData, bi: usize) -> (u64, bool) {
             pg_sys::pfree(detoasted as *mut _);
         }
         crate::blob_cache::insert(&key, &bytes);
-        seg.compressed_blobs[bi] = bytes;
+        seg.compressed_blobs[bi] = BlobBytes::Owned(bytes);
         seg.toast_pointers[bi].clear();
         (0, false)
     }

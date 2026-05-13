@@ -133,6 +133,19 @@ Together those changes fit in `src/blob_cache/storage.rs`:
   consumed at every call site (10 in `decompress.rs`, 10 in
   `agg.rs`). Example output on a warm 2nd scan of a 30k-row text
   table: `DeltaX Blob Cache: hits=1 misses=0 bytes_served=1263144`.
+- **`to_vec()` elimination on cache hits (Phase 5, 2026-05-14).**
+  `SegmentData::compressed_blobs` switched from `Vec<Vec<u8>>` to
+  `Vec<BlobBytes>`, a small enum: `Owned(Vec<u8>)` for freshly
+  detoasted blobs, `Cached { data: *const u8, len: u32 }` for
+  cache hits. `Cached` borrows directly from the corresponding
+  `BlobCachePin` in `cached_blob_pins`; no memcpy on the hit path.
+  Safe because `compressed_blobs` is declared before
+  `cached_blob_pins` in the struct, so Rust drops the raw pointers
+  before the pins release the cache entries. `BlobBytes:
+  Deref<Target = [u8]>` so existing consumers (`&[u8]` consumers)
+  needed no changes. Measured warm-scan detoast cost on a ~1.2 MB
+  blob dropped from 0.082 ms → 0.006 ms (~13×); MB-scale blobs on
+  JSONBench / RTABench will save proportionally more.
 
 ### Remaining
 
@@ -149,18 +162,11 @@ Together those changes fit in `src/blob_cache/storage.rs`:
    fixed-bucket hashmap (`BUCKETS_PER_SHARD = 256`, separate chaining
    through `Entry::bucket_next`). Acceptable for the working set
    sizes we have; reconsider if buckets get long under churn.
-3. **`to_vec()` elimination (Phase 5).** Cache-hit path currently
-   does `pin.as_slice().to_vec()` — a memcpy of the cached bytes
-   into a backend-heap `Vec<u8>`. Measurement on JSONBench Q4/Q5
-   showed ~1 ms/blob spent in this copy; eliminating it (borrow
-   directly from the pin) would roughly double the cache's warm
-   savings on detoast-dominated queries. Low-risk because pin
-   lifetime is already guaranteed by `cached_blob_pins`.
-4. **Tests.** `tests/test_blob_cache.py` for parity, eviction, and
+3. **Tests.** `tests/test_blob_cache.py` for parity, eviction, and
    concurrent-insert races; parametrise `tests/test_parallel_scan.py`
    over `blob_cache_mb`. Needs a separate-container fixture since
    `blob_cache_mb` is Postmaster-context.
-5. **Bench validation** on JSONBench + ClickBench EC2.
+4. **Bench validation** on JSONBench + ClickBench EC2.
 
 ### Codebase findings that simplify the original plan
 
