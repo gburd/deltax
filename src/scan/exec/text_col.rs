@@ -59,6 +59,21 @@ impl SegTextColumn {
         }
     }
 
+    /// Phase D bitset path: return the local dict ID at `row` if this column
+    /// is `Dict`-encoded and the row is non-null. Returns `None` for nulls,
+    /// non-Dict variants (Lz4/Lengths/SegBy don't have a per-row dict
+    /// reference). Callers pair this with a leader-precomputed
+    /// local→global remap table to set bits in a per-group bitset.
+    pub(super) fn dict_local_id(&self, row: usize) -> Option<u32> {
+        match self {
+            SegTextColumn::Dict { row_to_entry, .. } => {
+                let idx = row_to_entry[row];
+                if idx == u32::MAX { None } else { Some(idx) }
+            }
+            _ => None,
+        }
+    }
+
     /// Get the character length of the value at a given row, or None if null.
     /// All variants support this — Dict/Lz4/SegBy compute from the string body,
     /// Lengths reads directly from the stored array.
@@ -97,6 +112,12 @@ impl SegTextColumn {
 pub(super) enum TextQualInfo {
     EqNe { col_idx: usize, const_str: String, is_ne: bool },
     Like { col_idx: usize, strategy: LikeStrategy, negate: bool },
+    /// `col IN (v1, v2, ...)` / `col = ANY(ARRAY[...])`. Per-segment dict
+    /// fast path tests each unique dict entry against the values once and
+    /// reuses the answer per row. Negated IN (`NOT IN`) is *not* supported
+    /// here — PG generates `<> ALL(ARRAY[...])` for that, which surfaces as
+    /// an `op_negate` SAOP we currently bail on at the planner gate.
+    InList { col_idx: usize, values: Vec<String> },
 }
 
 /// Decode a per-row length sidecar blob into a SegTextColumn::Lengths (pure Rust).
@@ -290,6 +311,90 @@ pub(super) fn apply_text_eq_filter(seg_col: &SegTextColumn, const_str: &str, is_
                         }
                         None => false,
                     };
+                }
+            }
+        }
+    }
+}
+
+/// Apply a text IN filter to a SegTextColumn, AND-ing into an existing selection.
+///
+/// If `sel` is empty, it is initialized (all rows evaluated). If `sel` is
+/// non-empty, rows already false are skipped (short-circuit).
+///
+/// Dict fast path: build a bool vector keyed by dict entry — one membership
+/// scan over `entries × values`, then `O(1)` per row. For low-cardinality
+/// columns like `x_collection` (~16 unique values) this collapses the
+/// per-row IN check to a single byte read.
+///
+/// Length-sidecar columns can only resolve `'' IN (...)` cleanly — the
+/// runtime plan never reaches this with a non-empty IN list against a
+/// length sidecar (the planner gate routes to a `Lengths`-eligible op),
+/// but we fail safe by zeroing the selection.
+pub(super) fn apply_text_in_filter(
+    seg_col: &SegTextColumn,
+    values: &[String],
+    row_count: usize,
+    sel: &mut Vec<bool>,
+) {
+    if let SegTextColumn::Lengths { lengths, null_bitmap } = seg_col {
+        let allow_empty = values.iter().any(|s| s.is_empty());
+        let is_null = |row: usize| -> bool {
+            !null_bitmap.is_empty() && (null_bitmap[row / 8] >> (row % 8)) & 1 == 1
+        };
+        let pass_fn = |row: usize| -> bool {
+            if is_null(row) { return false; }
+            allow_empty && lengths[row] == 0
+        };
+        if sel.is_empty() {
+            sel.reserve(row_count);
+            for row in 0..row_count {
+                sel.push(pass_fn(row));
+            }
+        } else {
+            for (row, s) in sel.iter_mut().enumerate() {
+                if !*s { continue; }
+                *s = pass_fn(row);
+            }
+        }
+        return;
+    }
+
+    match seg_col {
+        SegTextColumn::Dict { entries, row_to_entry } => {
+            // Build dict-entry → bool table once per segment. O(|entries| × |values|).
+            let dict_matches: Vec<bool> = entries.iter()
+                .map(|s| values.iter().any(|v| v.as_str() == s.as_str()))
+                .collect();
+            if sel.is_empty() {
+                sel.reserve(row_count);
+                for &idx in row_to_entry.iter().take(row_count) {
+                    sel.push(idx != u32::MAX && dict_matches[idx as usize]);
+                }
+            } else {
+                for (row, s) in sel.iter_mut().enumerate() {
+                    if !*s { continue; }
+                    let idx = row_to_entry[row];
+                    *s = idx != u32::MAX && dict_matches[idx as usize];
+                }
+            }
+        }
+        _ => {
+            let pass_fn = |s: Option<&str>| -> bool {
+                match s {
+                    Some(v) => values.iter().any(|cand| cand.as_str() == v),
+                    None => false,
+                }
+            };
+            if sel.is_empty() {
+                sel.reserve(row_count);
+                for row in 0..row_count {
+                    sel.push(pass_fn(seg_col.get_str(row)));
+                }
+            } else {
+                for (row, s) in sel.iter_mut().enumerate() {
+                    if !*s { continue; }
+                    *s = pass_fn(seg_col.get_str(row));
                 }
             }
         }

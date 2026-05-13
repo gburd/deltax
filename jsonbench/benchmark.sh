@@ -60,6 +60,15 @@ sudo -u postgres psql -c "CREATE DATABASE $DB"
 sudo -u postgres psql "$DB" -c "CREATE EXTENSION pg_deltax"
 sudo -u postgres psql -c "ALTER DATABASE $DB SET work_mem TO '1GB'"
 sudo -u postgres psql -c "ALTER DATABASE $DB SET min_parallel_table_scan_size TO '0'"
+# Use the box: PG defaults cap at 2 workers per Gather (~3 cores total),
+# which leaves a 32-vCPU m6i.8xlarge mostly idle during scans. Sized for
+# m6i.8xlarge — bump if you swap instance class.
+sudo -u postgres psql -c "ALTER DATABASE $DB SET max_parallel_workers_per_gather TO 16"
+sudo -u postgres psql -c "ALTER SYSTEM SET max_parallel_workers TO 32"
+sudo -u postgres psql -c "ALTER SYSTEM SET max_worker_processes TO 64"
+# max_worker_processes requires a full restart, the others reload.
+sudo -u postgres psql -c "SELECT pg_reload_conf()"
+sudo systemctl restart postgresql
 
 # Download data
 mkdir -p "$RAW_DIR"
@@ -84,14 +93,21 @@ printf '%s\n' "${RAW_FILES[@]:0:$SCALE}" | \
         f="{}"
         out="'"$TSV_DIR"'/$(basename "$f" .json.gz).tsv"
         if [ -s "$out" ]; then exit 0; fi
-        # Strip null bytes both pre- and post-jq:
-        #   pre-jq sed: removes  escapes already in the source ndjson
-        #   post-jq sed: jq tojson can re-emit  escapes for embedded NULs
+        # Tolerant ndjson parse:
+        #   `jq -R` reads each input line as a raw string, `fromjson?` yields
+        #   the parsed JSON (or empty on parse error). Without this, a single
+        #   record containing an unescaped raw control byte (Bluesky firehose
+        #   data has these in user-text fields) makes jq abort and the rest
+        #   of the file is silently dropped — observed loss of ~5.6M rows
+        #   out of 100M before this fix.
+        # Null-byte sanitisation:
+        #   pre-jq sed: removes \\u0000 escapes already in the source ndjson
+        #   post-jq sed: jq tojson can re-emit \\u0000 escapes for embedded NULs
         #   tr: belt-and-suspenders against any raw \0 byte that might survive
-        # Postgres rejects  in jsonb_in, and CString::new fails on raw \0.
+        # Postgres rejects \0 in jsonb_in, and CString::new fails on raw \0.
         pigz -dc "$f" \
             | sed "s/\\\\u0000//g" \
-            | jq -rc "select(.time_us != null) | [(.time_us|tonumber/1000000|todate), tojson] | @tsv" \
+            | jq -rcR "fromjson? | select(.time_us != null) | [(.time_us|tonumber/1000000|todate), tojson] | @tsv" \
             | sed "s/\\\\u0000//g" \
             | tr -d "\000" \
             > "$out.tmp"
@@ -126,8 +142,28 @@ fi
 # query at the end will surface this if the heuristic is off.
 sudo -u postgres psql "$DB" -t -c "SET pg_deltax.mock_now = '$DATA_START'; SELECT deltax_create_table('bluesky', 'ts', '1 day'::interval, 365)"
 
-# Enable compression before loading (required for direct backfill)
-sudo -u postgres psql "$DB" -t -c "SELECT deltax_enable_compression('bluesky', order_by => ARRAY['ts'], segment_size => 30000)"
+# Enable compression before loading (required for direct backfill).
+# json_extract pre-extracts the JSON paths every JSONBench query touches into
+# columnar synthetic columns; the planner_hook walker then rewrites
+# `data->>'kind'`-style chains in upper plans to Var refs into those
+# synthetic columns, sidestepping per-row jsonb_in / `->`/`->>` evaluation
+# on the warm path. Requires pg_deltax.json_extract_mode=fields at query time.
+sudo -u postgres psql "$DB" -t -c "SELECT deltax_enable_compression(
+    'bluesky',
+    order_by => ARRAY['ts'],
+    segment_size => 30000,
+    json_extract => '[
+        {\"src\":\"data\",\"path\":[\"kind\"],\"name\":\"x_kind\",\"type\":\"text\"},
+        {\"src\":\"data\",\"path\":[\"did\"],\"name\":\"x_did\",\"type\":\"text\"},
+        {\"src\":\"data\",\"path\":[\"time_us\"],\"name\":\"x_time_us\",\"type\":\"bigint\"},
+        {\"src\":\"data\",\"path\":[\"commit\",\"collection\"],\"name\":\"x_collection\",\"type\":\"text\"},
+        {\"src\":\"data\",\"path\":[\"commit\",\"operation\"],\"name\":\"x_operation\",\"type\":\"text\"}
+    ]'::jsonb
+)"
+
+# Enable the planner_hook walker by default for queries on this DB so that
+# `data->>'kind'` etc. transparently use the pre-extracted columns.
+sudo -u postgres psql -c "ALTER DATABASE $DB SET pg_deltax.json_extract_mode = 'fields'"
 
 # Direct backfill: load and compress in a single pass via FORMAT deltax_compress.
 # Single COPY with a glob — pg_deltax expands it and processes all matched
@@ -154,20 +190,25 @@ sudo -u postgres psql "$DB" -q -t -c "VACUUM FREEZE ANALYZE bluesky"
 VACUUM_END=$(date +%s)
 echo " done in $((VACUUM_END - VACUUM_START))s"
 
-# Capture data size (bytes)
+# Capture data size (bytes) and row count for the JSONBench dashboard.
 DATA_SIZE=$(sudo -u postgres psql "$DB" -t -A -c "SELECT deltax_table_size('bluesky')")
+NUM_LOADED=$(sudo -u postgres psql "$DB" -t -A -c "SELECT count(*) FROM bluesky")
 echo "Data size: $DATA_SIZE bytes ($(echo "$DATA_SIZE / 1024 / 1024 / 1024" | bc -l | xargs printf '%.2f') GB)"
+echo "Loaded documents: $NUM_LOADED"
 
 # Save load stats. LOAD_TIME includes transform + COPY + vacuum so it reflects the
 # end-to-end time from raw .json.gz to a query-ready compressed table.
 LOAD_TIME=$((TRANSFORM_END - TRANSFORM_START + LOAD_END - LOAD_START + VACUUM_END - VACUUM_START))
-DATASET_SIZE_LABEL="${SCALE}m"
+# JSONBench expects dataset_size as a NUMBER (target row count), not a label.
+# 1 -> 1m -> 1_000_000, 10 -> 10_000_000, 100 -> 100_000_000, 1000 -> 1_000_000_000.
+DATASET_SIZE_NUM=$((SCALE * 1000000))
 cat > ~/jsonbench/load_stats.env <<STATS
 LOAD_TIME=$LOAD_TIME
 DATA_SIZE=$DATA_SIZE
-DATASET_SIZE=$DATASET_SIZE_LABEL
+NUM_LOADED=$NUM_LOADED
+DATASET_SIZE=$DATASET_SIZE_NUM
 STATS
-echo "Saved load stats to ~/jsonbench/load_stats.env (load_time=${LOAD_TIME}s, data_size=${DATA_SIZE}, dataset_size=${DATASET_SIZE_LABEL})"
+echo "Saved load stats to ~/jsonbench/load_stats.env (load_time=${LOAD_TIME}s, data_size=${DATA_SIZE}, num_loaded=${NUM_LOADED}, dataset_size=${DATASET_SIZE_NUM})"
 
 # Lower work_mem and disable JIT for the query phase
 sudo -u postgres psql -c "ALTER DATABASE $DB SET work_mem TO '256MB'"
@@ -177,5 +218,5 @@ sudo -u postgres psql -c "ALTER DATABASE $DB SET jit TO off"
 sudo -u postgres psql "$DB" -c "SELECT * FROM deltax_partition_info('bluesky')"
 sudo -u postgres psql "$DB" -c "SELECT count(*) AS default_partition_rows FROM bluesky_default"
 
-echo "Setup complete. Database '$DB' is ready (SCALE=$SCALE, dataset=$DATASET_SIZE_LABEL)."
+echo "Setup complete. Database '$DB' is ready (SCALE=$SCALE, dataset=${SCALE}m)."
 echo "Run all queries with: ./run.sh"

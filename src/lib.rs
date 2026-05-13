@@ -43,6 +43,31 @@ pub(crate) static MAX_PARALLEL_WORKERS_PER_SCAN: GucSetting<i32> =
 pub(crate) static DISABLE_META_AGG_FASTPATH: GucSetting<bool> =
     GucSetting::<bool>::new(false);
 
+/// When true, `add_agg_partial_path` returns early and the planner only
+/// sees the complete CustomScan DeltaXAgg path. Escape hatch for the
+/// partial+Gather+FinalAgg model (PARALLEL_AGG.md "C.2 activation
+/// followup"); useful for bisecting suspected regressions on the
+/// partial path or comparing the two paths' end-to-end timings on the
+/// same query. The complete path's internal-rayon parallelism still
+/// runs — this only disables the PG-level partial-path activation.
+pub(crate) static DISABLE_PARALLEL_AGG: GucSetting<bool> =
+    GucSetting::<bool>::new(false);
+
+/// Controls how COPY ... FORMAT deltax_compress extracts JSON paths into
+/// extra columnar columns alongside the original JSONB, and whether the
+/// planner_hook walker rewrites upper-plan chain Exprs to read from
+/// synthetic slot positions. Values:
+///   `none`   — disable extraction AND walker rewrite (ignores any
+///              json_extract config; queries fall through to slow path).
+///   `fields` — extract the user-specified path list from
+///              `deltax_enable_compression` AND enable the walker rewrite.
+///              Requires Step 5's executor wiring for correct results.
+///   `all`    — auto-discover all scalar leaves (not yet implemented).
+///
+/// Default is `none` until Step 5 (executor synthetic slot population) lands.
+pub(crate) static JSON_EXTRACT_MODE: GucSetting<Option<CString>> =
+    GucSetting::<Option<CString>>::new(Some(c"none"));
+
 /// Resolve the effective number of parallel workers.
 /// 0 = auto (num_cpus, capped at 16), 1 = single-threaded, 2..=64 = explicit.
 pub(crate) fn get_parallel_workers() -> usize {
@@ -67,6 +92,31 @@ pub(crate) fn get_scan_parallel_workers() -> i32 {
 
 pub(crate) fn get_parallel_regex() -> bool {
     PARALLEL_REGEX.get()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Wired up incrementally across the json-extract feature.
+pub(crate) enum JsonExtractMode {
+    None,
+    Fields,
+    All,
+}
+
+/// Resolve `pg_deltax.json_extract_mode` into a typed enum. Errors out for
+/// `all` (not yet implemented) and any unknown value.
+#[allow(dead_code)] // Wired up incrementally across the json-extract feature.
+pub(crate) fn get_json_extract_mode() -> JsonExtractMode {
+    let raw = JSON_EXTRACT_MODE.get();
+    let s = raw.as_ref().and_then(|c| c.to_str().ok()).unwrap_or("fields");
+    match s {
+        "none" => JsonExtractMode::None,
+        "fields" => JsonExtractMode::Fields,
+        "all" => JsonExtractMode::All,
+        other => pgrx::error!(
+            "pg_deltax.json_extract_mode: unknown value {:?} (expected: none, fields, all)",
+            other
+        ),
+    }
 }
 
 extension_sql!(
@@ -106,6 +156,8 @@ CREATE TABLE IF NOT EXISTS deltax_partition (
 );
 
 ALTER TABLE deltax_partition ADD COLUMN IF NOT EXISTS column_valmap JSONB;
+ALTER TABLE deltax_deltatable ADD COLUMN IF NOT EXISTS json_extract JSONB;
+ALTER TABLE deltax_deltatable ADD COLUMN IF NOT EXISTS json_extract_added_at TIMESTAMPTZ;
 
 CREATE OR REPLACE FUNCTION deltax_reject_compressed_partition_dml()
 RETURNS trigger
@@ -174,6 +226,22 @@ pub extern "C-unwind" fn _PG_init() {
         c"Disable DeltaXCount/DeltaXMinMax fast paths for queries with WHERE clauses",
         c"When ON, queries that could be answered from per-segment metadata fall through to the generic DeltaXAgg path instead. Used for correctness A/B testing.",
         &DISABLE_META_AGG_FASTPATH,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_bool_guc(
+        c"pg_deltax.disable_parallel_agg",
+        c"Disable the partial+Gather+FinalAgg path for DeltaXAgg",
+        c"When ON, add_agg_partial_path is a no-op and the planner only sees the complete CustomScan DeltaXAgg. Escape hatch for bisecting suspected regressions on the partial path; the complete path's internal-rayon parallelism still runs.",
+        &DISABLE_PARALLEL_AGG,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_string_guc(
+        c"pg_deltax.json_extract_mode",
+        c"How COPY extracts JSON paths into extra columnar columns: none, fields, or all (all not yet implemented)",
+        c"none disables extraction; fields uses the path list configured in deltax_enable_compression; all auto-discovers scalar leaves (not yet implemented).",
+        &JSON_EXTRACT_MODE,
         GucContext::Userset,
         GucFlags::default(),
     );

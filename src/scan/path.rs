@@ -21,16 +21,59 @@ pub(super) fn take_agg_having_filters() -> Vec<super::exec::HavingFilter> {
     AGG_HAVING_FILTERS.with(|cell| std::mem::take(&mut *cell.borrow_mut()))
 }
 
+/// Top-N info for DeltaXAgg.
+///
+/// `sort_col`: index in the post-agg output tlist of a direct-aggregate sort
+/// key, or `-3` when the sort key is a derived expression over two
+/// aggregates (see `derived_minmax`).
+///
+/// `derived_minmax`: when `Some((max_agg_idx, min_agg_idx))`, the sort key is
+/// `storage[max] - storage[min]` (both i64-storage). This covers the
+/// JSONBench Q4 shape `ORDER BY EXTRACT(EPOCH FROM (MAX(t) - MIN(t))) * N`
+/// — monotonic in `max - min` regardless of the scaling/extract wrappers.
+#[derive(Copy, Clone)]
+pub(super) struct AggTopnInfo {
+    pub limit: i64,
+    pub sort_col: i32,
+    pub ascending: bool,
+    pub derived_minmax: Option<(i32, i32)>,
+}
+
+/// Sentinel for `sort_col` when the sort key is a derived MIN/MAX-difference
+/// expression instead of a single aggregate's output column.
+pub(super) const TOPN_SORT_COL_DERIVED: i32 = -3;
+
 thread_local! {
-    /// Top-N info for DeltaXAgg: (limit, sort_output_col, ascending).
+    /// Top-N info for DeltaXAgg.
     /// Set in hook (deltax_create_upper_paths), consumed in plan_agg_path.
-    static AGG_TOPN_INFO: std::cell::RefCell<Option<(i64, i32, bool)>> =
+    static AGG_TOPN_INFO: std::cell::RefCell<Option<AggTopnInfo>> =
         const { std::cell::RefCell::new(None) };
 }
 
-/// Store top-N info for the next DeltaXAgg plan.
+/// Store top-N info for the next DeltaXAgg plan. Direct-aggregate form.
 pub(super) fn set_agg_topn_info(limit: i64, sort_col: i32, ascending: bool) {
-    AGG_TOPN_INFO.with(|cell| *cell.borrow_mut() = Some((limit, sort_col, ascending)));
+    AGG_TOPN_INFO.with(|cell| {
+        *cell.borrow_mut() = Some(AggTopnInfo {
+            limit, sort_col, ascending, derived_minmax: None,
+        });
+    });
+}
+
+/// Store top-N info with a derived MIN/MAX-difference sort key (Q4 shape).
+pub(super) fn set_agg_topn_info_derived_minmax(
+    limit: i64,
+    ascending: bool,
+    max_agg_idx: i32,
+    min_agg_idx: i32,
+) {
+    AGG_TOPN_INFO.with(|cell| {
+        *cell.borrow_mut() = Some(AggTopnInfo {
+            limit,
+            sort_col: TOPN_SORT_COL_DERIVED,
+            ascending,
+            derived_minmax: Some((max_agg_idx, min_agg_idx)),
+        });
+    });
 }
 
 /// Clear any stale top-N info (e.g. from a previous query whose DeltaXAgg path was not chosen).
@@ -39,8 +82,15 @@ pub(super) fn clear_agg_topn_info() {
 }
 
 /// Take (consume) the stored top-N info.
-fn take_agg_topn_info() -> Option<(i64, i32, bool)> {
+fn take_agg_topn_info() -> Option<AggTopnInfo> {
     AGG_TOPN_INFO.with(|cell| cell.borrow_mut().take())
+}
+
+/// Peek at the stored top-N info without consuming. Used by `add_agg_path`'s
+/// parallel-eligibility check (Phase C.2.f) — Top-N pushdown is excluded
+/// from the parallel path because workers can't prune top-N locally.
+fn peek_agg_topn_info() -> Option<AggTopnInfo> {
+    AGG_TOPN_INFO.with(|cell| *cell.borrow())
 }
 
 // ============================================================================
@@ -169,6 +219,170 @@ pub unsafe fn add_decompress_path(
     }
 }
 
+/// Resolve a planner range-table index to the actual relation OID via
+/// `simple_rte_array`. Returns `InvalidOid` on out-of-range / null entry.
+unsafe fn rti_to_rel_oid(
+    root: *mut pg_sys::PlannerInfo,
+    rti: pg_sys::Index,
+) -> pg_sys::Oid {
+    unsafe {
+        if root.is_null() {
+            return pg_sys::InvalidOid;
+        }
+        let array_size = (*root).simple_rel_array_size;
+        if rti as i32 == 0 || (rti as i32) >= array_size {
+            return pg_sys::InvalidOid;
+        }
+        let rte = *(*root).simple_rte_array.add(rti as usize);
+        if rte.is_null() {
+            return pg_sys::InvalidOid;
+        }
+        (*rte).relid
+    }
+}
+
+/// SPI-look up the json_extract config for the deltatable that owns this
+/// relation. `rel_oid` may be either the partitioned parent (matched against
+/// `deltax_deltatable`) or a partition (matched via `deltax_partition`).
+/// Returns an empty Vec on any failure (no deltatable, no json_extract,
+/// parse error) — extraction is silently skipped rather than aborting
+/// query planning.
+/// Public wrapper around `load_extract_specs_for_rel` for use by the
+/// planner_hook walker (which lives in `src/scan/json_extract.rs`).
+pub(crate) unsafe fn load_extract_specs_for_rel_pub(
+    rel_oid: pg_sys::Oid,
+) -> Vec<crate::compress::ExtractSpec> {
+    unsafe { load_extract_specs_for_rel(rel_oid) }
+}
+
+/// Mixed-partition gate: returns true iff every relevant compressed partition
+/// has `compressed_at >= json_extract_added_at`. Without this, partitions
+/// compressed before json_extract was configured don't have synthetic
+/// columns in their companion blobs, and the rewrite would silently emit
+/// NULLs at synthetic positions for those partitions.
+///
+/// For a parent-baserel rel_oid, "relevant" is every compressed partition
+/// of that deltatable. For a partition rel_oid, it's just that partition.
+/// Returns true (safe) when there are no compressed partitions yet, when
+/// `json_extract_added_at` is NULL (no json_extract configured), or when
+/// every relevant partition is up to date. Defensive default on any SPI
+/// hiccup is `true` — a stale partition would surface as a wrong result;
+/// a wrong default of `false` only loses the perf win, never correctness.
+/// We pick `true` here because the upstream caller (`load_extract_specs`)
+/// has already returned a non-empty spec list, so the deltatable definitely
+/// has json_extract configured; the only question is partition freshness,
+/// and treating unknowns as fresh is the less-surprising choice.
+pub(crate) unsafe fn is_json_extract_safe_for_rel(rel_oid: pg_sys::Oid) -> bool {
+    if rel_oid == pg_sys::InvalidOid {
+        return true;
+    }
+    pgrx::Spi::connect(|client| -> bool {
+        // Find this rel's deltatable + classify whether rel_oid is the
+        // parent or a partition. Then compute the relevant `compressed_at`
+        // bound: MIN(compressed_at) across compressed partitions for parent,
+        // or this partition's own compressed_at for partition. Compare to
+        // json_extract_added_at.
+        let row = client
+            .select(
+                "WITH ident AS (
+                     SELECT n.nspname AS s, c.relname AS t
+                     FROM pg_class c
+                     JOIN pg_namespace n ON c.relnamespace = n.oid
+                     WHERE c.oid = $1
+                 ),
+                 dt AS (
+                     SELECT h.id, h.json_extract_added_at, 'parent'::text AS kind
+                     FROM deltax_deltatable h, ident i
+                     WHERE h.schema_name = i.s AND h.table_name = i.t
+                     UNION ALL
+                     SELECT h.id, h.json_extract_added_at, 'partition'::text AS kind
+                     FROM deltax_deltatable h
+                     JOIN deltax_partition p ON p.deltatable_id = h.id
+                     JOIN ident i ON p.schema_name = i.s AND p.table_name = i.t
+                     LIMIT 1
+                 )
+                 SELECT
+                     dt.json_extract_added_at,
+                     CASE
+                         WHEN dt.kind = 'parent' THEN
+                             (SELECT min(p.compressed_at)
+                                FROM deltax_partition p
+                               WHERE p.deltatable_id = dt.id
+                                 AND p.is_compressed)
+                         ELSE
+                             (SELECT p.compressed_at
+                                FROM deltax_partition p, ident i
+                               WHERE p.schema_name = i.s
+                                 AND p.table_name = i.t)
+                     END AS oldest_compressed
+                 FROM dt",
+                None,
+                &[rel_oid.into()],
+            )
+            .ok();
+        let Some(row) = row else { return true };
+        let row = row.first();
+        let added_at: Option<pgrx::datum::TimestampWithTimeZone> =
+            row.get(1).ok().flatten();
+        let oldest: Option<pgrx::datum::TimestampWithTimeZone> =
+            row.get(2).ok().flatten();
+        match (added_at, oldest) {
+            // No json_extract configured (shouldn't happen here — caller
+            // already loaded specs — but defensively safe).
+            (None, _) => true,
+            // No compressed partitions yet — nothing to gate on.
+            (_, None) => true,
+            // Both present: safe iff every compressed partition is at or
+            // after the json_extract install time.
+            (Some(added), Some(oldest)) => oldest >= added,
+        }
+    })
+}
+
+unsafe fn load_extract_specs_for_rel(
+    rel_oid: pg_sys::Oid,
+) -> Vec<crate::compress::ExtractSpec> {
+    if rel_oid == pg_sys::InvalidOid {
+        return Vec::new();
+    }
+    pgrx::Spi::connect(|client| -> Vec<crate::compress::ExtractSpec> {
+        // Single SQL: resolve rel_oid via name to its containing deltatable,
+        // matching either the parent table or a partition. Returns
+        // json_extract from the deltatable.
+        // Resolve rel_oid → (schema, table). Then look up the deltatable
+        // either by the parent's name OR via a partition row that points back
+        // at it. UNION ALL keeps the SQL simple and lets either match win.
+        let row = client
+            .select(
+                "WITH ident AS (
+                     SELECT n.nspname AS s, c.relname AS t
+                     FROM pg_class c
+                     JOIN pg_namespace n ON c.relnamespace = n.oid
+                     WHERE c.oid = $1
+                 )
+                 SELECT h.json_extract FROM deltax_deltatable h, ident i
+                  WHERE h.schema_name = i.s AND h.table_name = i.t
+                  UNION ALL
+                 SELECT h.json_extract FROM deltax_deltatable h
+                  JOIN deltax_partition p ON p.deltatable_id = h.id
+                  JOIN ident i ON p.schema_name = i.s AND p.table_name = i.t
+                  LIMIT 1",
+                None,
+                &[rel_oid.into()],
+            )
+            .ok();
+        let Some(row) = row else { return Vec::new() };
+        let jx_value = row
+            .first()
+            .get_one::<pgrx::datum::JsonB>()
+            .ok()
+            .flatten()
+            .map(|j| j.0);
+        let Some(jx_value) = jx_value else { return Vec::new() };
+        crate::compress::parse_extract_specs(&jx_value)
+    })
+}
+
 /// PlanCustomPath callback: converts a CustomPath into a CustomScan plan node.
 #[pg_guard]
 pub unsafe extern "C-unwind" fn plan_custom_path(
@@ -190,8 +404,35 @@ pub unsafe extern "C-unwind" fn plan_custom_path(
         let final_clauses = pg_sys::extract_actual_clauses(clauses, false);
         (*cscan).scan.plan.qual = final_clauses;
 
-        // Build custom_private: [companion_oid_as_int, -1 (sentinel), col0, col1, ...]
+        // Read companion_oid from the path's OidList custom_private.
         let companion_oid = pg_sys::list_nth_oid((*best_path).custom_private, 0);
+
+        // Look up json_extract config via the rel's actual OID (works for
+        // both partition-direct and parent-baserel queries — the loader
+        // matches on partition or parent name). SPI is fine here: we're
+        // inside the planner with a valid snapshot. Returns an empty Vec
+        // when extraction isn't configured.
+        let rti = (*rel).relid;
+        let scan_rel_oid = rti_to_rel_oid(_root, rti);
+        let extract_specs: Vec<crate::compress::ExtractSpec> =
+            load_extract_specs_for_rel(scan_rel_oid);
+
+        // Activate the json_extract synthetic-tlist scaffolding when the
+        // deltatable has json_extract specs. We set `custom_scan_tlist` so:
+        //   - PG widens the scan slot to `physical_natts + M` positions.
+        //   - `set_customscan_references` rewrites our scan's tlist to
+        //     `Var(INDEX_VAR, k)` for both physical and synthetic positions.
+        //   - The post-setrefs planner_hook walker then reads our
+        //     `custom_scan_tlist` to discover what's at each slot position
+        //     and substitutes matching chain Exprs in upper plans.
+        // Don't set custom_scan_tlist here. PG's set_customscan_references
+        // (or some path between plan_custom_path and there) empirically
+        // nulls it before our planner_hook walker can see it. The walker
+        // rebuilds custom_scan_tlist from catalog config after setrefs runs,
+        // sidestepping the issue. See `rebuild_custom_scan_tlist_from_catalog`.
+        let _ = (scan_rel_oid, &extract_specs, rti);
+
+        // Build int-form custom_private: [companion_oid_as_int, -1 (sentinel), col0, col1, ...]
         let mut private_list =
             pg_sys::lappend_int(std::ptr::null_mut(), u32::from(companion_oid) as i32);
 
@@ -200,7 +441,7 @@ pub unsafe extern "C-unwind" fn plan_custom_path(
         let mut needed_attrs: *mut pg_sys::Bitmapset = std::ptr::null_mut();
         pg_sys::pull_varattnos(tlist as *mut pg_sys::Node, varno, &mut needed_attrs);
         pg_sys::pull_varattnos(
-            final_clauses as *mut pg_sys::Node,
+            (*cscan).scan.plan.qual as *mut pg_sys::Node,
             varno,
             &mut needed_attrs,
         );
@@ -455,6 +696,10 @@ pub struct MinMaxAggSpec {
     pub col_type_oid: pg_sys::Oid,      // source column type (InvalidOid for CountStar)
     pub typlen: i16,
     pub typbyval: bool,
+    /// Constant offset for `SUM(col + N)` shape. Adds `const_offset *
+    /// nonnull_count` to the metadata-derived sum at finalize. Zero for
+    /// all other aggregate shapes (MIN/MAX, COUNT, SUM with plain Var arg).
+    pub const_offset: i64,
 }
 
 /// Add a DeltaXMinMax custom path to the grouped relation's pathlist.
@@ -491,8 +736,10 @@ pub unsafe fn add_minmax_path(
         // Store in custom_private:
         // [oid1, oid2, ..., -1, num_aggs,
         //  kind_0, varattno_0, result_type_0, col_type_0, typlen_0, typbyval_0,
+        //    const_offset_lo_0, const_offset_hi_0,
         //  kind_1, varattno_1, ...,
         //  qual_bytes_len, qual_byte0, qual_byte1, ...]
+        // 8 ints per spec (was 6 before const_offset was added for SUM(col+N)).
         let mut private_list: *mut pg_sys::List = std::ptr::null_mut();
         for &oid in companion_oids {
             private_list = pg_sys::lappend_int(private_list, u32::from(oid) as i32);
@@ -506,6 +753,8 @@ pub unsafe fn add_minmax_path(
             private_list = pg_sys::lappend_int(private_list, u32::from(spec.col_type_oid) as i32);
             private_list = pg_sys::lappend_int(private_list, spec.typlen as i32);
             private_list = pg_sys::lappend_int(private_list, if spec.typbyval { 1 } else { 0 });
+            private_list = pg_sys::lappend_int(private_list, spec.const_offset as i32);
+            private_list = pg_sys::lappend_int(private_list, (spec.const_offset >> 32) as i32);
         }
         // Serialize quals via nodeToString so they survive plan caching.
         if !qual_list.is_null() {
@@ -538,6 +787,7 @@ struct PlanAggSpec {
     col_type_oid: pg_sys::Oid,
     typlen: i32,
     typbyval: bool,
+    const_offset: i64,
 }
 
 /// PlanCustomPath callback for DeltaXMinMax.
@@ -590,12 +840,15 @@ pub unsafe extern "C-unwind" fn plan_minmax_path(
         let num_aggs = pg_sys::list_nth_int(path_private, i);
         i += 1;
 
-        // Parse 6 ints per agg spec.
+        // Parse 8 ints per agg spec.
         for _ in 0..num_aggs {
-            let fields: Vec<i32> = (0..6)
+            let fields: Vec<i32> = (0..8)
                 .map(|off| pg_sys::list_nth_int(path_private, i + off))
                 .collect();
-            i += 6;
+            i += 8;
+            // i64 reassembled from two i32s (low first, then high).
+            let const_offset = (fields[6] as u32 as i64)
+                | ((fields[7] as i64) << 32);
             agg_specs.push(PlanAggSpec {
                 kind: MetaAggKind::from_i32(fields[0]),
                 varattno: fields[1],
@@ -603,6 +856,7 @@ pub unsafe extern "C-unwind" fn plan_minmax_path(
                 col_type_oid: pg_sys::Oid::from(fields[3] as u32),
                 typlen: fields[4],
                 typbyval: fields[5] != 0,
+                const_offset,
             });
         }
 
@@ -680,6 +934,8 @@ pub unsafe extern "C-unwind" fn plan_minmax_path(
             plan_private = pg_sys::lappend_int(plan_private, u32::from(spec.col_type_oid) as i32);
             plan_private = pg_sys::lappend_int(plan_private, spec.typlen);
             plan_private = pg_sys::lappend_int(plan_private, if spec.typbyval { 1 } else { 0 });
+            plan_private = pg_sys::lappend_int(plan_private, spec.const_offset as i32);
+            plan_private = pg_sys::lappend_int(plan_private, (spec.const_offset >> 32) as i32);
         }
         plan_private = pg_sys::lappend_int(plan_private, qual_bytes.len() as i32);
         for &b in &qual_bytes {
@@ -724,6 +980,20 @@ pub struct AggSpec {
     pub col_type_oid: pg_sys::Oid,  // source column type OID
     pub expr_kind: super::exec::AggExpr,  // Column, LengthOf, or AddConst
     pub const_offset: i64,          // Only used when expr_kind == AddConst
+    /// Phase C.2 activation: when true, the partial CustomPath is being
+    /// built and this spec emits per-PG `aggtranstype` partial state values
+    /// (combined upstream by a Final Aggregate node). Default false →
+    /// existing complete-aggregate path.
+    #[allow(dead_code)] // wired by C.2 activation in path.rs
+    pub is_partial: bool,
+    /// Aggregate's `aggtranstype` from `pg_aggregate.dat`. Only meaningful
+    /// when `is_partial = true`.
+    #[allow(dead_code)] // wired by C.2 activation in path.rs
+    pub transtype_oid: pg_sys::Oid,
+    /// H.2: monotonic transform applied to the stored MIN/MAX value at
+    /// finalize / partial-emit. Default `None`. Recognizer in `hook.rs` sets
+    /// `PgUsShift { delta }` for the timestamptz_pl_interval Aggref shape.
+    pub output_transform: super::exec::OutputTransform,
 }
 
 /// Serialize a CaseWhenValue into the integer list.
@@ -776,6 +1046,405 @@ unsafe fn deserialize_case_when_value(
     }
 }
 
+/// Phase C.2 activation — shared `custom_private` (path-level) builder for the
+/// DeltaXAgg complete-mode and partial-mode CustomPaths. Both modes use the
+/// same plan_agg_path callback so the wire format must match exactly except
+/// the trailing `is_partial` flag.
+unsafe fn build_agg_path_private(
+    companion_oids: &[pg_sys::Oid],
+    agg_specs: &[AggSpec],
+    group_specs: &[super::exec::GroupByColSpec],
+    is_partial: bool,
+) -> *mut pg_sys::List {
+    unsafe {
+        let mut private_list: *mut pg_sys::List = std::ptr::null_mut();
+        for &oid in companion_oids {
+            private_list = pg_sys::lappend_int(private_list, u32::from(oid) as i32);
+        }
+        private_list = pg_sys::lappend_int(private_list, -1); // sentinel
+        private_list = pg_sys::lappend_int(private_list, agg_specs.len() as i32);
+        for spec in agg_specs {
+            private_list = pg_sys::lappend_int(private_list, spec.agg_type as i32);
+            private_list = pg_sys::lappend_int(private_list, spec.col_idx);
+            private_list = pg_sys::lappend_int(private_list, u32::from(spec.result_type_oid) as i32);
+            private_list = pg_sys::lappend_int(private_list, u32::from(spec.col_type_oid) as i32);
+            private_list = pg_sys::lappend_int(private_list, spec.expr_kind as i32);
+            if matches!(spec.expr_kind, super::exec::AggExpr::AddConst) {
+                private_list = pg_sys::lappend_int(private_list, spec.const_offset as i32);
+            }
+            // H.2: per-MIN/MAX OutputTransform trailer. Only emitted for
+            // Min/Max — keeps the existing wire format for Count/Sum/Avg/CD
+            // intact (no test churn). Tag 0 = None (no follow-up); tag 1 =
+            // PgUsShift, followed by lo + hi i32 halves of the i64 delta.
+            if matches!(spec.agg_type, super::exec::AggType::Min | super::exec::AggType::Max) {
+                match spec.output_transform {
+                    super::exec::OutputTransform::None => {
+                        private_list = pg_sys::lappend_int(private_list, 0);
+                    }
+                    super::exec::OutputTransform::PgUsShift { delta } => {
+                        private_list = pg_sys::lappend_int(private_list, 1);
+                        private_list = pg_sys::lappend_int(private_list, delta as i32);
+                        private_list = pg_sys::lappend_int(private_list, (delta >> 32) as i32);
+                    }
+                }
+            }
+        }
+        private_list = pg_sys::lappend_int(private_list, group_specs.len() as i32);
+        for gs in group_specs {
+            private_list = pg_sys::lappend_int(private_list, gs.col_idx);
+            private_list = pg_sys::lappend_int(private_list, u32::from(gs.type_oid) as i32);
+            match &gs.expr {
+                super::exec::GroupByExpr::Column => {
+                    private_list = pg_sys::lappend_int(private_list, 0);
+                }
+                super::exec::GroupByExpr::RegexpReplace { pattern, replacement, func_oid, collation } => {
+                    private_list = pg_sys::lappend_int(private_list, 1);
+                    private_list = pg_sys::lappend_int(private_list, *func_oid as i32);
+                    private_list = pg_sys::lappend_int(private_list, *collation as i32);
+                    private_list = pg_sys::lappend_int(private_list, pattern.len() as i32);
+                    for &b in pattern.as_bytes() {
+                        private_list = pg_sys::lappend_int(private_list, b as i32);
+                    }
+                    private_list = pg_sys::lappend_int(private_list, replacement.len() as i32);
+                    for &b in replacement.as_bytes() {
+                        private_list = pg_sys::lappend_int(private_list, b as i32);
+                    }
+                }
+                super::exec::GroupByExpr::DateTrunc { unit, func_oid, .. } => {
+                    private_list = pg_sys::lappend_int(private_list, 2);
+                    private_list = pg_sys::lappend_int(private_list, *func_oid as i32);
+                    private_list = pg_sys::lappend_int(private_list, unit.len() as i32);
+                    for &b in unit.as_bytes() {
+                        private_list = pg_sys::lappend_int(private_list, b as i32);
+                    }
+                }
+                super::exec::GroupByExpr::Extract { unit, func_oid, divisor } => {
+                    // tag=3, func_oid, divisor (i64 split hi/lo), unit_len, unit_bytes...
+                    private_list = pg_sys::lappend_int(private_list, 3);
+                    private_list = pg_sys::lappend_int(private_list, *func_oid as i32);
+                    private_list = pg_sys::lappend_int(private_list, (*divisor >> 32) as i32);
+                    private_list = pg_sys::lappend_int(private_list, *divisor as i32);
+                    private_list = pg_sys::lappend_int(private_list, unit.len() as i32);
+                    for &b in unit.as_bytes() {
+                        private_list = pg_sys::lappend_int(private_list, b as i32);
+                    }
+                }
+                super::exec::GroupByExpr::AddConst { offset, op_oid } => {
+                    private_list = pg_sys::lappend_int(private_list, 4);
+                    private_list = pg_sys::lappend_int(private_list, *offset as i32);
+                    private_list = pg_sys::lappend_int(private_list, *op_oid as i32);
+                }
+                super::exec::GroupByExpr::CaseWhen(spec) => {
+                    private_list = pg_sys::lappend_int(private_list, 5);
+                    private_list = pg_sys::lappend_int(private_list, spec.clauses.len() as i32);
+                    for clause in &spec.clauses {
+                        private_list = pg_sys::lappend_int(private_list, clause.conditions.len() as i32);
+                        for cond in &clause.conditions {
+                            private_list = pg_sys::lappend_int(private_list, cond.col_idx as i32);
+                            private_list = pg_sys::lappend_int(private_list, cond.op as i32);
+                            private_list = pg_sys::lappend_int(private_list, (cond.const_val >> 32) as i32);
+                            private_list = pg_sys::lappend_int(private_list, cond.const_val as i32);
+                        }
+                        serialize_case_when_value(&clause.result, &mut private_list);
+                    }
+                    serialize_case_when_value(&spec.default, &mut private_list);
+                }
+            }
+        }
+        // Trailer: is_partial. plan_agg_path reads this and forwards into
+        // plan_private; runtime uses it to decide between compact_finalize
+        // and compact_emit_partial.
+        private_list = pg_sys::lappend_int(private_list, if is_partial { 1 } else { 0 });
+        private_list
+    }
+}
+
+/// Phase C.2.f — predicate mirroring `agg::can_use_compact_accs` but operating
+/// on `AggSpec` (the path-level type). Both check the same conditions: fixed-
+/// size accumulators on integer/float/text columns. Diverging would silently
+/// mismatch leader and worker eligibility, so this helper sticks to the same
+/// shape.
+fn parallel_compact_aggs_ok(agg_specs: &[AggSpec]) -> bool {
+    if agg_specs.is_empty() {
+        return false;
+    }
+    agg_specs.iter().all(|spec| {
+        match spec.agg_type {
+            super::exec::AggType::CountStar | super::exec::AggType::Count => true,
+            super::exec::AggType::Sum | super::exec::AggType::Avg => {
+                let t = spec.col_type_oid;
+                t == pg_sys::INT2OID || t == pg_sys::INT4OID || t == pg_sys::INT8OID
+                    || t == pg_sys::FLOAT4OID || t == pg_sys::FLOAT8OID
+            }
+            super::exec::AggType::Min | super::exec::AggType::Max => {
+                let t = spec.col_type_oid;
+                t == pg_sys::TEXTOID || t == pg_sys::VARCHAROID || t == pg_sys::BPCHAROID
+            }
+            // CountDistinct is excluded by the eligibility predicate before
+            // this helper is reached; Phase D will revisit.
+            super::exec::AggType::CountDistinct => false,
+        }
+    })
+}
+
+/// Phase C.2 activation — predicate restricting partial-mode emit to the
+/// aggregate shapes `compact_emit_partial` knows how to serialise. Today:
+/// COUNT/COUNT(*) → int8; SUM(int2/int4) → int8; SUM(float4/float8) →
+/// float8; MIN/MAX(text) → text. Excludes SUM(int8) (transtype=internal,
+/// needs int8_avg_serialize), AVG (same), and COUNT(DISTINCT) (no
+/// aggcombinefn in PG core).
+fn agg_specs_partial_emittable(agg_specs: &[AggSpec]) -> bool {
+    if agg_specs.is_empty() {
+        return false;
+    }
+    agg_specs.iter().all(|spec| match spec.agg_type {
+        super::exec::AggType::CountStar | super::exec::AggType::Count => true,
+        super::exec::AggType::Sum => {
+            let t = spec.col_type_oid;
+            t == pg_sys::INT2OID
+                || t == pg_sys::INT4OID
+                || t == pg_sys::FLOAT4OID
+                || t == pg_sys::FLOAT8OID
+        }
+        super::exec::AggType::Min | super::exec::AggType::Max => {
+            let t = spec.col_type_oid;
+            t == pg_sys::TEXTOID || t == pg_sys::VARCHAROID || t == pg_sys::BPCHAROID
+        }
+        // SUM(int8) / AVG / COUNT(DISTINCT) excluded.
+        _ => false,
+    })
+}
+
+/// Phase C.2 activation — true iff every `Var` reachable from `qual_list`
+/// has a numeric `vartype` (int / float / timestamp / date / bool). Used
+/// to gate the partial-mode CustomPath: `process_segments_compact` only
+/// decompresses numeric columns, so a WHERE qual on a non-numeric col
+/// would silently get its filter skipped (the per-row evaluator sees an
+/// empty Vec for that column and `continue`s past the qual). Rejecting
+/// such queries up front keeps the complete-aggregate path correct.
+///
+/// `pull_var_clause` walks `OpExpr` / `BoolExpr` / `FuncExpr` /
+/// `ScalarArrayOpExpr` / etc. transparently; `flags = 0` skips into
+/// aggregate args and placeholder vars (none of which appear in WHERE
+/// clauses anyway).
+#[allow(dead_code)] // wired by add_agg_partial_path below
+unsafe fn quals_reference_only_numeric_vars(qual_list: *mut pg_sys::List) -> bool {
+    if qual_list.is_null() {
+        return true;
+    }
+    unsafe {
+        let nquals = (*qual_list).length;
+        for i in 0..nquals {
+            let cell = (*qual_list).elements.add(i as usize);
+            let node = (*cell).ptr_value as *mut pg_sys::Node;
+            if node.is_null() {
+                continue;
+            }
+            let vars = pg_sys::pull_var_clause(node, 0);
+            if vars.is_null() {
+                continue;
+            }
+            let nvars = (*vars).length;
+            for j in 0..nvars {
+                let v = (*(*vars).elements.add(j as usize)).ptr_value as *mut pg_sys::Var;
+                if v.is_null() {
+                    continue;
+                }
+                if !is_partial_eligible_var_type((*v).vartype) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Set of `vartype` OIDs that `process_segments_compact` can correctly
+/// decompress + filter. Mirrors `batch_quals_all_numeric` in
+/// `agg.rs::batch_quals_all_numeric`. Diverging from that set would let
+/// the planner gate accept queries the runtime mishandles.
+fn is_partial_eligible_var_type(t: pg_sys::Oid) -> bool {
+    matches!(
+        t,
+        pg_sys::INT2OID
+            | pg_sys::INT4OID
+            | pg_sys::INT8OID
+            | pg_sys::FLOAT4OID
+            | pg_sys::FLOAT8OID
+            | pg_sys::TIMESTAMPOID
+            | pg_sys::TIMESTAMPTZOID
+            | pg_sys::DATEOID
+            | pg_sys::BOOLOID
+    )
+}
+
+/// Phase C.2 activation — adds a partial-mode DeltaXAgg CustomPath to
+/// `partially_grouped_rel.partial_pathlist`, wraps it in `Gather` (via
+/// `create_gather_path`), wraps that in a Final Aggregate
+/// (`create_agg_path` with `AGGSPLIT_FINAL_DESERIAL`), and adds the
+/// result to `grouped_rel.pathlist`. PG core's `create_grouping_paths`
+/// already populated `partially_grouped_rel.reltarget` with the partial
+/// target (Aggrefs marked `AGGSPLIT_INITIAL_SERIAL`); we piggyback on
+/// that. The planner then picks whichever of (complete-DeltaXAgg) or
+/// (partial-DeltaXAgg + Gather + Final Aggregate) is cheaper.
+///
+/// Eligibility — must all hold or we skip:
+/// - `extra` non-null and `havingQual` null (HAVING is Phase E).
+/// - `agg_specs_partial_emittable` (Count, SUM int4/float, MIN/MAX text;
+///   excludes SUM(int8) / AVG / COUNT(DISTINCT)).
+/// - Group keys empty or `can_use_compact_keys_path` (compact-eligible
+///   numeric keys).
+/// - `quals_reference_only_numeric_vars` — rejects WHERE on text /
+///   varchar / json columns. Otherwise `process_segments_compact` would
+///   silently skip the qual and over-count.
+/// - `recommend_agg_workers > 0` (worth parallelising).
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn add_agg_partial_path(
+    root: *mut pg_sys::PlannerInfo,
+    output_rel: *mut pg_sys::RelOptInfo,
+    companion_oids: &[pg_sys::Oid],
+    agg_specs: &[AggSpec],
+    group_specs: &[super::exec::GroupByColSpec],
+    pg_estimated_groups: f64,
+    extra: *mut pg_sys::GroupPathExtraData,
+) {
+    unsafe {
+        // -------- Eligibility --------
+        // Operator escape hatch: when `pg_deltax.disable_parallel_agg = on`,
+        // the planner only sees the complete CustomScan DeltaXAgg path.
+        // The complete path's internal-rayon parallelism still runs.
+        if crate::DISABLE_PARALLEL_AGG.get() {
+            return;
+        }
+        if extra.is_null() {
+            return;
+        }
+        let having_qual = (*extra).havingQual;
+        if !having_qual.is_null() {
+            return;
+        }
+        if !agg_specs_partial_emittable(agg_specs) {
+            return;
+        }
+        if !group_specs.is_empty() && !super::exec::can_use_compact_keys_path(group_specs, &[]) {
+            return;
+        }
+        // Reject WHERE clauses that reference non-numeric columns. See
+        // `quals_reference_only_numeric_vars` for the rationale.
+        let parse = (*root).parse;
+        if !parse.is_null() {
+            let jointree = (*parse).jointree;
+            if !jointree.is_null() && !(*jointree).quals.is_null() {
+                let q = (*jointree).quals;
+                let wrap = pg_sys::lappend(std::ptr::null_mut(), q as *mut _);
+                let ok = quals_reference_only_numeric_vars(wrap);
+                if !ok {
+                    return;
+                }
+            }
+        }
+        let workers = cost::recommend_agg_workers(companion_oids);
+        if workers <= 0 {
+            return;
+        }
+
+        // -------- Fetch partially_grouped_rel --------
+        let pgr = pg_sys::fetch_upper_rel(
+            root,
+            pg_sys::UpperRelationKind::UPPERREL_PARTIAL_GROUP_AGG,
+            (*output_rel).relids,
+        );
+        if pgr.is_null() {
+            return;
+        }
+        if (*pgr).reltarget.is_null() {
+            return;
+        }
+
+        // -------- Build partial CustomPath --------
+        let cpath =
+            pg_sys::palloc0(std::mem::size_of::<pg_sys::CustomPath>()) as *mut pg_sys::CustomPath;
+        (*cpath).path.type_ = pg_sys::NodeTag::T_CustomPath;
+        (*cpath).path.pathtype = pg_sys::NodeTag::T_CustomScan;
+        (*cpath).path.parent = pgr;
+        (*cpath).path.pathtarget = (*pgr).reltarget;
+
+        let estimated_rows = if group_specs.is_empty() {
+            1.0
+        } else if pg_estimated_groups > 0.0 {
+            pg_estimated_groups
+        } else {
+            100.0
+        };
+        (*cpath).path.rows = estimated_rows;
+
+        let (startup, total) = cost::estimate_agg_cost(
+            companion_oids,
+            agg_specs.len(),
+            estimated_rows,
+            /* num_having_filters */ 0,
+            workers as usize,
+        );
+        (*cpath).path.startup_cost = startup;
+        (*cpath).path.total_cost = total;
+        (*cpath).path.parallel_workers = workers;
+        (*cpath).path.parallel_aware = true;
+        (*cpath).path.parallel_safe = true;
+        (*cpath).path.pathkeys = std::ptr::null_mut();
+
+        let private_list = build_agg_path_private(
+            companion_oids,
+            agg_specs,
+            group_specs,
+            /* is_partial */ true,
+        );
+        (*cpath).custom_private = private_list;
+        (*cpath).custom_paths = std::ptr::null_mut();
+        (*cpath).custom_restrictinfo = std::ptr::null_mut();
+        (*cpath).methods = &DELTAX_AGG_PATH_METHODS.0;
+
+        pg_sys::add_partial_path(pgr, cpath as *mut pg_sys::Path);
+
+        // -------- Wrap in Gather --------
+        let mut gather_rows: f64 = (estimated_rows * workers as f64).max(1.0);
+        let gather_path = pg_sys::create_gather_path(
+            root,
+            pgr,
+            cpath as *mut pg_sys::Path,
+            (*pgr).reltarget,
+            std::ptr::null_mut(),
+            &mut gather_rows,
+        );
+        if gather_path.is_null() {
+            return;
+        }
+
+        // -------- Wrap Gather in Final Aggregate (AGGSPLIT_FINAL_DESERIAL) --------
+        let agg_strategy = if group_specs.is_empty() {
+            pg_sys::AggStrategy::AGG_PLAIN
+        } else {
+            pg_sys::AggStrategy::AGG_HASHED
+        };
+        let final_path = pg_sys::create_agg_path(
+            root,
+            output_rel,
+            gather_path as *mut pg_sys::Path,
+            (*output_rel).reltarget,
+            agg_strategy,
+            pg_sys::AggSplit::AGGSPLIT_FINAL_DESERIAL,
+            (*root).processed_groupClause,
+            having_qual as *mut pg_sys::List,
+            &(*extra).agg_final_costs,
+            pg_estimated_groups.max(1.0),
+        );
+        if final_path.is_null() {
+            return;
+        }
+
+        pg_sys::add_path(output_rel, final_path as *mut pg_sys::Path);
+    }
+}
+
 /// Add a DeltaXAgg custom path to the grouped relation's pathlist.
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn add_agg_path(
@@ -806,6 +1475,40 @@ pub unsafe fn add_agg_path(
             100.0
         };
         (*cpath).path.rows = estimated_rows;
+
+        // Phase C.2.f — eligibility for the parallel-aware DeltaXAgg path.
+        // The runtime path (workers do partials in their DSM slabs, leader
+        // merges + finalises) only handles the compact path: integer-packed
+        // group keys, fixed-size accumulators, no DISTINCT / HAVING / Top-N
+        // / LIMIT. Anything else stays serial / internal-rayon.
+        let topn_info = peek_agg_topn_info();
+        let topn_active = topn_info.is_some_and(|info| info.limit > 0);
+        let parallel_eligible = having_filters.is_empty()
+            && !topn_active
+            && !agg_specs.iter().any(|s| s.agg_type == super::exec::AggType::CountDistinct)
+            && parallel_compact_aggs_ok(agg_specs)
+            && (group_specs.is_empty() || super::exec::can_use_compact_keys_path(group_specs, &[]));
+
+        // Phase C.2.f wiring: the predicate + `recommend_agg_workers` are in
+        // place but we keep `parallel_workers = 0` here. Hooking the
+        // parallel-aware path through PG's Gather model is non-trivial: PG
+        // expects "partial aggregate → Gather → final aggregate" semantics,
+        // whereas DeltaXAgg's design has the leader merge + emit final rows
+        // directly (workers contribute via DSM, not via tuple stream). The
+        // C.2.b–e infrastructure (DSM hooks, agg_wire, deferred exec_ctx,
+        // worker / leader claim+merge) is sound and exercised by the unit
+        // tests; activating it requires a separate planner integration —
+        // either splitting into partial-DeltaXAgg + final-Aggregate, or
+        // building a custom Gather-equivalent — which is beyond the scope
+        // of C.2 and lands in a follow-up.
+        let _eligible = parallel_eligible;
+        let _recommended = if parallel_eligible {
+            cost::recommend_agg_workers(companion_oids)
+        } else {
+            0
+        };
+        let workers: i32 = 0;
+
         // §5.8-b: real formula replaces the historic `(10.0, 20.0)` hack so
         // future parallel-partial paths can be costed meaningfully against
         // `parallel_setup_cost`. See `cost::estimate_agg_cost` for
@@ -815,105 +1518,47 @@ pub unsafe fn add_agg_path(
             agg_specs.len(),
             estimated_rows,
             having_filters.len(),
+            workers as usize,
         );
         (*cpath).path.startup_cost = startup;
         (*cpath).path.total_cost = total;
-        (*cpath).path.parallel_workers = 0;
+        (*cpath).path.parallel_workers = workers;
         (*cpath).path.parallel_aware = false;
         (*cpath).path.parallel_safe = false;
         (*cpath).path.pathkeys = if pathkeys.is_null() { std::ptr::null_mut() } else { pathkeys };
 
-        // Store in custom_private:
-        // [oid1, oid2, ..., -1, num_aggs,
-        //  agg_type_0, col_idx_0, result_oid_0, col_type_oid_0, expr_kind_0,
-        //  ...,
-        //  num_groups, group_col_idx_0, group_type_oid_0, ...]
-        let mut private_list: *mut pg_sys::List = std::ptr::null_mut();
-        for &oid in companion_oids {
-            private_list = pg_sys::lappend_int(private_list, u32::from(oid) as i32);
-        }
-        private_list = pg_sys::lappend_int(private_list, -1);  // sentinel
-        private_list = pg_sys::lappend_int(private_list, agg_specs.len() as i32);
-        for spec in agg_specs {
-            private_list = pg_sys::lappend_int(private_list, spec.agg_type as i32);
-            private_list = pg_sys::lappend_int(private_list, spec.col_idx);
-            private_list = pg_sys::lappend_int(private_list, u32::from(spec.result_type_oid) as i32);
-            private_list = pg_sys::lappend_int(private_list, u32::from(spec.col_type_oid) as i32);
-            private_list = pg_sys::lappend_int(private_list, spec.expr_kind as i32);
-            if matches!(spec.expr_kind, super::exec::AggExpr::AddConst) {
-                private_list = pg_sys::lappend_int(private_list, spec.const_offset as i32);
-            }
-        }
-        private_list = pg_sys::lappend_int(private_list, group_specs.len() as i32);
-        for gs in group_specs {
-            private_list = pg_sys::lappend_int(private_list, gs.col_idx);
-            private_list = pg_sys::lappend_int(private_list, u32::from(gs.type_oid) as i32);
-            match &gs.expr {
-                super::exec::GroupByExpr::Column => {
-                    private_list = pg_sys::lappend_int(private_list, 0); // expr_tag=0
-                }
-                super::exec::GroupByExpr::RegexpReplace { pattern, replacement, func_oid, collation } => {
-                    private_list = pg_sys::lappend_int(private_list, 1); // expr_tag=1
-                    private_list = pg_sys::lappend_int(private_list, *func_oid as i32);
-                    private_list = pg_sys::lappend_int(private_list, *collation as i32);
-                    private_list = pg_sys::lappend_int(private_list, pattern.len() as i32);
-                    for &b in pattern.as_bytes() {
-                        private_list = pg_sys::lappend_int(private_list, b as i32);
-                    }
-                    private_list = pg_sys::lappend_int(private_list, replacement.len() as i32);
-                    for &b in replacement.as_bytes() {
-                        private_list = pg_sys::lappend_int(private_list, b as i32);
-                    }
-                }
-                super::exec::GroupByExpr::DateTrunc { unit, func_oid, .. } => {
-                    private_list = pg_sys::lappend_int(private_list, 2); // expr_tag=2
-                    private_list = pg_sys::lappend_int(private_list, *func_oid as i32);
-                    private_list = pg_sys::lappend_int(private_list, unit.len() as i32);
-                    for &b in unit.as_bytes() {
-                        private_list = pg_sys::lappend_int(private_list, b as i32);
-                    }
-                }
-                super::exec::GroupByExpr::Extract { unit, func_oid } => {
-                    private_list = pg_sys::lappend_int(private_list, 3); // expr_tag=3
-                    private_list = pg_sys::lappend_int(private_list, *func_oid as i32);
-                    private_list = pg_sys::lappend_int(private_list, unit.len() as i32);
-                    for &b in unit.as_bytes() {
-                        private_list = pg_sys::lappend_int(private_list, b as i32);
-                    }
-                }
-                super::exec::GroupByExpr::AddConst { offset, op_oid } => {
-                    private_list = pg_sys::lappend_int(private_list, 4); // expr_tag=4
-                    private_list = pg_sys::lappend_int(private_list, *offset as i32);
-                    private_list = pg_sys::lappend_int(private_list, *op_oid as i32);
-                }
-                super::exec::GroupByExpr::CaseWhen(spec) => {
-                    private_list = pg_sys::lappend_int(private_list, 5); // expr_tag=5
-                    private_list = pg_sys::lappend_int(private_list, spec.clauses.len() as i32);
-                    for clause in &spec.clauses {
-                        private_list = pg_sys::lappend_int(private_list, clause.conditions.len() as i32);
-                        for cond in &clause.conditions {
-                            private_list = pg_sys::lappend_int(private_list, cond.col_idx as i32);
-                            private_list = pg_sys::lappend_int(private_list, cond.op as i32);
-                            // Store i64 const_val as two i32s (high, low)
-                            private_list = pg_sys::lappend_int(private_list, (cond.const_val >> 32) as i32);
-                            private_list = pg_sys::lappend_int(private_list, cond.const_val as i32);
-                        }
-                        serialize_case_when_value(&clause.result, &mut private_list);
-                    }
-                    serialize_case_when_value(&spec.default, &mut private_list);
-                }
-            }
-        }
+        // Store in custom_private. Wire format: see `build_agg_path_private`.
+        // Trailer is_partial = false on the complete path; the partial path
+        // constructor (add_agg_partial_path) sets it true.
+        let private_list = build_agg_path_private(
+            companion_oids,
+            agg_specs,
+            group_specs,
+            /* is_partial */ false,
+        );
+
         // Store HAVING filters for thread-local passing to plan_agg_path
         if !having_filters.is_empty() {
             set_agg_having_filters(having_filters.to_vec());
         }
+
         (*cpath).custom_private = private_list;
 
         (*cpath).custom_paths = std::ptr::null_mut();
         (*cpath).custom_restrictinfo = std::ptr::null_mut();
         (*cpath).methods = &DELTAX_AGG_PATH_METHODS.0;
 
+        // Phase C.2.f — parallel-aware paths must go through `add_partial_path`
+        // so PG generates a Gather above DeltaXAgg. With Gather, the
+        // EstimateDSM/InitializeDSM/InitializeWorker hooks fire and workers
+        // attach DSM. Without it, `parallel_aware = true` on a path added via
+        // `add_path` runs standalone with no workers — the leader's
+        // `run_leader_merge_and_finalise` would never have `pscan` populated.
+        //
+        // Workers emit no rows themselves (they write to DSM and return EOF
+        // in `exec_agg_scan`); the leader emits all final rows. Gather just
+        // concatenates → the upper relation sees the leader's full result
+        // set with no Aggregate-final wrapper needed.
         pg_sys::add_path(output_rel, cpath as *mut pg_sys::Path);
     }
 }
@@ -980,13 +1625,18 @@ pub unsafe extern "C-unwind" fn plan_agg_path(
             col_type_oid: u32,
             expr_kind: i32,  // 0=Column, 1=LengthOf, 2=AddConst
             const_offset: i32, // Only used when expr_kind == 2
+            // H.2: OutputTransform trailer (only for MIN/MAX in path_private).
+            // tag: 0=None, 1=PgUsShift. lo/hi only meaningful when tag==1.
+            output_tag: i32,
+            output_lo: i32,
+            output_hi: i32,
         }
         #[derive(Clone)]
         enum ParsedGroupExpr {
             Column,
             RegexpReplace { func_oid: u32, collation: u32, pattern: String, replacement: String },
             DateTrunc { func_oid: u32, unit: String },
-            Extract { func_oid: u32, unit: String },
+            Extract { func_oid: u32, unit: String, divisor: i64 },
             AddConst { offset: i32, op_oid: u32 },
             CaseWhen(super::exec::CaseWhenSpec),
         }
@@ -1000,6 +1650,10 @@ pub unsafe extern "C-unwind" fn plan_agg_path(
         let mut companion_oids: Vec<u32> = Vec::new();
         let mut parsed_aggs: Vec<ParsedAgg> = Vec::new();
         let mut parsed_groups: Vec<ParsedGroup> = Vec::new();
+        // Phase C.2 activation: trailing is_partial flag from path_private.
+        // Default false for paths that don't write the trailer (current
+        // complete-path code path).
+        let mut path_is_partial: bool = false;
 
         // Sequential parse with index
         let mut idx = 0;
@@ -1028,7 +1682,32 @@ pub unsafe extern "C-unwind" fn plan_agg_path(
                 } else {
                     0
                 };
-                parsed_aggs.push(ParsedAgg { agg_type, col_idx, result_oid, col_type_oid, expr_kind, const_offset });
+                // H.2: per-MIN/MAX OutputTransform trailer. tag(0=None, 1=PgUsShift)
+                // followed by 2 i32 halves of i64 delta when tag==1. Capture on
+                // the path side and re-emit on plan_private below — exec parse
+                // expects the same shape.
+                let (output_tag, output_lo, output_hi) =
+                    if (agg_type == super::exec::AggType::Min as i32
+                        || agg_type == super::exec::AggType::Max as i32)
+                        && idx < path_len
+                    {
+                        let tag = pg_sys::list_nth_int(path_private, idx);
+                        idx += 1;
+                        if tag == 1 {
+                            let lo = pg_sys::list_nth_int(path_private, idx);
+                            let hi = pg_sys::list_nth_int(path_private, idx + 1);
+                            idx += 2;
+                            (1, lo, hi)
+                        } else {
+                            (0, 0, 0)
+                        }
+                    } else {
+                        (0, 0, 0)
+                    };
+                parsed_aggs.push(ParsedAgg {
+                    agg_type, col_idx, result_oid, col_type_oid, expr_kind, const_offset,
+                    output_tag, output_lo, output_hi,
+                });
             }
         }
         // Parse group specs (variable-length due to RegexpReplace)
@@ -1074,8 +1753,14 @@ pub unsafe extern "C-unwind" fn plan_agg_path(
                     let unit = String::from_utf8_lossy(&unit_bytes).into_owned();
                     ParsedGroupExpr::DateTrunc { func_oid, unit }
                 } else if expr_tag == 3 {
+                    // Extract: func_oid, divisor (i64 hi/lo), unit_len, unit_bytes...
                     let func_oid = pg_sys::list_nth_int(path_private, idx) as u32;
                     idx += 1;
+                    let div_hi = pg_sys::list_nth_int(path_private, idx) as i64;
+                    idx += 1;
+                    let div_lo = pg_sys::list_nth_int(path_private, idx) as u32 as i64;
+                    idx += 1;
+                    let divisor = (div_hi << 32) | div_lo;
                     let unit_len = pg_sys::list_nth_int(path_private, idx) as usize;
                     idx += 1;
                     let mut unit_bytes = Vec::with_capacity(unit_len);
@@ -1084,7 +1769,7 @@ pub unsafe extern "C-unwind" fn plan_agg_path(
                         idx += 1;
                     }
                     let unit = String::from_utf8_lossy(&unit_bytes).into_owned();
-                    ParsedGroupExpr::Extract { func_oid, unit }
+                    ParsedGroupExpr::Extract { func_oid, unit, divisor }
                 } else if expr_tag == 4 {
                     let offset = pg_sys::list_nth_int(path_private, idx);
                     let op_oid = pg_sys::list_nth_int(path_private, idx + 1) as u32;
@@ -1121,6 +1806,15 @@ pub unsafe extern "C-unwind" fn plan_agg_path(
                 parsed_groups.push(ParsedGroup { col_idx, type_oid, expr });
             }
         }
+
+        // Phase C.2 activation: trailing `is_partial` flag (one int, 0/1).
+        // Older paths that don't write it default to false. add_agg_path
+        // and add_agg_partial_path are responsible for appending it.
+        if idx < path_len {
+            path_is_partial = pg_sys::list_nth_int(path_private, idx) != 0;
+            idx += 1;
+        }
+        let _ = idx;
 
         // Eliminate redundant GROUP BY expressions.
         // If multiple specs reference the same col_idx and are all Column/AddConst,
@@ -1276,7 +1970,27 @@ pub unsafe extern "C-unwind" fn plan_agg_path(
                     }).unwrap_or(0) as i32;
                     output_map.push((1, group_idx));
                 } else if (*expr).type_ == pg_sys::NodeTag::T_OpExpr {
-                    // OpExpr in target list (e.g. col - 1) — find matching GROUP BY AddConst spec
+                    // OpExpr in target list. Three cases handled below:
+                    //   1. JSONB chain (`data->>'k'`) — match to a synthetic
+                    //      column GROUP BY entry via AggChainCtx.
+                    //   2. `Var ± Const` — match to AddConst GROUP BY.
+                    //   3. fall through to a default that points at group_specs[0].
+                    // Try chain first because chain Exprs are also OpExpr nodes;
+                    // without this, a `data->>'k'` target falls through to the
+                    // AddConst path, finds no Const arg, and emits a bogus
+                    // `Group(0)` mapping that crashes finalization when there
+                    // are multiple GROUP BY columns.
+                    let chain_match = super::json_extract::AggChainCtx::from_root(root)
+                        .and_then(|ctx| ctx.match_to_synthetic(expr))
+                        .map(|(synth_col_idx, _)| synth_col_idx);
+                    if let Some(synth_col_idx) = chain_match {
+                        let group_idx = parsed_groups.iter().position(|g| {
+                            g.col_idx == synth_col_idx
+                                && matches!(g.expr, ParsedGroupExpr::Column)
+                        }).unwrap_or(0) as i32;
+                        output_map.push((1, group_idx));
+                        continue;
+                    }
                     let opexpr = expr as *const pg_sys::OpExpr;
                     let op_oid = u32::from((*opexpr).opno);
                     let op_args = (*opexpr).args;
@@ -1389,6 +2103,16 @@ pub unsafe extern "C-unwind" fn plan_agg_path(
             if a.expr_kind == 2 {
                 private_list = pg_sys::lappend_int(private_list, a.const_offset);
             }
+            // H.2: re-emit OutputTransform trailer for MIN/MAX. Mirrors the
+            // path_private layout so exec's `parse_agg_private` reads the same
+            // shape it expects.
+            if a.agg_type == super::exec::AggType::Min as i32 || a.agg_type == super::exec::AggType::Max as i32 {
+                private_list = pg_sys::lappend_int(private_list, a.output_tag);
+                if a.output_tag == 1 {
+                    private_list = pg_sys::lappend_int(private_list, a.output_lo);
+                    private_list = pg_sys::lappend_int(private_list, a.output_hi);
+                }
+            }
         }
         private_list = pg_sys::lappend_int(private_list, parsed_groups.len() as i32);
         for g in &parsed_groups {
@@ -1419,9 +2143,11 @@ pub unsafe extern "C-unwind" fn plan_agg_path(
                         private_list = pg_sys::lappend_int(private_list, b as i32);
                     }
                 }
-                ParsedGroupExpr::Extract { func_oid, unit } => {
+                ParsedGroupExpr::Extract { func_oid, unit, divisor } => {
                     private_list = pg_sys::lappend_int(private_list, 3);
                     private_list = pg_sys::lappend_int(private_list, *func_oid as i32);
+                    private_list = pg_sys::lappend_int(private_list, (*divisor >> 32) as i32);
+                    private_list = pg_sys::lappend_int(private_list, *divisor as i32);
                     private_list = pg_sys::lappend_int(private_list, unit.len() as i32);
                     for &b in unit.as_bytes() {
                         private_list = pg_sys::lappend_int(private_list, b as i32);
@@ -1509,6 +2235,29 @@ pub unsafe extern "C-unwind" fn plan_agg_path(
             qual_list = extract_quals_from_baserestrictinfo(root);
         }
 
+        // Rewrite JSONB chain Exprs in the qual list against the parent's
+        // json_extract specs so the serialised quals deserialise into Var
+        // nodes that `extract_batch_quals` can recognise. Without this,
+        // queries like `WHERE data->>'kind' = 'commit'` hit DeltaXAgg with
+        // unrewritten chains, `extract_batch_quals` skips them silently
+        // (Var-only matcher), and the WHERE filter is dropped — wrong
+        // results. The post-`standard_planner` walker only handles
+        // DeltaXDecompress / DeltaXAppend cscans; DeltaXAgg keeps its quals
+        // in `custom_private` (not in `scan.plan.qual`) so the walker can't
+        // touch them after the fact. Doing it here, while the parse tree is
+        // still in scope, is the natural fit.
+        if !qual_list.is_null()
+            && let Some(ctx) = super::json_extract::AggChainCtx::from_root(root)
+        {
+            qual_list = super::json_extract::rewrite_chains_in_list(
+                qual_list,
+                ctx.parent_rti,
+                &ctx.specs,
+                &ctx.phys,
+                ctx.physical_count,
+            );
+        }
+
         if !qual_list.is_null() {
             let s = pg_sys::nodeToString(qual_list as *const _);
             let s_bytes = std::ffi::CStr::from_ptr(s).to_bytes();
@@ -1522,15 +2271,29 @@ pub unsafe extern "C-unwind" fn plan_agg_path(
             private_list = pg_sys::lappend_int(private_list, 0);
         }
 
-        // Top-N info: [topn_limit, topn_sort_col, topn_ascending] or [0]
+        // Top-N info: [topn_limit, topn_sort_col, topn_ascending,
+        //              derived_max_idx, derived_min_idx] or [0].
+        // For backward compat: when derived_minmax is None we still emit the
+        // 3-int form (no trailing pair). When sort_col == TOPN_SORT_COL_DERIVED
+        // we emit the 5-int form with the slot indices.
         let topn = take_agg_topn_info();
-        if let Some((limit, sort_col, ascending)) = topn {
-            private_list = pg_sys::lappend_int(private_list, limit as i32);
-            private_list = pg_sys::lappend_int(private_list, sort_col);
-            private_list = pg_sys::lappend_int(private_list, if ascending { 1 } else { 0 });
+        if let Some(info) = topn {
+            private_list = pg_sys::lappend_int(private_list, info.limit as i32);
+            private_list = pg_sys::lappend_int(private_list, info.sort_col);
+            private_list = pg_sys::lappend_int(private_list, if info.ascending { 1 } else { 0 });
+            if let Some((max_idx, min_idx)) = info.derived_minmax {
+                private_list = pg_sys::lappend_int(private_list, max_idx);
+                private_list = pg_sys::lappend_int(private_list, min_idx);
+            }
         } else {
             private_list = pg_sys::lappend_int(private_list, 0);
         }
+
+        // Phase C.2 activation trailer: is_partial flag, propagated from
+        // path_private (set by add_agg_partial_path) into the runtime
+        // plan_private. parse_agg_private treats absence as false for
+        // backward-compat.
+        private_list = pg_sys::lappend_int(private_list, if path_is_partial { 1 } else { 0 });
 
         (*cscan).custom_private = private_list;
         (*cscan).scan.plan.qual = std::ptr::null_mut();

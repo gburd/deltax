@@ -5,6 +5,7 @@ use pgrx::pg_guard;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::hash::{BuildHasherDefault, Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use regex::Regex;
@@ -19,16 +20,17 @@ use super::batch_qual::{BatchCompareOp, BatchQual,
 use super::datum_utils::{
     decompress_blob_to_datums, decompress_text_blob_to_raw_strings,
     decompress_text_blob_to_lengths, decompress_text_blob_with_like_filter,
-    decompress_text_blob_with_eq_filter, string_to_datum, pg_type_name,
+    decompress_text_blob_with_eq_filter, decompress_text_blob_with_in_filter,
+    string_to_datum, pg_type_name,
     count_non_null, collation_strcmp,
 };
 use super::segments::{
     SegmentData, load_metadata, load_segments_heap,
     segment_skippable_by_dict, extract_segment_filters,
-    classify_segment_quals, SegmentQualResult, is_zero_const,
+    classify_segment_quals, classify_segment_quals_numeric, SegmentQualResult, is_zero_const,
     detoast_lazy_blobs,
 };
-use super::text_col::{SegTextColumn, TextQualInfo, decompress_length_sidecar, decompress_text_to_seg_col, apply_text_eq_filter, apply_text_like_filter, strcoll_cmp};
+use super::text_col::{SegTextColumn, TextQualInfo, decompress_length_sidecar, decompress_text_to_seg_col, apply_text_eq_filter, apply_text_in_filter, apply_text_like_filter, strcoll_cmp};
 
 /// Compute a 128-bit hash of a byte slice for COUNT(DISTINCT) on strings.
 /// Uses two AHasher instances (AES-NI accelerated) with different fixed keys
@@ -81,6 +83,27 @@ pub(crate) enum AggExpr {
     LengthOf,
     /// col + const: AGG(col + N) — add integer constant before aggregation
     AddConst,
+}
+
+/// H.2: post-storage transform applied at finalize / partial-emit time.
+///
+/// MIN/MAX are linear in the input, so a monotonic affine transform on the
+/// argument can be lifted to a transform on the result without changing the
+/// argmin/argmax. We exploit this for JSONBench Q3/Q4's
+/// `MIN(<const_timestamptz> + INTERVAL <unit> * <bigint>)` shape: store the
+/// raw bigint (`time_us`), pick the min, then shift by `delta` at emit time
+/// to recover the timestamptz value PG expects.
+///
+/// `None` is the identity (no shift); existing code paths default to it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum OutputTransform {
+    None,
+    /// Final emitted value = `stored_i64 + delta` (wrapping i64 add).
+    /// Stored accumulator is i64 microseconds; emitted Datum is reinterpreted
+    /// as TIMESTAMPTZOID (PG's internal representation is i64 µs from 2000-01-01).
+    /// `delta` is precomputed by the recognizer in `hook.rs` from the
+    /// constant epoch + interval coefficient.
+    PgUsShift { delta: i64 },
 }
 
 /// `hashbrown` HashSet with ahash — the insert hot path for
@@ -178,6 +201,24 @@ pub(crate) struct AggExecSpec {
     pub(crate) col_type_oid: pg_sys::Oid,  // source column type
     pub(crate) expr_kind: AggExpr,         // Column, LengthOf, or AddConst
     pub(crate) const_offset: i64,          // Only used when expr_kind == AddConst
+    /// Phase C.2 activation: when true, exec emits PG's partial-aggregate
+    /// transition state (see `transtype_oid`) instead of the final value;
+    /// a Final Aggregate node above DeltaXAgg combines partials via the
+    /// aggregate's combinefn. Wired by C.2.f's planner construction.
+    /// Default false → existing complete-aggregate behaviour.
+    #[allow(dead_code)] // wired by C.2 activation in path.rs
+    pub(crate) is_partial: bool,
+    /// Aggregate's `aggtranstype` from `pg_aggregate.dat` — only meaningful
+    /// when `is_partial = true`. For COUNT/SUM(int4) this is INT8;
+    /// for SUM(int8) / AVG it's INTERNAL (serialized via aggserialfn);
+    /// for MIN/MAX it's the column type. `InvalidOid` when `is_partial =
+    /// false`.
+    #[allow(dead_code)] // wired by C.2 activation in path.rs
+    pub(crate) transtype_oid: pg_sys::Oid,
+    /// H.2: monotonic transform applied at finalize / partial-emit. Default
+    /// `None` for all existing call sites; recognizer in `hook.rs` sets
+    /// `PgUsShift { delta }` for the timestamptz_pl_interval Aggref shape.
+    pub(crate) output_transform: OutputTransform,
 }
 
 // SAFETY: AggExecSpec contains only value types (i32, i64, Oid=u32, enums).
@@ -193,8 +234,22 @@ pub(crate) enum GroupByExpr {
     RegexpReplace { pattern: String, replacement: String, func_oid: u32, collation: u32 },
     /// date_trunc(unit, timestamp_col): GROUP BY date_trunc('minute', ts)
     DateTrunc { unit: String, unit_usecs: i64, func_oid: u32 },
-    /// extract(field FROM timestamp_col): GROUP BY extract(minute FROM ts)
-    Extract { unit: String, func_oid: u32 },
+    /// extract(field FROM timestamp_col): GROUP BY extract(minute FROM ts).
+    ///
+    /// When `divisor == 0`, the input column at `col_idx` is a TIMESTAMP /
+    /// TIMESTAMPTZ — read as i64 microseconds since the PG epoch
+    /// (2000-01-01) and passed to `extract_field_from_usecs`.
+    ///
+    /// When `divisor > 0`, the input column is a BIGINT carrying microseconds
+    /// since the unix epoch (1970-01-01) — typically a json_extract synthetic
+    /// recovered from `(data->>'time_us')::bigint`. The recognizer matches
+    /// `extract(unit FROM to_timestamp(<bigint_col> / <const>))`; `divisor`
+    /// is the SQL-level divisor (e.g. 1_000_000 for `time_us / 1000000`),
+    /// applied at evaluation time to recover unix seconds. Restricted to
+    /// period-86400-invariant units (sub-day fields), where the unix-vs-PG
+    /// epoch shift drops out of the answer; calendar-based fields fall back
+    /// to the executor.
+    Extract { unit: String, func_oid: u32, divisor: i64 },
     /// col +/- const: GROUP BY col - 1  (offset is always stored as addition, so col-1 → offset=-1)
     AddConst { offset: i64, op_oid: u32 },
     /// CASE WHEN ... THEN ... ELSE ... END
@@ -290,6 +345,57 @@ fn extract_field_from_usecs(pg_usec: i64, unit: &str) -> i64 {
     }
 }
 
+/// Evaluate a `GroupByExpr::Extract` on a single column-row value. When
+/// `divisor == 0` the input is interpreted as PG-usec (existing path); when
+/// `divisor > 0` the input is interpreted as bigint unix microseconds via
+/// `extract_subday_from_bigint_scaled` below. Centralised so the five
+/// per-row extract sites in this file stay one-line and consistent.
+#[inline]
+pub(crate) fn eval_extract(value: i64, divisor: i64, unit: &str) -> i64 {
+    if divisor > 0 {
+        extract_subday_from_bigint_scaled(value, divisor, unit)
+    } else {
+        extract_field_from_usecs(value, unit)
+    }
+}
+
+/// Extract a sub-day field from a BIGINT column whose value, when divided
+/// by `divisor`, yields seconds since the unix epoch (1970-01-01). Used for
+/// the `extract(unit FROM to_timestamp(bigint_col / divisor))` shape — the
+/// recognizer in `hook.rs` only emits this for units whose value depends
+/// only on `unix_secs % 86400` (microsecond/millisecond/second/minute/hour),
+/// so the unix-vs-PG epoch shift (a multiple of 86400) drops out and we
+/// don't need to convert to PG-usec first.
+///
+/// `divisor` must be positive; the recognizer enforces this.
+fn extract_subday_from_bigint_scaled(value: i64, divisor: i64, unit: &str) -> i64 {
+    let unix_secs = value.div_euclid(divisor);
+    let secs_in_day = unix_secs.rem_euclid(86_400);
+    match unit {
+        "microsecond" | "microseconds" => {
+            // Whole-second arithmetic only: `to_timestamp(bigint / divisor)`
+            // already truncated below the second, so any sub-second component
+            // of the original bigint is lost. The recognizer accepts the unit
+            // anyway because the answer remains exact for divisors that are
+            // multiples of 1_000_000 (the only shape we've seen in practice).
+            (secs_in_day % 60) * 1_000_000
+        }
+        "millisecond" | "milliseconds" => {
+            (secs_in_day % 60) * 1_000
+        }
+        "second" | "seconds" => {
+            secs_in_day % 60
+        }
+        "minute" | "minutes" => {
+            (secs_in_day / 60) % 60
+        }
+        "hour" | "hours" => {
+            secs_in_day / 3_600
+        }
+        _ => 0, // recognizer rejects other units in the divisor>0 path
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct GroupByColSpec {
     pub(crate) col_idx: i32,  // 0-based column index
@@ -346,8 +452,561 @@ pub(crate) struct AggScanState {
     /// F8 (`PERF_IMPROVEMENTS.md` #44): number of preselected keys used to
     /// filter Phase-1 rows. 0 when the optimization didn't fire.
     pub(crate) f8_preselected: u64,
+    /// Parallel-DeltaXAgg shared state (Phase C). Null when running serially
+    /// (no Gather above us). Set by `initialize_dsm_deltax_agg` on the
+    /// leader and by `init_worker_deltax_agg` on each worker.
+    #[allow(dead_code)] // Phase C.0 scaffold; consumers added in C.1+.
+    pub(crate) pscan: *mut DeltaXAggPState,
+    /// True for parallel workers; the worker's `begin_agg_scan` short-
+    /// circuits past SPI + heap scan + accumulator construction and the
+    /// leader handles result emission. False on the leader and on serial
+    /// scans.
+    #[allow(dead_code)] // Phase C.0 scaffold; consumers added in C.1+.
+    pub(crate) is_parallel_worker: bool,
+    /// Phase C.2.c — deferred parallel-exec state. `Some` when the planner
+    /// chose the parallel-aware path (`plan.parallel_aware == true`); `None`
+    /// for serial / internal-rayon paths. The leader populates it in
+    /// `begin_agg_scan`'s parallel branch from already-loaded metadata +
+    /// segments + extracted quals; workers populate it in
+    /// `init_worker_deltax_agg` via re-SPI (V2 follow-up will share via
+    /// DSM).
+    #[allow(dead_code)] // Phase C.2.c scaffold; consumers added in C.2.d/e.
+    pub(crate) exec_ctx: Option<Box<AggExecContext>>,
 }
 
+
+/// Phase C.2.c — bundle of state the parallel-aware DeltaXAgg path passes from
+/// `begin_agg_scan` (which loads metadata + segments + extracts quals) to
+/// `exec_agg_scan` (which claims segments via the DSM cursor, aggregates,
+/// merges, finalises). In the serial / internal-rayon path this is unused —
+/// the locals stay inside `begin_agg_scan` because the whole aggregation runs
+/// there.
+///
+/// The eligibility predicate in `add_agg_path` (C.2.f) excludes COUNT(DISTINCT),
+/// HAVING, Top-N pushdown, LIMIT, regex GROUP BY, and non-numeric paths, so
+/// this struct only tracks state the compact path actually uses.
+#[allow(dead_code)] // wired by C.2.d / C.2.e
+pub(crate) struct AggExecContext {
+    pub(super) meta: super::segments::MetadataInfo,
+    /// Segments loaded by the leader once. V1 workers re-load via SPI per
+    /// PARALLEL_AGG.md; V2 follow-up will share the leader's list via DSM.
+    pub(super) all_segments: Vec<SegmentData>,
+    pub(super) agg_specs: Vec<AggExecSpec>,
+    pub(super) group_specs: Vec<GroupByColSpec>,
+    pub(super) output_map: Vec<OutputEntry>,
+    pub(super) needed_cols: Vec<bool>,
+    pub(super) batch_quals: Vec<BatchQual>,
+    pub(super) seg_filters: Vec<(usize, String)>,
+    pub(super) time_min: Option<i64>,
+    pub(super) time_max: Option<i64>,
+    pub(super) topn_spec: Option<(usize, usize, bool)>,
+    pub(super) num_result_cols: usize,
+    /// True after the leader has merged worker partials into `result_rows`.
+    /// Reset by `rescan_agg_scan`.
+    pub(super) merged: bool,
+    /// True after a worker has serialised its partial into the slab.
+    /// Reset by `rescan_agg_scan`. Unused on the leader.
+    pub(super) worker_done: bool,
+    /// Phase C.2 activation: when true, this CustomScan emits per-group
+    /// partial-aggregate transition states (via `compact_emit_partial`) for
+    /// a Final Aggregate above to combine. Default false for the existing
+    /// complete-aggregate path.
+    #[allow(dead_code)] // wired by C.2 activation
+    pub(super) is_partial: bool,
+}
+
+// ============================================================================
+// Parallel-aware DSM scaffolding (Phase B of the parallel-DeltaXAgg plan).
+//
+// The full design lives in `dev/docs/JSON_EXTRACT.md` follow-up section /
+// the matching plan file. Phase B lays only the type + hook surface so a
+// future commit can flip `parallel_workers > 0` without further
+// CustomExecMethods churn. With `parallel_workers = 0` (current state in
+// `path.rs::add_agg_path`) PG never invokes these callbacks, so the stubs
+// stay dormant until Phase C wires real worker work in.
+//
+// `DeltaXAggPState` mirrors `DeltaXAppendPState` (`scan/exec/decompress.rs`)
+// — same `next_segment` cursor + per-worker timing slots. Phase C will
+// extend with `partial_offsets` / `partial_caps` / `partial_lens` describing
+// each worker's reserved slab in the DSM partial-state region.
+// ============================================================================
+
+/// Max combined leader+worker slots we track per scan. Matches
+/// `super::decompress::MAX_WORKER_SLOTS`; both must agree because Phase C
+/// shares the same per-process slot computation helper.
+#[allow(dead_code)] // Phase B scaffolding; activated in Phase C.
+pub(crate) const MAX_AGG_WORKER_SLOTS: usize =
+    super::decompress::MAX_WORKER_SLOTS;
+
+/// Per-worker timing counters in the DSM region. Phase C populates this
+/// during `shutdown_deltax_agg`; the leader aggregates for EXPLAIN. Default
+/// (zeros) is a valid "this slot was never populated" signal.
+#[allow(dead_code)] // Phase B scaffolding; activated in Phase C.
+#[repr(C)]
+#[derive(Copy, Clone, Default)]
+pub(crate) struct AggTimingShmem {
+    pub(crate) populated: u32,
+    pub(crate) _pad: u32,
+    pub(crate) segments_decompressed: u64,
+    pub(crate) rows_in: u64,
+    pub(crate) rows_filtered_qual: u64,
+    pub(crate) groups_emitted_local: u64,
+    pub(crate) hash_probe_us: u64,
+    pub(crate) accum_update_us: u64,
+    pub(crate) distinct_union_us: u64,
+    pub(crate) partial_serialize_us: u64,
+}
+
+/// Per-worker partial-result slab size in bytes. Conservative default —
+/// fits ~1M groups for typical accumulator widths. Phase F adds a GUC
+/// (`pg_deltax.parallel_agg_partial_state_mb`) and tuplestore spill on
+/// overflow. Today, overflow erroes out cleanly via `serialize_partial_into`.
+pub(crate) const PARTIAL_SLAB_SIZE_BYTES: usize = 32 * 1024 * 1024;
+
+/// Shared DSM state for parallel `DeltaXAgg`. POD; zero-initialised state is
+/// the empty "no segments claimed yet" condition. The full DSM region is
+/// `[DeltaXAggPState][slab 0 (leader)][slab 1 (worker 0)]…` — each slab is
+/// `PARTIAL_SLAB_SIZE_BYTES` long and at offset
+/// `size_of::<DeltaXAggPState>() + slot_idx * PARTIAL_SLAB_SIZE_BYTES`.
+///
+/// Synchronisation contract: workers serialise their `ParallelCompactResult`
+/// into their slab, write `partial_lens[k]` (the byte count actually written),
+/// then set `worker_timings[k].populated = 1` with `Release`. The leader
+/// spin-waits on `populated` reads with `Acquire`, then deserialises the
+/// first `partial_lens[k]` bytes of slot k's slab. Skipping the
+/// Release/Acquire pair on `populated` is undefined behaviour.
+#[allow(dead_code)] // Phase B scaffolding; partial_lens used in C.2.
+#[repr(C)]
+pub(crate) struct DeltaXAggPState {
+    /// Workers `fetch_add(1)` to claim the next segment index.
+    pub(crate) next_segment: AtomicU64,
+    /// Total segments the leader pre-loaded; set in `initialize_dsm_deltax_agg`.
+    pub(crate) total_segments: u64,
+    /// Number of timing slots populated (leader + nworkers).
+    pub(crate) n_worker_slots: u32,
+    /// Per-slab byte capacity; mirrors `PARTIAL_SLAB_SIZE_BYTES` so workers
+    /// don't have to reach into a const.
+    pub(crate) partial_slab_size: u32,
+    /// Bytes actually written into each slab by the corresponding process.
+    /// `partial_lens[k]` is set BEFORE `worker_timings[k].populated = 1`
+    /// (with Release ordering) so the leader's Acquire read on `populated`
+    /// makes the slab contents visible.
+    pub(crate) partial_lens: [AtomicU64; MAX_AGG_WORKER_SLOTS],
+    /// Per-process timing aggregation. Slot 0 = leader, 1..=N = workers.
+    pub(crate) worker_timings: [AggTimingShmem; MAX_AGG_WORKER_SLOTS],
+}
+
+impl DeltaXAggPState {
+    /// Pointer to slot `slot_idx`'s slab. Caller must ensure the DSM
+    /// region was sized for this slot count.
+    #[allow(dead_code)] // Phase C.2.
+    #[inline]
+    pub(crate) unsafe fn slab_ptr(&self, slot_idx: usize) -> *mut u8 {
+        unsafe {
+            let base = self as *const _ as *const u8;
+            base.add(std::mem::size_of::<DeltaXAggPState>())
+                .add(slot_idx * PARTIAL_SLAB_SIZE_BYTES) as *mut u8
+        }
+    }
+}
+
+/// EstimateDSMCustomScan: bytes for `DeltaXAggPState` + N+1 partial-state
+/// slabs (one per leader/worker). The slab count is fixed at the cap so
+/// re-sizing isn't needed if the planner picks a smaller worker count
+/// later — wasted DSM bytes in that case are bounded by
+/// `PARTIAL_SLAB_SIZE_BYTES * (MAX_AGG_WORKER_SLOTS - 1 - nworkers)`.
+#[pg_guard]
+pub(super) unsafe extern "C-unwind" fn estimate_dsm_deltax_agg(
+    _node: *mut pg_sys::CustomScanState,
+    pcxt: *mut pg_sys::ParallelContext,
+) -> pg_sys::Size {
+    unsafe {
+        let nworkers = (*pcxt).nworkers as usize;
+        let nslots = (nworkers + 1).min(MAX_AGG_WORKER_SLOTS);
+        (std::mem::size_of::<DeltaXAggPState>() + nslots * PARTIAL_SLAB_SIZE_BYTES)
+            as pg_sys::Size
+    }
+}
+
+/// InitializeDSMCustomScan: leader populates the shared region after its own
+/// `BeginCustomScan` has run. `coordinate` is a `DeltaXAggPState` carved out
+/// of PG's parallel-context DSM segment.
+///
+/// Phase C.1 wires the cursor + slot count. Phase C.2 will set
+/// `total_segments` from the leader's `segments_data` and slot the per-
+/// worker partial-result region offsets.
+#[pg_guard]
+pub(super) unsafe extern "C-unwind" fn initialize_dsm_deltax_agg(
+    node: *mut pg_sys::CustomScanState,
+    pcxt: *mut pg_sys::ParallelContext,
+    coordinate: *mut std::ffi::c_void,
+) {
+    unsafe {
+        let ps = coordinate as *mut DeltaXAggPState;
+        std::ptr::write_bytes(ps as *mut u8, 0, std::mem::size_of::<DeltaXAggPState>());
+
+        let nworkers = (*pcxt).nworkers as usize;
+        if nworkers + 1 > MAX_AGG_WORKER_SLOTS {
+            pgrx::error!(
+                "pg_deltax: parallel worker count {} exceeds MAX_AGG_WORKER_SLOTS {}",
+                nworkers,
+                MAX_AGG_WORKER_SLOTS - 1,
+            );
+        }
+
+        // `next_segment` is zero from `write_bytes`; AtomicU64 has the same
+        // memory representation as `u64` so that's a valid initial state.
+        (*ps).total_segments = 0;
+        (*ps).n_worker_slots = (nworkers + 1) as u32;
+        (*ps).partial_slab_size = PARTIAL_SLAB_SIZE_BYTES as u32;
+        // `partial_lens` is zero-initialised by `write_bytes`; AtomicU64
+        // shares layout with u64.
+
+        let state_ptr = (*node).custom_ps as *mut AggScanState;
+        if !state_ptr.is_null() {
+            (*state_ptr).pscan = ps;
+            // Phase C.2.c: leader's `begin_agg_scan` parallel branch already
+            // populated `exec_ctx.all_segments`; publish the segment count
+            // to the cursor range so workers' `next_segment.fetch_add` knows
+            // when to stop. If exec_ctx is None (planner chose
+            // parallel_aware but begin's parallel branch didn't fire — a
+            // bug), workers will see total_segments == 0 and exit cleanly.
+            if let Some(ref ctx) = (*state_ptr).exec_ctx {
+                (*ps).total_segments = ctx.all_segments.len() as u64;
+            }
+        }
+    }
+}
+
+/// ReInitializeDSMCustomScan: reset the shared cursor and per-slot timing
+/// before a rescan. The leader is the only caller.
+#[pg_guard]
+pub(super) unsafe extern "C-unwind" fn reinit_dsm_deltax_agg(
+    _node: *mut pg_sys::CustomScanState,
+    _pcxt: *mut pg_sys::ParallelContext,
+    coordinate: *mut std::ffi::c_void,
+) {
+    unsafe {
+        let ps = coordinate as *mut DeltaXAggPState;
+        (*ps).next_segment.store(0, Ordering::Relaxed);
+        for slot in (*ps).worker_timings.iter_mut() {
+            *slot = AggTimingShmem::default();
+        }
+        for len in (*ps).partial_lens.iter_mut() {
+            len.store(0, Ordering::Relaxed);
+        }
+    }
+}
+
+/// InitializeWorkerCustomScan: worker attaches DSM, re-runs the leader's
+/// metadata + segment + qual prelude, and stashes the result on the
+/// worker-side `AggScanState.exec_ctx` so `exec_agg_scan`'s claim loop
+/// (Phase C.2.d) can drive segment fetches from the shared cursor.
+///
+/// V1 hydrates via SPI (per PARALLEL_AGG.md C.2.c "re-SPI for now"); V2
+/// follow-up will share leader-loaded segments via DSM (mirroring
+/// `append_wire`).
+///
+/// SPI is legal inside `InitializeWorkerCustomScan` because PG opens a
+/// transaction in each worker before calling our hooks.
+#[pg_guard]
+pub(super) unsafe extern "C-unwind" fn init_worker_deltax_agg(
+    node: *mut pg_sys::CustomScanState,
+    _toc: *mut pg_sys::shm_toc,
+    coordinate: *mut std::ffi::c_void,
+) {
+    unsafe {
+        // The worker's `begin_agg_scan` short-circuit installed a minimal
+        // stub state — replace it now with a deferred state populated by
+        // re-SPI'd metadata + segments. Mirror of decompress.rs's
+        // `init_worker_deltax_append`.
+        let cscan = (*node).ss.ps.plan as *mut pg_sys::CustomScan;
+        let custom_private = (*cscan).custom_private;
+        if custom_private.is_null() {
+            pgrx::error!("pg_deltax: parallel DeltaXAgg worker has no custom_private");
+        }
+        let plan = parse_agg_private(custom_private);
+        if plan.companion_oids.is_empty() {
+            pgrx::error!("pg_deltax: parallel DeltaXAgg worker has no companion tables");
+        }
+
+        // The leader extracted batch_quals from `where_quals`; reproduce on
+        // the worker and clear `ps.qual` if all quals are batch-handled, so
+        // PG doesn't re-evaluate them after `exec_agg_scan` returns. Mirrors
+        // decompress.rs's qual-clear pattern.
+        let plan_qual = (*(*node).ss.ps.plan).qual;
+
+        super::segments::reset_scan_buf_stats();
+        let ctx = build_agg_exec_context_from_plan(plan);
+
+        // If batch_quals fully cover the planner's qual list, clear it so
+        // PG's executor won't double-evaluate after exec emits virtual rows.
+        if !plan_qual.is_null()
+            && !ctx.batch_quals.is_empty()
+            && ctx.batch_quals.len() as i32 == (*plan_qual).length
+        {
+            (*node).ss.ps.qual = std::ptr::null_mut();
+        }
+
+        let mut state = build_deferred_agg_state(ctx, /* is_worker */ true);
+        state.pscan = coordinate as *mut DeltaXAggPState;
+
+        let state_ptr = Box::into_raw(Box::new(state));
+        (*node).custom_ps = state_ptr as *mut pg_sys::List;
+    }
+}
+
+/// ShutdownCustomScan: each process records its worker-slot timing into
+/// `worker_timings[slot]` while DSM is still attached, so the leader can
+/// aggregate per-process numbers for EXPLAIN.
+///
+/// Phase C.1 just stamps `populated = 1` so the leader sees that this slot
+/// participated. Phase C.2 will serialise the process's local
+/// `ParallelCompactResult` into the slot's slab and copy timing.
+#[pg_guard]
+pub(super) unsafe extern "C-unwind" fn shutdown_deltax_agg(
+    node: *mut pg_sys::CustomScanState,
+) {
+    unsafe {
+        let state_ptr = (*node).custom_ps as *mut AggScanState;
+        if state_ptr.is_null() {
+            return;
+        }
+        let state = &mut *state_ptr;
+        if state.pscan.is_null() {
+            return;
+        }
+        let slot_idx = current_agg_worker_slot();
+        let ps = &mut *state.pscan;
+        if slot_idx >= ps.n_worker_slots as usize {
+            return;
+        }
+        let slot = &mut ps.worker_timings[slot_idx];
+        slot.populated = 1;
+    }
+}
+
+/// Returns the DSM slot index for the current process. Slot 0 is the
+/// leader; worker N (0-indexed in PG) gets slot N+1.
+#[allow(dead_code)] // Phase C.1; widely used in C.2.
+unsafe fn current_agg_worker_slot() -> usize {
+    unsafe {
+        let n = pg_sys::ParallelWorkerNumber;
+        if n < 0 {
+            0
+        } else {
+            ((n as usize) + 1).min(MAX_AGG_WORKER_SLOTS - 1)
+        }
+    }
+}
+
+/// Allocate a minimal `AggScanState` for parallel-worker processes that
+/// short-circuit past the leader's heavy SPI + heap-scan + accumulator
+/// construction. The worker won't emit rows (its `exec_agg_scan` returns
+/// EOF immediately); Phase C.2 will replace this with an actual segment-
+/// claim + partial-aggregate loop driving real `ParallelCompactResult`
+/// state on the worker.
+#[allow(dead_code)] // Phase C.1; activated by `begin_agg_scan` short-circuit.
+fn build_minimal_worker_state() -> AggScanState {
+    AggScanState {
+        _agg_specs: Vec::new(),
+        _group_specs: Vec::new(),
+        result_rows: Vec::new(),
+        result_idx: 0,
+        _num_result_cols: 0,
+        metadata_us: 0,
+        heap_scan_us: 0,
+        detoast_us: 0,
+        decompress_us: 0,
+        agg_us: 0,
+        total_segments: 0,
+        total_rows_processed: 0,
+        batch_quals_count: 0,
+        where_quals_null: true,
+        segments_metadata_resolved: 0,
+        segments_decompressed: 0,
+        regex_cache_size: 0,
+        regex_cache_calls: 0,
+        topn_limit: 0,
+        topn_sort_col: -1,
+        topn_ascending: true,
+        pre_topn_groups: 0,
+        merge_us: 0,
+        finalize_us: 0,
+        topn_select_us: 0,
+        n_workers: 0,
+        bare_limit: 0,
+        wall_us: 0,
+        buf_stats: super::segments::ScanBufferStats::default(),
+        f8_preselected: 0,
+        pscan: std::ptr::null_mut(),
+        is_parallel_worker: true,
+        exec_ctx: None,
+    }
+}
+
+/// Build an `AggExecContext` for the parallel-aware path. Used by both the
+/// leader (in `begin_agg_scan`'s parallel branch) and workers (in
+/// `init_worker_deltax_agg`). V1 workers re-SPI metadata + re-load segments;
+/// V2 follow-up will share the leader's hydration via DSM (mirroring
+/// `append_wire`).
+///
+/// SAFETY: Calls into `load_agg_metadata_from_plan` + `load_segments_heap`
+/// which use SPI; caller must be inside a PG transaction (which is true for
+/// any `BeginCustomScan` / `InitializeWorkerCustomScan` callback).
+#[allow(dead_code)] // wired by C.2.d / C.2.e
+unsafe fn build_agg_exec_context_from_plan(plan: ParsedAggPlan) -> AggExecContext {
+    unsafe {
+        let (meta, _metadata_us) = load_agg_metadata_from_plan(&plan.companion_oids);
+
+        let ParsedAggPlan {
+            companion_oids,
+            agg_specs,
+            group_specs,
+            output_map,
+            having_filters: _,
+            where_quals,
+            topn_limit,
+            topn_sort_col,
+            topn_ascending,
+            derived_minmax_topn: _,
+            bare_limit: _,
+            is_partial,
+        } = plan;
+
+        let num_cols = meta.col_names.len();
+        let mut needed_cols = vec![false; num_cols];
+        for spec in &agg_specs {
+            if spec.col_idx >= 0 && (spec.col_idx as usize) < num_cols {
+                needed_cols[spec.col_idx as usize] = true;
+            }
+        }
+        for gs in &group_specs {
+            if gs.col_idx >= 0 && (gs.col_idx as usize) < num_cols {
+                needed_cols[gs.col_idx as usize] = true;
+            }
+        }
+
+        let (batch_quals, _handled) = extract_batch_quals(
+            where_quals,
+            &meta.col_names,
+            &meta.col_types,
+        );
+        for bq in &batch_quals {
+            if bq.col_idx < num_cols {
+                needed_cols[bq.col_idx] = true;
+            }
+        }
+
+        let (seg_filters, time_min, time_max) = extract_segment_filters(
+            where_quals,
+            &meta.col_names,
+            &meta.segment_by,
+            &meta.time_column,
+        );
+
+        let mut all_segments: Vec<SegmentData> = Vec::new();
+        for &oid in &companion_oids {
+            let (segs, _, _, _, _, _) = load_segments_heap(
+                oid,
+                &meta.col_names,
+                &meta.segment_by,
+                &needed_cols,
+                &meta.time_column,
+                /* load_minmax */ false,
+                &seg_filters,
+                time_min,
+                time_max,
+                /* lazy_cols */ None,
+                &batch_quals,
+                /* needed_stats_cols */ &[],
+                &meta.col_types,
+                /* needed_minmax_cols */ &[],
+                /* skip_text */ false,
+            );
+            all_segments.extend(segs);
+        }
+
+        // Speculative top-K is excluded from the parallel-aware path's
+        // eligibility predicate (Top-N pushdown is gated off in C.2.f), so
+        // `topn_spec` remains `None` here. Plumbed through for forward-
+        // compat once Top-N joins parallel.
+        let topn_spec = if topn_limit > 0 && !output_map.is_empty() {
+            match output_map[topn_sort_col] {
+                OutputEntry::Agg(ai) if agg_specs[ai].agg_type != AggType::Avg => {
+                    let k = (topn_limit as usize).max(1000);
+                    Some((ai, k, topn_ascending))
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        let num_result_cols = output_map.len();
+
+        AggExecContext {
+            meta,
+            all_segments,
+            agg_specs,
+            group_specs,
+            output_map,
+            needed_cols,
+            batch_quals,
+            seg_filters,
+            time_min,
+            time_max,
+            topn_spec,
+            num_result_cols,
+            merged: false,
+            worker_done: false,
+            is_partial,
+        }
+    }
+}
+
+/// Construct a deferred-exec `AggScanState` for the parallel-aware path:
+/// empty `result_rows`, populated `exec_ctx`, all timers zero. Workers and
+/// the leader use this as their initial state — the actual claim+merge work
+/// runs in `exec_agg_scan`.
+#[allow(dead_code)] // wired by C.2.d / C.2.e
+fn build_deferred_agg_state(ctx: AggExecContext, is_worker: bool) -> AggScanState {
+    AggScanState {
+        _agg_specs: Vec::new(),
+        _group_specs: Vec::new(),
+        result_rows: Vec::new(),
+        result_idx: 0,
+        _num_result_cols: ctx.num_result_cols,
+        metadata_us: 0,
+        heap_scan_us: 0,
+        detoast_us: 0,
+        decompress_us: 0,
+        agg_us: 0,
+        total_segments: 0,
+        total_rows_processed: 0,
+        batch_quals_count: ctx.batch_quals.len(),
+        where_quals_null: ctx.batch_quals.is_empty() && ctx.seg_filters.is_empty(),
+        segments_metadata_resolved: 0,
+        segments_decompressed: 0,
+        regex_cache_size: 0,
+        regex_cache_calls: 0,
+        topn_limit: 0,
+        topn_sort_col: -1,
+        topn_ascending: true,
+        pre_topn_groups: 0,
+        merge_us: 0,
+        finalize_us: 0,
+        topn_select_us: 0,
+        n_workers: 0,
+        bare_limit: 0,
+        wall_us: 0,
+        buf_stats: super::segments::ScanBufferStats::default(),
+        f8_preselected: 0,
+        pscan: std::ptr::null_mut(),
+        is_parallel_worker: is_worker,
+        exec_ctx: Some(Box::new(ctx)),
+    }
+}
 
 /// Static CustomExecMethods struct for DeltaXAgg.
 pub(crate) static DELTAX_AGG_EXEC_METHODS: SyncStatic<pg_sys::CustomExecMethods> =
@@ -359,11 +1018,20 @@ pub(crate) static DELTAX_AGG_EXEC_METHODS: SyncStatic<pg_sys::CustomExecMethods>
         ReScanCustomScan: Some(rescan_agg_scan),
         MarkPosCustomScan: None,
         RestrPosCustomScan: None,
-        EstimateDSMCustomScan: None,
-        InitializeDSMCustomScan: None,
-        ReInitializeDSMCustomScan: None,
-        InitializeWorkerCustomScan: None,
-        ShutdownCustomScan: None,
+        // Phase C.1: hook bodies are functional scaffolding. Workers can
+        // attach to DSM and flag themselves as `is_parallel_worker = true`,
+        // but they don't yet claim segments — `begin_agg_scan` short-
+        // circuits into `build_minimal_worker_state` and `exec_agg_scan`
+        // returns EOF. Phase C.2 wires up the actual segment-claim and
+        // partial-aggregate work.
+        //
+        // `add_agg_path` still sets `parallel_workers = 0` until C.4, so
+        // these hooks remain unused under the default cost path.
+        EstimateDSMCustomScan: Some(estimate_dsm_deltax_agg),
+        InitializeDSMCustomScan: Some(initialize_dsm_deltax_agg),
+        ReInitializeDSMCustomScan: Some(reinit_dsm_deltax_agg),
+        InitializeWorkerCustomScan: Some(init_worker_deltax_agg),
+        ShutdownCustomScan: Some(shutdown_deltax_agg),
         ExplainCustomScan: Some(super::super::explain::explain_agg_scan),
     });
 
@@ -391,7 +1059,7 @@ pub(crate) unsafe extern "C-unwind" fn create_agg_scan_state(
 
 /// Output mapping entry: which internal data to put at this slot position.
 #[derive(Debug, Clone, Copy)]
-enum OutputEntry {
+pub(super) enum OutputEntry {
     Agg(usize),    // index into agg_specs
     Group(usize),  // index into group_specs
     Const(pg_sys::Datum, bool),  // constant value + is_null
@@ -405,17 +1073,31 @@ enum OutputEntry {
 /// The planner (hook.rs / path.rs) packs the aggregate plan into a flat integer
 /// list because PostgreSQL's custom scan API only allows passing a `List*` through
 /// `custom_private`. This struct is the Rust-side representation after parsing.
-struct ParsedAggPlan {
-    companion_oids: Vec<pg_sys::Oid>,
-    agg_specs: Vec<AggExecSpec>,
-    group_specs: Vec<GroupByColSpec>,
-    output_map: Vec<OutputEntry>,
-    having_filters: Vec<HavingFilter>,
-    where_quals: *mut pg_sys::List,
-    topn_limit: i64,
-    topn_sort_col: usize,
-    topn_ascending: bool,
-    bare_limit: i64,
+pub(super) struct ParsedAggPlan {
+    pub(super) companion_oids: Vec<pg_sys::Oid>,
+    pub(super) agg_specs: Vec<AggExecSpec>,
+    pub(super) group_specs: Vec<GroupByColSpec>,
+    pub(super) output_map: Vec<OutputEntry>,
+    pub(super) having_filters: Vec<HavingFilter>,
+    pub(super) where_quals: *mut pg_sys::List,
+    pub(super) topn_limit: i64,
+    pub(super) topn_sort_col: usize,
+    pub(super) topn_ascending: bool,
+    /// `Some((max_slot, min_slot))` when the sort key is a derived expression
+    /// `storage[max] - storage[min]` over two compact-storage slots — the
+    /// JSONBench-Q4 shape `ORDER BY EXTRACT(EPOCH FROM (MAX-MIN))*N`.
+    /// When set, `topn_sort_col` is the sentinel `usize::MAX` (the path layer
+    /// emits `TOPN_SORT_COL_DERIVED = -3`, which we map to `usize::MAX` here)
+    /// and the runtime uses `derived_minmax_topn` for sort-value computation.
+    pub(super) derived_minmax_topn: Option<(usize, usize)>,
+    pub(super) bare_limit: i64,
+    /// Phase C.2 activation: when true, this CustomScan is the partial-mode
+    /// node below a Gather + Final Aggregate. exec_agg_scan emits per-group
+    /// rows whose values match PG's `aggtranstype` (via `compact_emit_partial`)
+    /// instead of final-aggregate values. Default false → existing
+    /// complete-aggregate path.
+    #[allow(dead_code)] // wired by C.2 activation in path.rs
+    pub(super) is_partial: bool,
 }
 
 /// Deserialize a CaseWhenValue from a custom_private integer list.
@@ -502,6 +1184,26 @@ unsafe fn parse_agg_private(custom_private: *mut pg_sys::List) -> ParsedAggPlan 
                 }
                 _ => (AggExpr::Column, 0i64),
             };
+            // H.2: OutputTransform trailer — only present for Min/Max
+            // (keeps the wire format identical for Count/Sum/Avg/CountDistinct).
+            // tag(0=None,1=PgUsShift); when tag==1, followed by lo+hi i32s
+            // for the i64 delta.
+            let output_transform = if matches!(agg_type, AggType::Min | AggType::Max) && idx < list_len {
+                let tag = pg_sys::list_nth_int(custom_private, idx);
+                idx += 1;
+                match tag {
+                    1 => {
+                        let lo = pg_sys::list_nth_int(custom_private, idx) as u32 as u64;
+                        let hi = pg_sys::list_nth_int(custom_private, idx + 1) as u32 as u64;
+                        idx += 2;
+                        let delta = ((hi << 32) | lo) as i64;
+                        OutputTransform::PgUsShift { delta }
+                    }
+                    _ => OutputTransform::None,
+                }
+            } else {
+                OutputTransform::None
+            };
             let _ = result_oid; // parsed for offset, not stored
             agg_specs.push(AggExecSpec {
                 agg_type,
@@ -509,6 +1211,9 @@ unsafe fn parse_agg_private(custom_private: *mut pg_sys::List) -> ParsedAggPlan 
                 col_type_oid: pg_sys::Oid::from(col_type_oid),
                 expr_kind,
                 const_offset,
+                is_partial: false,
+                transtype_oid: pg_sys::InvalidOid,
+                output_transform,
             });
         }
     }
@@ -558,9 +1263,14 @@ unsafe fn parse_agg_private(custom_private: *mut pg_sys::List) -> ParsedAggPlan 
                 let unit_usecs = date_trunc_unit_to_usecs(&unit);
                 GroupByExpr::DateTrunc { unit, unit_usecs, func_oid }
             } else if expr_tag == 3 {
-                // Extract: func_oid, unit_len, unit_bytes...
+                // Extract: func_oid, divisor_hi, divisor_lo, unit_len, unit_bytes...
                 let func_oid = pg_sys::list_nth_int(custom_private, idx) as u32;
                 idx += 1;
+                let div_hi = pg_sys::list_nth_int(custom_private, idx) as i64;
+                idx += 1;
+                let div_lo = pg_sys::list_nth_int(custom_private, idx) as u32 as i64;
+                idx += 1;
+                let divisor = (div_hi << 32) | div_lo;
                 let unit_len = pg_sys::list_nth_int(custom_private, idx) as usize;
                 idx += 1;
                 let mut unit_bytes = Vec::with_capacity(unit_len);
@@ -569,7 +1279,7 @@ unsafe fn parse_agg_private(custom_private: *mut pg_sys::List) -> ParsedAggPlan 
                     idx += 1;
                 }
                 let unit = String::from_utf8_lossy(&unit_bytes).into_owned();
-                GroupByExpr::Extract { unit, func_oid }
+                GroupByExpr::Extract { unit, func_oid, divisor }
             } else if expr_tag == 4 {
                 // AddConst: offset_i32, op_oid
                 let offset = pg_sys::list_nth_int(custom_private, idx) as i64;
@@ -707,6 +1417,7 @@ unsafe fn parse_agg_private(custom_private: *mut pg_sys::List) -> ParsedAggPlan 
     let mut topn_sort_col: usize = 0;
     let mut topn_ascending: bool = true;
     let mut bare_limit: i64 = 0;
+    let mut derived_minmax_topn: Option<(usize, usize)> = None;
     if idx < list_len {
         let limit_val = pg_sys::list_nth_int(custom_private, idx);
         idx += 1;
@@ -715,7 +1426,18 @@ unsafe fn parse_agg_private(custom_private: *mut pg_sys::List) -> ParsedAggPlan 
             idx += 1;
             topn_ascending = pg_sys::list_nth_int(custom_private, idx) != 0;
             idx += 1;
-            if sort_col_raw < 0 {
+            // -1 = bare LIMIT (no sort); -3 = derived MIN/MAX-difference
+            // sort (Q4 shape) — two additional ints follow with the
+            // (max_agg_idx, min_agg_idx) pair.
+            if sort_col_raw == -3 {
+                let max_idx = pg_sys::list_nth_int(custom_private, idx) as usize;
+                idx += 1;
+                let min_idx = pg_sys::list_nth_int(custom_private, idx) as usize;
+                idx += 1;
+                topn_limit = limit_val as i64;
+                topn_sort_col = usize::MAX; // unused — see derived_minmax_topn
+                derived_minmax_topn = Some((max_idx, min_idx));
+            } else if sort_col_raw < 0 {
                 bare_limit = limit_val as i64; // bare LIMIT, no sort
             } else {
                 topn_limit = limit_val as i64;
@@ -723,6 +1445,16 @@ unsafe fn parse_agg_private(custom_private: *mut pg_sys::List) -> ParsedAggPlan 
             }
         }
     }
+    // Phase C.2 activation: trailing `is_partial` flag (1 byte). Older
+    // plans / test fixtures may end without it — default false in that
+    // case so existing paths stay compatible.
+    let is_partial = if idx < list_len {
+        let v = pg_sys::list_nth_int(custom_private, idx) != 0;
+        idx += 1;
+        v
+    } else {
+        false
+    };
     let _ = idx;
 
     ParsedAggPlan {
@@ -735,7 +1467,9 @@ unsafe fn parse_agg_private(custom_private: *mut pg_sys::List) -> ParsedAggPlan 
         topn_limit,
         topn_sort_col,
         topn_ascending,
+        derived_minmax_topn,
         bare_limit,
+        is_partial,
     }
     } // unsafe
 }
@@ -816,7 +1550,7 @@ fn try_catalog_shortcut(
         finalize_us: 0,
         topn_select_us: 0,
         n_workers: 0,
-        bare_limit: 0, wall_us: 0, buf_stats: super::segments::take_scan_buf_stats(), f8_preselected: 0,
+        bare_limit: 0, wall_us: 0, buf_stats: super::segments::take_scan_buf_stats(), f8_preselected: 0, pscan: std::ptr::null_mut(), is_parallel_worker: false, exec_ctx: None,
     })
 }
 
@@ -1105,7 +1839,7 @@ fn try_metadata_fast_path(
         finalize_us: 0,
         topn_select_us: 0,
         n_workers: 0,
-        bare_limit: 0, wall_us: 0, buf_stats: super::segments::take_scan_buf_stats(), f8_preselected: 0,
+        bare_limit: 0, wall_us: 0, buf_stats: super::segments::take_scan_buf_stats(), f8_preselected: 0, pscan: std::ptr::null_mut(), is_parallel_worker: false, exec_ctx: None,
     })
 }
 
@@ -1407,6 +2141,39 @@ unsafe fn accumulate_segment_decompressed(
     }
 }
 
+/// Load metadata via SPI for a `DeltaXAgg` plan. Returns the
+/// `MetadataInfo` plus elapsed micros for the `metadata_us` timer.
+///
+/// Phase-A extraction from `begin_agg_scan`. The same metadata structure
+/// (`col_names`, `col_types`, `col_typmods`, `segment_by`, `time_column`)
+/// is what Phase C's `init_worker_deltax_agg` will hydrate from
+/// `append_wire` instead of running SPI a second time per worker.
+unsafe fn load_agg_metadata_from_plan(
+    companion_oids: &[pg_sys::Oid],
+) -> (super::segments::MetadataInfo, u64) {
+    unsafe {
+        if companion_oids.is_empty() {
+            pgrx::error!("pg_deltax: load_agg_metadata_from_plan called with empty oids");
+        }
+        let first_name = {
+            let name_ptr = pg_sys::get_rel_name(companion_oids[0]);
+            if name_ptr.is_null() {
+                pgrx::error!(
+                    "pg_deltax: companion table not found for OID {}",
+                    u32::from(companion_oids[0])
+                );
+            }
+            std::ffi::CStr::from_ptr(name_ptr)
+                .to_string_lossy()
+                .into_owned()
+        };
+        let t0 = Instant::now();
+        let meta = Spi::connect(|client| load_metadata(client, &first_name));
+        let metadata_us = t0.elapsed().as_micros() as u64;
+        (meta, metadata_us)
+    }
+}
+
 /// BeginCustomScan callback for DeltaXAgg: decompress and aggregate.
 #[pg_guard]
 pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
@@ -1415,6 +2182,43 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
     _eflags: i32,
 ) {
     unsafe {
+        // Phase C.1: parallel-worker short-circuit. Each worker process runs
+        // its own `BeginCustomScan` (PG calls it per-process for parallel-
+        // aware paths). Workers must NOT duplicate the leader's SPI + heap
+        // scan + accumulator construction here — that runs in
+        // `init_worker_deltax_agg` once DSM is wired up, so the worker has
+        // the leader's segment-cursor handle to drive the claim loop.
+        if pg_sys::ParallelWorkerNumber >= 0 {
+            let state = build_minimal_worker_state();
+            let state_ptr = Box::into_raw(Box::new(state));
+            (*node).custom_ps = state_ptr as *mut pg_sys::List;
+            return;
+        }
+
+        // Phase C.2.c: parallel-aware leader branch. When the planner chose
+        // the parallel path (gated by `add_agg_path` + `recommend_agg_workers`
+        // in C.2.f), the leader hydrates an `AggExecContext` once and defers
+        // all per-segment work to `exec_agg_scan`, where it claims segments
+        // alongside workers via `pscan.next_segment.fetch_add`. The serial
+        // / internal-rayon path below stays unchanged for `parallel_aware ==
+        // false`.
+        if (*(*node).ss.ps.plan).parallel_aware {
+            let custom_private = (*node).custom_ps;
+            if custom_private.is_null() {
+                pgrx::error!("pg_deltax: missing custom_private in DeltaXAgg state");
+            }
+            let plan = parse_agg_private(custom_private);
+            if plan.companion_oids.is_empty() {
+                pgrx::error!("pg_deltax: DeltaXAgg has no companion tables");
+            }
+            super::segments::reset_scan_buf_stats();
+            let ctx = build_agg_exec_context_from_plan(plan);
+            let state = build_deferred_agg_state(ctx, /* is_worker */ false);
+            let state_ptr = Box::into_raw(Box::new(state));
+            (*node).custom_ps = state_ptr as *mut pg_sys::List;
+            return;
+        }
+
         let t_wall = Instant::now();
         // Reset per-phase buffer accumulator for this scan. `load_segments_heap`
         // writes to the thread-local; the AggScanState ctor reads it back out
@@ -1431,24 +2235,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
             pgrx::error!("pg_deltax: DeltaXAgg has no companion tables");
         }
 
-        // Get first companion table name for metadata
-        let first_name = {
-            let name_ptr = pg_sys::get_rel_name(plan.companion_oids[0]);
-            if name_ptr.is_null() {
-                pgrx::error!(
-                    "pg_deltax: companion table not found for OID {}",
-                    u32::from(plan.companion_oids[0])
-                );
-            }
-            std::ffi::CStr::from_ptr(name_ptr)
-                .to_string_lossy()
-                .into_owned()
-        };
-
-        // Load metadata via SPI
-        let t0 = Instant::now();
-        let meta = Spi::connect(|client| load_metadata(client, &first_name));
-        let metadata_us = t0.elapsed().as_micros() as u64;
+        let (meta, metadata_us) = load_agg_metadata_from_plan(&plan.companion_oids);
 
         // Fast path 1: answer from catalog metadata (no segment scan at all)
         {
@@ -1544,7 +2331,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
         let ParsedAggPlan {
             companion_oids, agg_specs, group_specs, output_map,
             having_filters, where_quals, topn_limit, topn_sort_col, topn_ascending,
-            bare_limit,
+            derived_minmax_topn, bare_limit, is_partial: _,
         } = plan;
 
         // Build needed_cols: only columns referenced by aggregates and group-by
@@ -1706,7 +2493,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
         let sidecar_only_cols: Vec<bool> = if sidecar_candidate.iter().any(|&s| s)
             && crate::get_parallel_workers() > 1
             && estimated_rows >= SIDECAR_MIN_ROWS
-            && can_parallel_mixed(&group_specs, &needed_cols, &meta.col_types, &batch_quals, &agg_specs)
+            && can_parallel_mixed(&group_specs, &needed_cols, &meta.col_types, &meta.col_not_null, &batch_quals, &agg_specs)
         {
             sidecar_candidate
         } else {
@@ -2306,6 +3093,14 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                             }
                                         }
                                     }
+                                    CompactAccKind::MinInt => {
+                                        let (w_val, w_has) = result.compact_storage.read_min_max_int(worker_idx_w, slot_idx);
+                                        if w_has { storage.update_min_int(global_idx, slot_idx, w_val); }
+                                    }
+                                    CompactAccKind::MaxInt => {
+                                        let (w_val, w_has) = result.compact_storage.read_min_max_int(worker_idx_w, slot_idx);
+                                        if w_has { storage.update_max_int(global_idx, slot_idx, w_val); }
+                                    }
                                     CompactAccKind::CountDistinctInt | CompactAccKind::CountDistinctStr => {
                                         // Handled by parallel pass above.
                                     }
@@ -2378,7 +3173,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                         finalize_us,
                         topn_select_us,
                         n_workers: n_workers as u64,
-                        bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64, buf_stats: super::segments::take_scan_buf_stats(), f8_preselected: 0,
+                        bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64, buf_stats: super::segments::take_scan_buf_stats(), f8_preselected: 0, pscan: std::ptr::null_mut(), is_parallel_worker: false, exec_ctx: None,
                     };
 
                     let state_box = Box::new(state);
@@ -2469,6 +3264,14 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                                 }
                                             }
                                         }
+                                        CompactAccKind::MinInt => {
+                                            let (w_val, w_has) = result.compact_storage.read_min_max_int(worker_idx, slot_idx);
+                                            if w_has { storage.update_min_int(global_idx, slot_idx, w_val); }
+                                        }
+                                        CompactAccKind::MaxInt => {
+                                            let (w_val, w_has) = result.compact_storage.read_min_max_int(worker_idx, slot_idx);
+                                            if w_has { storage.update_max_int(global_idx, slot_idx, w_val); }
+                                        }
                                         CompactAccKind::CountDistinctInt | CompactAccKind::CountDistinctStr => {
                                             spec_cd_sidecar.union_from(slot_idx, global_idx, &result.cd_sidecar, worker_idx);
                                         }
@@ -2478,11 +3281,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                         }
 
                         for e in &spec_cd_sidecar.entries {
-                            let count = if e.is_str {
-                                e.sets_str[global_idx as usize].len() as i64
-                            } else {
-                                e.sets_int[global_idx as usize].len() as i64
-                            };
+                            let count = e.count(global_idx);
                             *storage.count_mut(global_idx, e.spec_idx) = count;
                         }
 
@@ -2544,7 +3343,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                         finalize_us,
                         topn_select_us: spec_fail_us,
                         n_workers: n_workers as u64,
-                        bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64, buf_stats: super::segments::take_scan_buf_stats(), f8_preselected: 0,
+                        bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64, buf_stats: super::segments::take_scan_buf_stats(), f8_preselected: 0, pscan: std::ptr::null_mut(), is_parallel_worker: false, exec_ctx: None,
                     };
 
                     let state_box = Box::new(state);
@@ -2634,6 +3433,14 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                             }
                                         }
                                     }
+                                    CompactAccKind::MinInt => {
+                                        let (w_val, w_has) = result.compact_storage.read_min_max_int(worker_idx, slot_idx);
+                                        if w_has { storage.update_min_int(global_idx, slot_idx, w_val); }
+                                    }
+                                    CompactAccKind::MaxInt => {
+                                        let (w_val, w_has) = result.compact_storage.read_min_max_int(worker_idx, slot_idx);
+                                        if w_has { storage.update_max_int(global_idx, slot_idx, w_val); }
+                                    }
                                     CompactAccKind::CountDistinctInt | CompactAccKind::CountDistinctStr => {
                                         bare_cd_sidecar.union_from(slot_idx, global_idx, &result.cd_sidecar, worker_idx);
                                     }
@@ -2644,11 +3451,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
 
                     // Write CountDistinct counts for this group
                     for e in &bare_cd_sidecar.entries {
-                        let count = if e.is_str {
-                            e.sets_str[global_idx as usize].len() as i64
-                        } else {
-                            e.sets_int[global_idx as usize].len() as i64
-                        };
+                        let count = e.count(global_idx);
                         *storage.count_mut(global_idx, e.spec_idx) = count;
                     }
 
@@ -2712,7 +3515,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                     wall_us: t_wall.elapsed().as_micros() as u64,
                     buf_stats: super::segments::take_scan_buf_stats(),
                     // Compact (int-only) path doesn't wire F8 today.
-                    f8_preselected: 0,
+                    f8_preselected: 0, pscan: std::ptr::null_mut(), is_parallel_worker: false, exec_ctx: None,
                 };
 
                 let state_box = Box::new(state);
@@ -2819,6 +3622,14 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                                         storage.write_min_max_str(gidx, slot_idx, new_off, new_len);
                                                     }
                                                 }
+                                            }
+                                            CompactAccKind::MinInt => {
+                                                let (w_val, w_has) = worker.compact_storage.read_min_max_int(wgidx, slot_idx);
+                                                if w_has { storage.update_min_int(gidx, slot_idx, w_val); }
+                                            }
+                                            CompactAccKind::MaxInt => {
+                                                let (w_val, w_has) = worker.compact_storage.read_min_max_int(wgidx, slot_idx);
+                                                if w_has { storage.update_max_int(gidx, slot_idx, w_val); }
                                             }
                                             CompactAccKind::CountDistinctInt | CompactAccKind::CountDistinctStr => {
                                                 cd_sidecar.union_from(slot_idx, gidx, &worker.cd_sidecar, wgidx);
@@ -3033,7 +3844,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                     finalize_us,
                     topn_select_us: 0,
                     n_workers: n_workers as u64,
-                    bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64, buf_stats: super::segments::take_scan_buf_stats(), f8_preselected: 0,
+                    bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64, buf_stats: super::segments::take_scan_buf_stats(), f8_preselected: 0, pscan: std::ptr::null_mut(), is_parallel_worker: false, exec_ctx: None,
                 };
 
                 let state_box = Box::new(state);
@@ -3184,7 +3995,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                 finalize_us,
                 topn_select_us,
                 n_workers: n_workers as u64,
-                bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64, buf_stats: super::segments::take_scan_buf_stats(), f8_preselected: 0,
+                bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64, buf_stats: super::segments::take_scan_buf_stats(), f8_preselected: 0, pscan: std::ptr::null_mut(), is_parallel_worker: false, exec_ctx: None,
             };
 
             let state_box = Box::new(state);
@@ -3224,11 +4035,17 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
             && n_workers > 1
             && all_segments.len() > 1
             && all_regexp_compiled
-            && can_parallel_mixed(&group_specs, &needed_cols, &meta.col_types, &batch_quals, &agg_specs);
+            && can_parallel_mixed(&group_specs, &needed_cols, &meta.col_types, &meta.col_not_null, &batch_quals, &agg_specs);
 
         if can_parallel_mixed_flag {
             let t2 = Instant::now();
-            let topn_spec = if topn_limit > 0 && having_filters.is_empty() {
+            // For derived MIN/MAX-difference top-N, workers don't maintain a
+            // direct-sort heap — sort key is recovered at the leader from
+            // partial max/min, see the `derived_minmax_topn` branch below.
+            let topn_spec = if topn_limit > 0
+                && having_filters.is_empty()
+                && derived_minmax_topn.is_none()
+            {
                 let sort_slot = match output_map[topn_sort_col] {
                     OutputEntry::Agg(ai) => ai,
                     _ => unreachable!(),
@@ -3291,30 +4108,58 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                 });
                             }
                         }
+                        BatchCompareOp::InList => {
+                            if let Some(ref vals) = bq.in_list_text {
+                                text_qual_infos.push(TextQualInfo::InList {
+                                    col_idx: bq.col_idx,
+                                    values: vals.clone(),
+                                });
+                            }
+                        }
                         _ => {}
                     }
                 }
             }
             // Reorder: cheap filters first to maximize short-circuit benefit.
-            // EQ/NE are O(1) per row (simple comparison); LIKE requires substring
-            // search. Running cheap filters first reduces the row count for
-            // expensive LIKE checks.
+            // EQ/NE are O(1) per row; InList against a small list is also O(1)
+            // in the dict fast path; LIKE requires substring search.
             text_qual_infos.sort_by_key(|tqi| match tqi {
                 TextQualInfo::EqNe { .. } => 0,                // EQ/NE — cheapest
-                TextQualInfo::Like { negate: false, .. } => 1,  // positive LIKE
-                TextQualInfo::Like { negate: true, .. } => 2,   // NOT LIKE
+                TextQualInfo::InList { .. } => 1,              // dict-keyed IN
+                TextQualInfo::Like { negate: false, .. } => 2,  // positive LIKE
+                TextQualInfo::Like { negate: true, .. } => 3,   // NOT LIKE
             });
 
             // Pipeline detoast with parallel processing when enough segments.
-            // Use fewer batches than the compact path (4 vs n_workers*2) because
+            // Use fewer batches than the compact path (2 vs n_workers*2) because
             // the mixed path processes text columns which have high per-segment
             // cost. Fewer batches = fewer thread scope synchronization points.
-            let use_pipeline = use_lazy && all_segments.len() >= n_workers * 16;
+            //
+            // Gate on `!batch_quals.is_empty()`: pipeline overlap only pays off
+            // when workers spend non-trivial time per segment (filter eval, more
+            // complex aggregation) so the leader can usefully detoast the next
+            // batch in parallel. Unfiltered text-grouping queries
+            // (e.g. ClickBench Q18) have workers blast through segments
+            // faster than detoast can keep up — the per-iteration thread::scope
+            // synchronization is then pure overhead. Empirically on ClickBench:
+            // pipeline gives ~+0.8s on Q22-class (heavy filter), ~-2.3s on
+            // Q18-class (no filter). Net positive on filtered, net negative on
+            // unfiltered.
+            let use_pipeline = use_lazy
+                && all_segments.len() >= n_workers * 16
+                && !batch_quals.is_empty();
+            // Pipeline uses 2 batches: workers run on current batch while leader
+            // detoasts the next. Pre-detoast must cover the *entire* first batch
+            // before workers spawn, otherwise workers on un-detoasted segments
+            // see empty blobs → SegTextColumn::Lz4 returns None → group keys
+            // collapse to NULL and distinct group values are lost. Must match
+            // PIPELINE_N_BATCHES below.
+            const PIPELINE_N_BATCHES: usize = 2;
 
             if use_lazy {
                 let t_detoast = Instant::now();
                 if use_pipeline {
-                    let n_batches = (n_workers * 2).max(2).min(all_segments.len());
+                    let n_batches = PIPELINE_N_BATCHES.min(all_segments.len());
                     let batch_size = all_segments.len().div_ceil(n_batches);
                     let first_end = batch_size.min(all_segments.len());
                     for seg in &mut all_segments[..first_end] {
@@ -3360,6 +4205,15 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                 None
             };
 
+            // Phase D leader pre-pass: build per-spec dict-distinct remaps
+            // for every eligible CountDistinct(text) spec. Workers consult
+            // these through `ParallelMixedConfig::dict_distinct_remaps` to
+            // set bits in per-(spec, group) bitsets instead of hashing
+            // strings into HashSet<u128>. Specs not in the map fall back to
+            // the existing HashSet path. Sequential today — see
+            // `build_dict_distinct_remaps` for the cost/threshold logic.
+            let dict_distinct_remaps = build_dict_distinct_remaps(&all_segments, &agg_specs);
+
             let config = ParallelMixedConfig {
                 agg_specs: &agg_specs,
                 group_specs: &group_specs,
@@ -3377,11 +4231,12 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                 rust_regex_infos: &rust_regex_infos,
                 sidecar_only_cols: &sidecar_only_cols,
                 preselected_keys: preselected_keys.as_ref(),
+                dict_distinct_remaps: &dict_distinct_remaps,
             };
 
             let mut pipeline_detoast_us: u64 = 0;
             let partial_results: Vec<ParallelMixedResult> = if use_pipeline {
-                let n_batches = 2.min(all_segments.len());
+                let n_batches = PIPELINE_N_BATCHES.min(all_segments.len());
                 let batch_size = all_segments.len().div_ceil(n_batches);
                 let mut results: Vec<ParallelMixedResult> = Vec::new();
                 let mut batch_start = 0;
@@ -3396,9 +4251,13 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
 
                     std::thread::scope(|s| {
                         let chunk_size = current_batch.len().div_ceil(n_workers);
-                        let handles: Vec<_> = current_batch.chunks(chunk_size).map(|chunk| {
+                        let handles: Vec<_> = current_batch.chunks(chunk_size).enumerate().map(|(ci, chunk)| {
                             let cfg = &config;
-                            s.spawn(move || process_segments_mixed(chunk, cfg))
+                            // Phase D: chunk_offset is the seg_idx of chunk[0]
+                            // in the leader's all_segments view, used to index
+                            // dict_distinct_remaps.per_segment.
+                            let chunk_offset = batch_start + ci * chunk_size;
+                            s.spawn(move || process_segments_mixed(chunk, chunk_offset, cfg))
                         }).collect();
 
                         if batch_end < total_segs {
@@ -3420,9 +4279,10 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
             } else {
                 let chunk_size = all_segments.len().div_ceil(n_workers);
                 std::thread::scope(|s| {
-                    let handles: Vec<_> = all_segments.chunks(chunk_size).map(|chunk| {
+                    let handles: Vec<_> = all_segments.chunks(chunk_size).enumerate().map(|(ci, chunk)| {
                         let cfg = &config;
-                        s.spawn(move || process_segments_mixed(chunk, cfg))
+                        let chunk_offset = ci * chunk_size;
+                        s.spawn(move || process_segments_mixed(chunk, chunk_offset, cfg))
                     }).collect();
                     handles.into_iter().map(|h| h.join().unwrap()).collect()
                 })
@@ -3440,6 +4300,265 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
             }
             total_detoast_us += pipeline_detoast_us;
             let agg_us = scan_wall_us.saturating_sub(decompress_us + pipeline_detoast_us);
+
+            // ----------------------------------------------------------
+            // Derived MIN/MAX-difference top-N (JSONBench Q4 shape):
+            // sort by `storage[max_slot] - storage[min_slot]`. Workers
+            // have produced partial MAX/MIN per group; one pass over all
+            // (worker, hash) pairs combines partials into per-key
+            // global MAX/MIN, applies a top-K heap on `max - min`, and
+            // then merges *only the K winners'* full accumulators.
+            // Skips the full 1.35M-group merge + finalize that the
+            // direct-aggregate paths below would otherwise do.
+            // ----------------------------------------------------------
+            if let Some((max_slot, min_slot)) = derived_minmax_topn {
+                let t_merge = Instant::now();
+                let limit = topn_limit as usize;
+                let ascending = topn_ascending;
+
+                // Step 1: single pass to combine per-worker partial
+                // MAX/MIN into per-key global (max, min).
+                let mut per_key: hashbrown::HashMap<
+                    u128,
+                    (i64, i64, bool),
+                    BuildHasherDefault<ahash::AHasher>,
+                > = hashbrown::HashMap::with_capacity_and_hasher(
+                    partial_results
+                        .iter()
+                        .map(|r| r.compact_map.len())
+                        .max()
+                        .unwrap_or(0),
+                    Default::default(),
+                );
+                for result in &partial_results {
+                    for (&hash_key, &wgidx) in &result.compact_map {
+                        let (max_val, max_has) = result
+                            .compact_storage
+                            .read_min_max_int(wgidx, max_slot);
+                        let (min_val, min_has) = result
+                            .compact_storage
+                            .read_min_max_int(wgidx, min_slot);
+                        let entry = per_key
+                            .entry(hash_key)
+                            .or_insert((i64::MIN, i64::MAX, false));
+                        if max_has && (!entry.2 || max_val > entry.0) {
+                            entry.0 = max_val;
+                            entry.2 = true;
+                        }
+                        if min_has && (entry.1 == i64::MAX || min_val < entry.1) {
+                            entry.1 = min_val;
+                        }
+                    }
+                }
+
+                // Step 2: top-K heap on `max - min`. Use i128 to avoid
+                // overflow on far-apart times. Skip keys whose either
+                // accumulator never saw a value (max_has=false ⇒ NULL).
+                let mut heap: std::collections::BinaryHeap<
+                    Reverse<(i128, u128)>,
+                > = std::collections::BinaryHeap::with_capacity(limit + 1);
+                let mut asc_heap: std::collections::BinaryHeap<(i128, u128)> =
+                    std::collections::BinaryHeap::with_capacity(limit + 1);
+                let pre_topn_groups = per_key.len();
+                for (&hash_key, &(max_val, min_val, seen)) in &per_key {
+                    if !seen {
+                        continue;
+                    }
+                    let derived = (max_val as i128).saturating_sub(min_val as i128);
+                    if ascending {
+                        asc_heap.push((derived, hash_key));
+                        if asc_heap.len() > limit {
+                            asc_heap.pop();
+                        }
+                    } else {
+                        heap.push(Reverse((derived, hash_key)));
+                        if heap.len() > limit {
+                            heap.pop();
+                        }
+                    }
+                }
+                let winners: Vec<u128> = if ascending {
+                    asc_heap.into_iter().map(|(_, h)| h).collect()
+                } else {
+                    heap.into_iter().map(|Reverse((_, h))| h).collect()
+                };
+                let topn_select_us = t_merge.elapsed().as_micros() as u64;
+
+                // Step 3: full-merge accumulators for the K winners and
+                // finalize. This is the existing speculative-path winner
+                // merge — duplicated here rather than factored out to
+                // keep this commit narrowly scoped.
+                let t_fin = Instant::now();
+                let storage = compact_storage.as_mut().unwrap();
+                let mut result_rows = Vec::with_capacity(winners.len());
+                let mut spec_cd_sidecar = CountDistinctSideCar::new(&agg_specs);
+
+                for hash_key in winners {
+                    let global_idx = storage.alloc_group();
+                    spec_cd_sidecar.alloc_group();
+
+                    let mut key_source_worker: Option<usize> = None;
+                    for (wi, result) in partial_results.iter().enumerate() {
+                        if let Some(&worker_idx) = result.compact_map.get(&hash_key) {
+                            if key_source_worker.is_none() {
+                                key_source_worker = Some(wi);
+                            }
+                            for (slot_idx, _) in agg_specs.iter().enumerate() {
+                                let (_, kind) = storage.layout.slots[slot_idx];
+                                match kind {
+                                    CompactAccKind::Count => {
+                                        let wc = result.compact_storage.read_count(worker_idx, slot_idx);
+                                        *storage.count_mut(global_idx, slot_idx) += wc;
+                                    }
+                                    CompactAccKind::SumInt => {
+                                        let (ws, wc) = result.compact_storage.read_sum_int(worker_idx, slot_idx);
+                                        let (gs, gc) = storage.sum_int_mut(global_idx, slot_idx);
+                                        *gs += ws;
+                                        *gc += wc;
+                                    }
+                                    CompactAccKind::SumIntNarrow => {
+                                        let (ws, wc) = result.compact_storage.read_sum_int_narrow(worker_idx, slot_idx);
+                                        let (gs, gc) = storage.sum_int_narrow_mut(global_idx, slot_idx);
+                                        *gs += ws;
+                                        *gc += wc;
+                                    }
+                                    CompactAccKind::SumFloat => {
+                                        let (ws, wc) = result.compact_storage.read_sum_float(worker_idx, slot_idx);
+                                        let (gs, gc) = storage.sum_float_mut(global_idx, slot_idx);
+                                        *gs += ws;
+                                        *gc += wc;
+                                    }
+                                    CompactAccKind::MinStr | CompactAccKind::MaxStr => {
+                                        let (w_off, w_len) = result.compact_storage.read_min_max_str(worker_idx, slot_idx);
+                                        if w_off != u32::MAX {
+                                            let w_str = result.compact_storage.str_arena.get(w_off, w_len);
+                                            let (g_off, g_len) = storage.read_min_max_str(global_idx, slot_idx);
+                                            let should_update = if g_off == u32::MAX {
+                                                true
+                                            } else {
+                                                let g_str = storage.str_arena.get(g_off, g_len);
+                                                let cmp = collation_strcmp(w_str, g_str);
+                                                match kind {
+                                                    CompactAccKind::MinStr => cmp < 0,
+                                                    CompactAccKind::MaxStr => cmp > 0,
+                                                    _ => unreachable!(),
+                                                }
+                                            };
+                                            if should_update {
+                                                let w_str = result.compact_storage.str_arena.get(w_off, w_len);
+                                                let (new_off, new_len) = storage.str_arena.alloc(w_str);
+                                                storage.write_min_max_str(global_idx, slot_idx, new_off, new_len);
+                                            }
+                                        }
+                                    }
+                                    CompactAccKind::MinInt => {
+                                        let (w_val, w_has) = result.compact_storage.read_min_max_int(worker_idx, slot_idx);
+                                        if w_has { storage.update_min_int(global_idx, slot_idx, w_val); }
+                                    }
+                                    CompactAccKind::MaxInt => {
+                                        let (w_val, w_has) = result.compact_storage.read_min_max_int(worker_idx, slot_idx);
+                                        if w_has { storage.update_max_int(global_idx, slot_idx, w_val); }
+                                    }
+                                    CompactAccKind::CountDistinctInt | CompactAccKind::CountDistinctStr => {
+                                        spec_cd_sidecar.union_from(slot_idx, global_idx, &result.cd_sidecar, worker_idx);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    for e in &spec_cd_sidecar.entries {
+                        let count = e.count(global_idx);
+                        *storage.count_mut(global_idx, e.spec_idx) = count;
+                    }
+
+                    let mut agg_results: Vec<(pg_sys::Datum, bool)> = Vec::new();
+                    for (spec_idx, spec) in agg_specs.iter().enumerate() {
+                        agg_results.push(compact_finalize(storage, global_idx, spec_idx, spec));
+                    }
+
+                    let source_wi = key_source_worker.unwrap();
+                    let source_gidx = *partial_results[source_wi].compact_map.get(&hash_key).unwrap();
+                    let mixed_ks = &partial_results[source_wi].mixed_keys;
+
+                    let mut row: Vec<(pg_sys::Datum, bool)> = Vec::with_capacity(num_result_cols);
+                    for entry in &output_map {
+                        match entry {
+                            OutputEntry::Agg(ai) => row.push(agg_results[*ai]),
+                            OutputEntry::Group(gi) => {
+                                let kv = mixed_ks.get(source_gidx, *gi);
+                                match kv {
+                                    MixedKeyVal::Int(v) => {
+                                        if matches!(group_specs[*gi].expr, GroupByExpr::Extract { .. }) {
+                                            row.push((i128_to_numeric_datum(v as i128), false));
+                                        } else {
+                                            row.push((pg_sys::Datum::from(v as usize), false));
+                                        }
+                                    }
+                                    MixedKeyVal::Str(off, len) => {
+                                        let s = mixed_ks.arena.get(off, len);
+                                        let datum = string_to_datum(s, group_specs[*gi].type_oid);
+                                        row.push((datum, false));
+                                    }
+                                    MixedKeyVal::Null => {
+                                        row.push((pg_sys::Datum::from(0usize), true));
+                                    }
+                                }
+                            }
+                            OutputEntry::DerivedGroup { base_gi, delta } => {
+                                match mixed_ks.get(source_gidx, *base_gi) {
+                                    MixedKeyVal::Int(v) => row.push((pg_sys::Datum::from((v + delta) as usize), false)),
+                                    _ => row.push((pg_sys::Datum::from(0usize), true)),
+                                }
+                            }
+                            OutputEntry::Const(d, n) => row.push((*d, *n)),
+                        }
+                    }
+                    result_rows.push(row);
+                }
+                let finalize_us = t_fin.elapsed().as_micros() as u64;
+
+                let state = AggScanState {
+                    _agg_specs: agg_specs,
+                    _group_specs: group_specs,
+                    result_rows,
+                    result_idx: 0,
+                    _num_result_cols: num_result_cols,
+                    metadata_us,
+                    heap_scan_us,
+                    detoast_us: total_detoast_us,
+                    decompress_us,
+                    agg_us,
+                    total_segments,
+                    total_rows_processed,
+                    batch_quals_count: batch_quals.len(),
+                    where_quals_null: where_quals.is_null(),
+                    segments_metadata_resolved: 0,
+                    segments_decompressed: 0,
+                    regex_cache_size: 0,
+                    regex_cache_calls: 0,
+                    topn_limit: topn_limit as u64,
+                    topn_sort_col: -3, // derived sentinel — see explain.rs
+                    topn_ascending,
+                    pre_topn_groups: pre_topn_groups as u64,
+                    merge_us: 0,
+                    finalize_us,
+                    topn_select_us,
+                    n_workers: n_workers as u64,
+                    bare_limit: 0,
+                    wall_us: t_wall.elapsed().as_micros() as u64,
+                    buf_stats: super::segments::take_scan_buf_stats(),
+                    f8_preselected: 0,
+                    pscan: std::ptr::null_mut(),
+                    is_parallel_worker: false,
+                    exec_ctx: None,
+                };
+
+                let state_box = Box::new(state);
+                let state_ptr = Box::into_raw(state_box);
+                (*node).custom_ps = state_ptr as *mut pg_sys::List;
+                return;
+            }
 
             // ----------------------------------------------------------
             // Speculative top-N: merge-skip using pre-computed top-K
@@ -3587,6 +4706,14 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                                 }
                                             }
                                         }
+                                        CompactAccKind::MinInt => {
+                                            let (w_val, w_has) = result.compact_storage.read_min_max_int(worker_idx, slot_idx);
+                                            if w_has { storage.update_min_int(global_idx, slot_idx, w_val); }
+                                        }
+                                        CompactAccKind::MaxInt => {
+                                            let (w_val, w_has) = result.compact_storage.read_min_max_int(worker_idx, slot_idx);
+                                            if w_has { storage.update_max_int(global_idx, slot_idx, w_val); }
+                                        }
                                         CompactAccKind::CountDistinctInt | CompactAccKind::CountDistinctStr => {
                                             spec_cd_sidecar.union_from(slot_idx, global_idx, &result.cd_sidecar, worker_idx);
                                         }
@@ -3597,11 +4724,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
 
                         // Write CountDistinct counts for this group
                         for e in &spec_cd_sidecar.entries {
-                            let count = if e.is_str {
-                                e.sets_str[global_idx as usize].len() as i64
-                            } else {
-                                e.sets_int[global_idx as usize].len() as i64
-                            };
+                            let count = e.count(global_idx);
                             *storage.count_mut(global_idx, e.spec_idx) = count;
                         }
 
@@ -3683,7 +4806,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                         finalize_us,
                         topn_select_us,
                         n_workers: n_workers as u64,
-                        bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64, buf_stats: super::segments::take_scan_buf_stats(), f8_preselected: 0,
+                        bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64, buf_stats: super::segments::take_scan_buf_stats(), f8_preselected: 0, pscan: std::ptr::null_mut(), is_parallel_worker: false, exec_ctx: None,
                     };
 
                     let state_box = Box::new(state);
@@ -3767,6 +4890,14 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                                 }
                                             }
                                         }
+                                        CompactAccKind::MinInt => {
+                                            let (w_val, w_has) = result.compact_storage.read_min_max_int(worker_idx, slot_idx);
+                                            if w_has { storage.update_min_int(global_idx, slot_idx, w_val); }
+                                        }
+                                        CompactAccKind::MaxInt => {
+                                            let (w_val, w_has) = result.compact_storage.read_min_max_int(worker_idx, slot_idx);
+                                            if w_has { storage.update_max_int(global_idx, slot_idx, w_val); }
+                                        }
                                         CompactAccKind::CountDistinctInt | CompactAccKind::CountDistinctStr => {
                                             spec_cd_sidecar.union_from(slot_idx, global_idx, &result.cd_sidecar, worker_idx);
                                         }
@@ -3776,11 +4907,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                         }
 
                         for e in &spec_cd_sidecar.entries {
-                            let count = if e.is_str {
-                                e.sets_str[global_idx as usize].len() as i64
-                            } else {
-                                e.sets_int[global_idx as usize].len() as i64
-                            };
+                            let count = e.count(global_idx);
                             *storage.count_mut(global_idx, e.spec_idx) = count;
                         }
 
@@ -3860,7 +4987,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                         finalize_us,
                         topn_select_us,
                         n_workers: n_workers as u64,
-                        bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64, buf_stats: super::segments::take_scan_buf_stats(), f8_preselected: 0,
+                        bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64, buf_stats: super::segments::take_scan_buf_stats(), f8_preselected: 0, pscan: std::ptr::null_mut(), is_parallel_worker: false, exec_ctx: None,
                     };
 
                     let state_box = Box::new(state);
@@ -3968,6 +5095,14 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                             }
                                         }
                                     }
+                                    CompactAccKind::MinInt => {
+                                        let (w_val, w_has) = result.compact_storage.read_min_max_int(worker_gidx, slot_idx);
+                                        if w_has { final_storage.update_min_int(group_idx, slot_idx, w_val); }
+                                    }
+                                    CompactAccKind::MaxInt => {
+                                        let (w_val, w_has) = result.compact_storage.read_min_max_int(worker_gidx, slot_idx);
+                                        if w_has { final_storage.update_max_int(group_idx, slot_idx, w_val); }
+                                    }
                                     CompactAccKind::CountDistinctInt | CompactAccKind::CountDistinctStr => {
                                         final_cd_sidecar.union_from(slot_idx, group_idx, &result.cd_sidecar, worker_gidx);
                                     }
@@ -3982,11 +5117,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                     for i in 0..target_keys.len() {
                         let group_idx = i as u32;
                         for e in &final_cd_sidecar.entries {
-                            let count = if e.is_str {
-                                e.sets_str[group_idx as usize].len() as i64
-                            } else {
-                                e.sets_int[group_idx as usize].len() as i64
-                            };
+                            let count = e.count(group_idx);
                             *final_storage.count_mut(group_idx, e.spec_idx) = count;
                         }
                     }
@@ -4074,6 +5205,8 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                     buf_stats: super::segments::take_scan_buf_stats(),
                     f8_preselected: preselected_keys.as_ref()
                         .map(|s| s.len() as u64).unwrap_or(0),
+                    pscan: std::ptr::null_mut(),
+                    is_parallel_worker: false, exec_ctx: None,
                 };
 
                 let state_box = Box::new(state);
@@ -4195,6 +5328,14 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                                         storage.write_min_max_str(gidx, slot_idx, new_off, new_len);
                                                     }
                                                 }
+                                            }
+                                            CompactAccKind::MinInt => {
+                                                let (w_val, w_has) = worker.compact_storage.read_min_max_int(wgidx, slot_idx);
+                                                if w_has { storage.update_min_int(gidx, slot_idx, w_val); }
+                                            }
+                                            CompactAccKind::MaxInt => {
+                                                let (w_val, w_has) = worker.compact_storage.read_min_max_int(wgidx, slot_idx);
+                                                if w_has { storage.update_max_int(gidx, slot_idx, w_val); }
                                             }
                                             CompactAccKind::CountDistinctInt | CompactAccKind::CountDistinctStr => {
                                                 cd_sidecar.union_from(slot_idx, gidx, &worker.cd_sidecar, wgidx);
@@ -4434,7 +5575,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                     finalize_us,
                     topn_select_us: 0,
                     n_workers: n_workers as u64,
-                    bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64, buf_stats: super::segments::take_scan_buf_stats(), f8_preselected: 0,
+                    bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64, buf_stats: super::segments::take_scan_buf_stats(), f8_preselected: 0, pscan: std::ptr::null_mut(), is_parallel_worker: false, exec_ctx: None,
                 };
 
                 let state_box = Box::new(state);
@@ -4540,6 +5681,14 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                         storage.write_min_max_str(global_group_idx, slot_idx, new_off, new_len);
                                     }
                                 }
+                            }
+                            CompactAccKind::MinInt => {
+                                let (w_val, w_has) = result.compact_storage.read_min_max_int(worker_group_idx, slot_idx);
+                                if w_has { storage.update_min_int(global_group_idx, slot_idx, w_val); }
+                            }
+                            CompactAccKind::MaxInt => {
+                                let (w_val, w_has) = result.compact_storage.read_min_max_int(worker_group_idx, slot_idx);
+                                if w_has { storage.update_max_int(global_group_idx, slot_idx, w_val); }
                             }
                             CompactAccKind::CountDistinctInt | CompactAccKind::CountDistinctStr => {
                                 merged_cd_sidecar.union_from(slot_idx, global_group_idx, &result.cd_sidecar, worker_group_idx);
@@ -4731,7 +5880,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                 finalize_us,
                 topn_select_us,
                 n_workers: n_workers as u64,
-                bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64, buf_stats: super::segments::take_scan_buf_stats(), f8_preselected: 0,
+                bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64, buf_stats: super::segments::take_scan_buf_stats(), f8_preselected: 0, pscan: std::ptr::null_mut(), is_parallel_worker: false, exec_ctx: None,
             };
 
             let state_box = Box::new(state);
@@ -5150,7 +6299,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                 finalize_us: 0,
                 topn_select_us: 0,
                 n_workers: actual_workers as u64,
-                bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64, buf_stats: super::segments::take_scan_buf_stats(), f8_preselected: 0,
+                bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64, buf_stats: super::segments::take_scan_buf_stats(), f8_preselected: 0, pscan: std::ptr::null_mut(), is_parallel_worker: false, exec_ctx: None,
             };
 
             let state_box = Box::new(state);
@@ -5545,6 +6694,11 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                 && bq.text_const.is_some()
                                 && matches!(bq.op, BatchCompareOp::Eq | BatchCompareOp::Ne)
                         });
+                        let text_in_qual = batch_quals.iter().find(|bq| {
+                            bq.col_idx == col_idx
+                                && bq.in_list_text.is_some()
+                                && bq.op == BatchCompareOp::InList
+                        });
 
                         if let Some(bq) = like_qual {
                             let strat = bq.like_strategy.as_ref().unwrap();
@@ -5571,6 +6725,19 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                             } else {
                                 for (ps, es) in pre_selection.iter_mut().zip(eq_sel.iter()) {
                                     *ps = *ps && *es;
+                                }
+                            }
+                        } else if let Some(bq) = text_in_qual {
+                            let strs = bq.in_list_text.as_ref().unwrap();
+                            let (datums, in_sel) = decompress_text_blob_with_in_filter(
+                                blob, type_oid, typmod, strs, /* is_not_in */ false, None,
+                            );
+                            decompressed.push(datums);
+                            if pre_selection.is_empty() {
+                                pre_selection = in_sel;
+                            } else {
+                                for (ps, is_) in pre_selection.iter_mut().zip(in_sel.iter()) {
+                                    *ps = *ps && *is_;
                                 }
                             }
                         } else {
@@ -5790,9 +6957,8 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                 let pg_usec = col[row].0.value() as i64;
                                 pg_usec.div_euclid(*unit_usecs) * *unit_usecs
                             }
-                            GroupByExpr::Extract { unit, .. } => {
-                                let pg_usec = col[row].0.value() as i64;
-                                extract_field_from_usecs(pg_usec, unit)
+                            GroupByExpr::Extract { unit, divisor, .. } => {
+                                eval_extract(col[row].0.value() as i64, *divisor, unit)
                             }
                             GroupByExpr::AddConst { offset, .. } => {
                                 col[row].0.value() as i64 + offset
@@ -5916,6 +7082,20 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                         }
                                 }
                             }
+                            CompactAccKind::MinInt => {
+                                let col = &decompressed[spec.col_idx as usize];
+                                if !col.is_empty() && !col[row].1 {
+                                    let v = col[row].0.value() as i64;
+                                    storage.update_min_int(group_idx, spec_idx, v);
+                                }
+                            }
+                            CompactAccKind::MaxInt => {
+                                let col = &decompressed[spec.col_idx as usize];
+                                if !col.is_empty() && !col[row].1 {
+                                    let v = col[row].0.value() as i64;
+                                    storage.update_max_int(group_idx, spec_idx, v);
+                                }
+                            }
                             CompactAccKind::CountDistinctInt => {
                                 let col = &decompressed[spec.col_idx as usize];
                                 if !col.is_empty() && !col[row].1 {
@@ -6020,9 +7200,8 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                     let truncated = pg_usec.div_euclid(*unit_usecs) * *unit_usecs;
                                     key_ref.push(GroupKeyRef::Int(truncated));
                                 }
-                                GroupByExpr::Extract { unit, .. } => {
-                                    let pg_usec = col[row].0.value() as i64;
-                                    let extracted = extract_field_from_usecs(pg_usec, unit);
+                                GroupByExpr::Extract { unit, divisor, .. } => {
+                                    let extracted = eval_extract(col[row].0.value() as i64, *divisor, unit);
                                     key_ref.push(GroupKeyRef::Int(extracted));
                                 }
                                 GroupByExpr::AddConst { offset, .. } => {
@@ -6514,7 +7693,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
             finalize_us,
             topn_select_us,
             n_workers: 0,
-            bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64, buf_stats: super::segments::take_scan_buf_stats(), f8_preselected: 0,
+            bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64, buf_stats: super::segments::take_scan_buf_stats(), f8_preselected: 0, pscan: std::ptr::null_mut(), is_parallel_worker: false, exec_ctx: None,
         };
 
         let state_box = Box::new(state);
@@ -6525,21 +7704,21 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
 
 /// String arena: all group key strings packed into one Vec<u8>.
 /// One deallocation instead of 275K individual String deallocations.
-struct StringArena {
-    buf: Vec<u8>,
+pub(super) struct StringArena {
+    pub(super) buf: Vec<u8>,
 }
 
 impl StringArena {
     fn new() -> Self { Self { buf: Vec::new() } }
 
-    fn alloc(&mut self, s: &str) -> (u32, u32) {
+    pub(super) fn alloc(&mut self, s: &str) -> (u32, u32) {
         let off = self.buf.len() as u32;
         let len = s.len() as u32;
         self.buf.extend_from_slice(s.as_bytes());
         (off, len)
     }
 
-    fn get(&self, off: u32, len: u32) -> &str {
+    pub(super) fn get(&self, off: u32, len: u32) -> &str {
         std::str::from_utf8(&self.buf[off as usize..off as usize + len as usize]).unwrap_or("")
     }
 }
@@ -6824,6 +8003,72 @@ pub(super) unsafe extern "C-unwind" fn exec_agg_scan(
         let scan_slot = (*node).ss.ss_ScanTupleSlot;
         let state = &mut *((*node).custom_ps as *mut AggScanState);
 
+        // Phase C.2 activation: partial-mode runtime. Every process (leader
+        // and workers) claims segments via the shared DSM cursor, builds a
+        // process-local accumulator, finalises into per-group partial-state
+        // rows, and emits them. PG's Gather concatenates rows from N
+        // processes; the Final Aggregate above combines partials per group
+        // via aggcombinefn. No DSM-slab serialise / spin-wait / leader
+        // merge — each process is independent.
+        let is_partial_mode = state
+            .exec_ctx
+            .as_ref()
+            .map(|c| c.is_partial)
+            .unwrap_or(false);
+        if is_partial_mode {
+            let already_done = state
+                .exec_ctx
+                .as_ref()
+                .map(|c| c.merged)
+                .unwrap_or(true);
+            if !already_done {
+                run_partial_aggregate_in_process(state);
+            }
+            if state.result_idx < state.result_rows.len() {
+                pg_sys::ExecClearTuple(scan_slot);
+                let row = &state.result_rows[state.result_idx];
+                for (i, &(datum, is_null)) in row.iter().enumerate() {
+                    (*scan_slot).tts_values.add(i).write(datum);
+                    (*scan_slot).tts_isnull.add(i).write(is_null);
+                }
+                pg_sys::ExecStoreVirtualTuple(scan_slot);
+                state.result_idx += 1;
+                return scan_slot;
+            }
+            pg_sys::ExecClearTuple(scan_slot);
+            return scan_slot;
+        }
+
+        // Phase C.2.d: parallel workers run the claim+aggregate+serialise
+        // loop on their first exec call. Subsequent calls return EOF — the
+        // leader picks up partial slabs in C.2.e via a spin-wait on
+        // `populated`. Workers emit no rows themselves.
+        if state.is_parallel_worker {
+            if state.exec_ctx.is_some() {
+                let already_done = state
+                    .exec_ctx
+                    .as_ref()
+                    .map(|c| c.worker_done)
+                    .unwrap_or(true);
+                if !already_done {
+                    run_worker_partial_aggregate(state);
+                }
+            }
+            pg_sys::ExecClearTuple(scan_slot);
+            return scan_slot;
+        }
+
+        // Phase C.2.e: leader's first call in the parallel-aware path.
+        // Claim segments alongside workers, spin-wait for worker partials,
+        // deserialise + merge them into the leader-local accumulator,
+        // finalise into `result_rows`. Subsequent calls fall through to the
+        // shared row-emit loop below.
+        if let Some(ctx) = state.exec_ctx.as_ref()
+            && !ctx.merged
+        {
+            run_leader_merge_and_finalise(state);
+        }
+
         if state.result_idx < state.result_rows.len() {
             pg_sys::ExecClearTuple(scan_slot);
             let row = &state.result_rows[state.result_idx];
@@ -6839,6 +8084,400 @@ pub(super) unsafe extern "C-unwind" fn exec_agg_scan(
         // EOF
         pg_sys::ExecClearTuple(scan_slot);
         scan_slot
+    }
+}
+
+/// Phase C.2.e: leader's first-call body. Run the same chunked-claim loop as
+/// workers (leader is slot 0), spin-wait for each worker slot's `populated`
+/// flag with `Acquire`, deserialise each populated slab, merge into the
+/// leader's global accumulator, finalise into `result_rows`, mark
+/// `ctx.merged = true`. Subsequent exec calls emit cached rows.
+unsafe fn run_leader_merge_and_finalise(state: &mut AggScanState) {
+    unsafe {
+        if state.pscan.is_null() {
+            return;
+        }
+        let total_segments;
+        let n_worker_slots;
+        {
+            let ps = &*state.pscan;
+            total_segments = ps.total_segments;
+            n_worker_slots = ps.n_worker_slots as usize;
+        }
+
+        let ctx = match state.exec_ctx.as_mut() {
+            Some(c) => c,
+            None => return,
+        };
+
+        // Leader-local accumulator. Leader is slot 0 so it claims segments
+        // alongside workers; that's fine — `next_segment.fetch_add` is
+        // shared.
+        let mut global = ParallelCompactResult::empty(&ctx.agg_specs);
+
+        if total_segments > 0 {
+            let cfg = ParallelCompactConfig {
+                agg_specs: &ctx.agg_specs,
+                group_specs: &ctx.group_specs,
+                col_names: &ctx.meta.col_names,
+                col_types: &ctx.meta.col_types,
+                segment_by: &ctx.meta.segment_by,
+                needed_cols: &ctx.needed_cols,
+                batch_quals: &ctx.batch_quals,
+                seg_filters: &ctx.seg_filters,
+                time_min: ctx.time_min,
+                time_max: ctx.time_max,
+                topn_spec: ctx.topn_spec,
+            };
+
+            const CHUNK: u64 = 4;
+            loop {
+                let start = (*state.pscan).next_segment.fetch_add(CHUNK, Ordering::Relaxed);
+                if start >= total_segments {
+                    break;
+                }
+                let end = (start + CHUNK).min(total_segments);
+                let slice = &ctx.all_segments[start as usize..end as usize];
+                let chunk_result = process_segments_compact(slice, &cfg);
+                merge_compact_results(
+                    &mut global.compact_map,
+                    &mut global.compact_storage,
+                    &mut global.cd_sidecar,
+                    &chunk_result.compact_map,
+                    &chunk_result.compact_storage,
+                    &chunk_result.cd_sidecar,
+                    &ctx.agg_specs,
+                );
+                global.segments_processed += chunk_result.segments_processed;
+                global.rows_processed += chunk_result.rows_processed;
+                global.decompress_us = global.decompress_us.max(chunk_result.decompress_us);
+            }
+        }
+
+        // Spin-wait for each worker slot to publish its partial. Slot 0 is
+        // the leader (us) so iterate 1..n_worker_slots. Spin-loop with a
+        // backoff to avoid burning a core when all workers are CPU-bound on
+        // their final merge.
+        for slot in 1..n_worker_slots {
+            let mut spin: u32 = 0;
+            loop {
+                let populated = (*state.pscan).worker_timings[slot]
+                    .populated;
+                // The populated field is a plain u32; emit an Acquire fence
+                // after observing 1 so the slab + partial_lens writes
+                // become visible. (worker_timings isn't itself atomic to
+                // keep the struct POD-zeroable.)
+                if populated == 1 {
+                    std::sync::atomic::fence(Ordering::Acquire);
+                    break;
+                }
+                spin = spin.saturating_add(1);
+                if spin < 1024 {
+                    std::hint::spin_loop();
+                } else {
+                    std::thread::yield_now();
+                    spin = 0;
+                }
+            }
+        }
+
+        // Deserialise each populated slab and merge into the leader's global.
+        for slot in 1..n_worker_slots {
+            let len = (*state.pscan).partial_lens[slot].load(Ordering::Acquire);
+            if len == 0 {
+                continue; // empty/unused slot
+            }
+            let slab_ptr = (*state.pscan).slab_ptr(slot);
+            match super::agg_wire::deserialize_partial(slab_ptr, len, &ctx.agg_specs) {
+                Ok(worker) => {
+                    merge_compact_results(
+                        &mut global.compact_map,
+                        &mut global.compact_storage,
+                        &mut global.cd_sidecar,
+                        &worker.compact_map,
+                        &worker.compact_storage,
+                        &worker.cd_sidecar,
+                        &ctx.agg_specs,
+                    );
+                    global.segments_processed += worker.segments_processed;
+                    global.rows_processed += worker.rows_processed;
+                    global.decompress_us = global.decompress_us.max(worker.decompress_us);
+                }
+                Err(e) => {
+                    pgrx::error!(
+                        "pg_deltax: failed to deserialise worker slot {} partial: {:?}",
+                        slot,
+                        e,
+                    );
+                }
+            }
+        }
+
+        // Finalise into result_rows. When ctx.is_partial, emit each agg
+        // slot's PG aggtranstype value (combined upstream by Final Agg);
+        // otherwise emit the user-visible final value.
+        let result_rows = finalise_compact_into_result_rows(
+            &global.compact_map,
+            &global.compact_storage,
+            &ctx.agg_specs,
+            &ctx.group_specs,
+            &ctx.output_map,
+            ctx.num_result_cols,
+            ctx.is_partial,
+        );
+
+        state.total_segments = global.segments_processed;
+        state.total_rows_processed = global.rows_processed;
+        state.decompress_us = global.decompress_us;
+        state.result_rows = result_rows;
+        state.result_idx = 0;
+        ctx.merged = true;
+    }
+}
+
+/// Iterate `global_map`'s groups and turn each one into an output row using
+/// `compact_finalize` per agg spec and `output_map` for column placement.
+/// Mirrors the post-merge emit loop in `begin_agg_scan`'s rayon path.
+///
+/// The parallel-aware path's eligibility (C.2.f) excludes HAVING, Top-N, and
+/// CountDistinct, so this is the simplest variant — no filter pass, no sort,
+/// no special-case finalisation.
+///
+/// When `is_partial = true` (Phase C.2 activation), each agg slot is emitted
+/// via `compact_emit_partial` (returning the PG `aggtranstype` value) instead
+/// of the user-visible final value — a Final Aggregate node above DeltaXAgg
+/// then combines the partials via `aggcombinefn`.
+unsafe fn finalise_compact_into_result_rows(
+    global_map: &CompactGroupMap,
+    global_storage: &CompactAccStorage,
+    agg_specs: &[AggExecSpec],
+    group_specs: &[GroupByColSpec],
+    output_map: &[OutputEntry],
+    num_result_cols: usize,
+    is_partial: bool,
+) -> Vec<Vec<(pg_sys::Datum, bool)>> {
+    unsafe {
+        let num_group_keys = group_specs.len();
+        let mut rows: Vec<Vec<(pg_sys::Datum, bool)>> = Vec::with_capacity(global_map.len());
+        for (&packed_key, &group_idx) in global_map {
+            let mut agg_results: Vec<(pg_sys::Datum, bool)> = Vec::with_capacity(agg_specs.len());
+            for (spec_idx, spec) in agg_specs.iter().enumerate() {
+                let val = if is_partial {
+                    compact_emit_partial(global_storage, group_idx, spec_idx, spec)
+                } else {
+                    compact_finalize(global_storage, group_idx, spec_idx, spec)
+                };
+                agg_results.push(val);
+            }
+            let keys = unpack_int_keys(packed_key, num_group_keys);
+            let mut row: Vec<(pg_sys::Datum, bool)> = Vec::with_capacity(num_result_cols);
+            for entry in output_map {
+                match entry {
+                    OutputEntry::Agg(ai) => row.push(agg_results[*ai]),
+                    OutputEntry::Group(gi) => {
+                        let v = keys[*gi];
+                        if matches!(group_specs[*gi].expr, GroupByExpr::Extract { .. }) {
+                            row.push((i128_to_numeric_datum(v as i128), false));
+                        } else {
+                            row.push((pg_sys::Datum::from(v as usize), false));
+                        }
+                    }
+                    OutputEntry::DerivedGroup { base_gi, delta } => {
+                        let v = keys[*base_gi] + delta;
+                        row.push((pg_sys::Datum::from(v as usize), false));
+                    }
+                    OutputEntry::Const(d, n) => row.push((*d, *n)),
+                }
+            }
+            rows.push(row);
+        }
+        rows
+    }
+}
+
+/// Phase C.2 activation — partial-mode in-process aggregation. Every
+/// process (leader and workers) calls this on its first `exec_agg_scan`
+/// invocation. Claims segments via the shared DSM cursor, accumulates into
+/// a process-local `ParallelCompactResult`, then finalises into
+/// `state.result_rows` using `compact_emit_partial` per slot. PG's Gather
+/// and the Final Aggregate above combine partials per group via the
+/// aggregate's `aggcombinefn`.
+///
+/// Differs from `run_worker_partial_aggregate` (complete-mode workers
+/// writing to DSM) and `run_leader_merge_and_finalise` (complete-mode
+/// leader merging worker DSM slabs) — neither is invoked in partial mode
+/// because there's no inter-process DSM merge step.
+unsafe fn run_partial_aggregate_in_process(state: &mut AggScanState) {
+    unsafe {
+        if state.pscan.is_null() {
+            return;
+        }
+        let total_segments = (*state.pscan).total_segments;
+
+        let ctx = match state.exec_ctx.as_mut() {
+            Some(c) => c,
+            None => return,
+        };
+
+        let mut local = ParallelCompactResult::empty(&ctx.agg_specs);
+
+        if total_segments > 0 {
+            let cfg = ParallelCompactConfig {
+                agg_specs: &ctx.agg_specs,
+                group_specs: &ctx.group_specs,
+                col_names: &ctx.meta.col_names,
+                col_types: &ctx.meta.col_types,
+                segment_by: &ctx.meta.segment_by,
+                needed_cols: &ctx.needed_cols,
+                batch_quals: &ctx.batch_quals,
+                seg_filters: &ctx.seg_filters,
+                time_min: ctx.time_min,
+                time_max: ctx.time_max,
+                topn_spec: None,
+            };
+            const CHUNK: u64 = 4;
+            loop {
+                let start = (*state.pscan).next_segment.fetch_add(CHUNK, Ordering::Relaxed);
+                if start >= total_segments {
+                    break;
+                }
+                let end = (start + CHUNK).min(total_segments);
+                let slice = &ctx.all_segments[start as usize..end as usize];
+                let chunk_result = process_segments_compact(slice, &cfg);
+                merge_compact_results(
+                    &mut local.compact_map,
+                    &mut local.compact_storage,
+                    &mut local.cd_sidecar,
+                    &chunk_result.compact_map,
+                    &chunk_result.compact_storage,
+                    &chunk_result.cd_sidecar,
+                    &ctx.agg_specs,
+                );
+                local.segments_processed += chunk_result.segments_processed;
+                local.rows_processed += chunk_result.rows_processed;
+                local.decompress_us = local.decompress_us.max(chunk_result.decompress_us);
+            }
+        }
+
+        // Finalise into per-group partial-state rows. is_partial=true →
+        // compact_emit_partial chooses the right `aggtranstype` value per
+        // slot; PG's Final Aggregate above combines via aggcombinefn.
+        let result_rows = finalise_compact_into_result_rows(
+            &local.compact_map,
+            &local.compact_storage,
+            &ctx.agg_specs,
+            &ctx.group_specs,
+            &ctx.output_map,
+            ctx.num_result_cols,
+            /* is_partial */ true,
+        );
+
+        state.total_segments = local.segments_processed;
+        state.total_rows_processed = local.rows_processed;
+        state.decompress_us = local.decompress_us;
+        state.result_rows = result_rows;
+        state.result_idx = 0;
+        ctx.merged = true;
+    }
+}
+
+/// Phase C.2.d: claim segments from the shared cursor, run
+/// `process_segments_compact` on each chunk, accumulate into a worker-local
+/// `ParallelCompactResult`, then serialise the result into the worker's DSM
+/// slab. The leader's `exec_agg_scan` first call (Phase C.2.e) reads back
+/// the slab via `agg_wire::deserialize_partial`.
+///
+/// Chunked claim (`CHUNK = 4`) amortises atomic cache-line bouncing across N
+/// workers; load imbalance is bounded by `CHUNK` segments. Empty-claim case
+/// (cursor already exhausted) is handled naturally — `serialize_partial_into`
+/// emits a header-only ~96-byte wire that the leader's deserialiser turns
+/// into an empty result with no merge effect.
+///
+/// Memory ordering: `partial_lens[slot]` is written with `Release` here;
+/// `shutdown_deltax_agg` later writes `worker_timings[slot].populated = 1`
+/// (also Release). The leader's `Acquire` load on `populated` synchronises
+/// with both writes in program order.
+unsafe fn run_worker_partial_aggregate(state: &mut AggScanState) {
+    unsafe {
+        const CHUNK: u64 = 4;
+
+        if state.pscan.is_null() {
+            return;
+        }
+        let ps = &*state.pscan;
+        let total_segments = ps.total_segments;
+        let slab_cap = ps.partial_slab_size;
+
+        let slot = current_agg_worker_slot();
+        if slot >= ps.n_worker_slots as usize {
+            return;
+        }
+        let slab_ptr = ps.slab_ptr(slot);
+
+        let ctx = match state.exec_ctx.as_mut() {
+            Some(c) => c,
+            None => return,
+        };
+
+        let mut local = ParallelCompactResult::empty(&ctx.agg_specs);
+
+        if total_segments > 0 {
+            let cfg = ParallelCompactConfig {
+                agg_specs: &ctx.agg_specs,
+                group_specs: &ctx.group_specs,
+                col_names: &ctx.meta.col_names,
+                col_types: &ctx.meta.col_types,
+                segment_by: &ctx.meta.segment_by,
+                needed_cols: &ctx.needed_cols,
+                batch_quals: &ctx.batch_quals,
+                seg_filters: &ctx.seg_filters,
+                time_min: ctx.time_min,
+                time_max: ctx.time_max,
+                topn_spec: ctx.topn_spec,
+            };
+
+            loop {
+                let start = ps.next_segment.fetch_add(CHUNK, Ordering::Relaxed);
+                if start >= total_segments {
+                    break;
+                }
+                let end = (start + CHUNK).min(total_segments);
+                let slice = &ctx.all_segments[start as usize..end as usize];
+                let chunk_result = process_segments_compact(slice, &cfg);
+
+                merge_compact_results(
+                    &mut local.compact_map,
+                    &mut local.compact_storage,
+                    &mut local.cd_sidecar,
+                    &chunk_result.compact_map,
+                    &chunk_result.compact_storage,
+                    &chunk_result.cd_sidecar,
+                    &ctx.agg_specs,
+                );
+                local.segments_processed += chunk_result.segments_processed;
+                local.rows_processed += chunk_result.rows_processed;
+                local.decompress_us = local.decompress_us.max(chunk_result.decompress_us);
+            }
+        }
+
+        match super::agg_wire::serialize_partial_into(slab_ptr, slab_cap, &local, &ctx.agg_specs) {
+            Ok(written) => {
+                // SAFETY: Release-store `partial_lens[slot]` after the slab
+                // bytes are written so the leader's Acquire-load on
+                // `populated` (in `shutdown_deltax_agg`) makes the slab
+                // contents visible.
+                (*state.pscan).partial_lens[slot].store(written as u64, Ordering::Release);
+                ctx.worker_done = true;
+            }
+            Err(super::agg_wire::SerError::Overflow { needed, have }) => {
+                pgrx::error!(
+                    "pg_deltax: parallel-agg partial slab overflow ({} bytes needed, {} available); \
+                     spill to per-worker tuplestore is Phase F",
+                    needed,
+                    have,
+                );
+            }
+        }
     }
 }
 
@@ -6880,6 +8519,11 @@ pub(super) unsafe extern "C-unwind" fn end_agg_scan(
 }
 
 /// ReScanCustomScan callback for DeltaXAgg.
+///
+/// For parallel-aware scans, also clears `result_rows` and `exec_ctx.merged`
+/// so the next exec re-runs the full claim+merge cycle. PG calls
+/// `reinit_dsm_deltax_agg` separately to zero the cursor + per-slot state in
+/// shared memory.
 #[pg_guard]
 pub(super) unsafe extern "C-unwind" fn rescan_agg_scan(
     node: *mut pg_sys::CustomScanState,
@@ -6887,6 +8531,11 @@ pub(super) unsafe extern "C-unwind" fn rescan_agg_scan(
     unsafe {
         let state = &mut *((*node).custom_ps as *mut AggScanState);
         state.result_idx = 0;
+        if let Some(ctx) = state.exec_ctx.as_mut() {
+            ctx.merged = false;
+            ctx.worker_done = false;
+            state.result_rows.clear();
+        }
     }
 }
 
@@ -6896,7 +8545,7 @@ pub(super) unsafe extern "C-unwind" fn rescan_agg_scan(
 
 /// Kind of accumulator slot in compact storage.
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum CompactAccKind {
+pub(super) enum CompactAccKind {
     Count,              // 8 bytes: i64
     SumInt,             // 24 bytes: i128 sum (16) + i64 count (8) — for INT8 columns
     SumIntNarrow,       // 16 bytes: i64 sum (8) + i64 count (8) — for INT2/INT4 columns
@@ -6905,9 +8554,29 @@ enum CompactAccKind {
     MaxStr,             // 8 bytes: u32 arena_offset + u32 length (sentinel: u32::MAX, 0)
     CountDistinctInt,   // 8 bytes: i64 count cache (real data in CountDistinctSideCar)
     CountDistinctStr,   // 8 bytes: i64 count cache (real data in CountDistinctSideCar)
+    MinInt,             // 16 bytes: i64 val + i64 has_value flag (0 = unset)
+    MaxInt,             // 16 bytes: i64 val + i64 has_value flag (0 = unset)
 }
 
 impl CompactAccKind {
+    /// 8-bit on-wire tag. Stable across versions because parallel-agg DSM wire
+    /// format depends on it.
+    #[allow(dead_code)] // wired by C.2.d/e via agg_wire
+    pub(super) fn wire_tag(self) -> u8 {
+        match self {
+            CompactAccKind::Count => 0,
+            CompactAccKind::SumInt => 1,
+            CompactAccKind::SumIntNarrow => 2,
+            CompactAccKind::SumFloat => 3,
+            CompactAccKind::MinStr => 4,
+            CompactAccKind::MaxStr => 5,
+            CompactAccKind::CountDistinctInt => 6,
+            CompactAccKind::CountDistinctStr => 7,
+            CompactAccKind::MinInt => 8,
+            CompactAccKind::MaxInt => 9,
+        }
+    }
+
     fn byte_size(self) -> usize {
         match self {
             CompactAccKind::Count
@@ -6917,6 +8586,7 @@ impl CompactAccKind {
             CompactAccKind::SumIntNarrow => 16,
             CompactAccKind::SumFloat => 16,
             CompactAccKind::MinStr | CompactAccKind::MaxStr => 8,
+            CompactAccKind::MinInt | CompactAccKind::MaxInt => 16,
         }
     }
 
@@ -6929,20 +8599,21 @@ impl CompactAccKind {
             CompactAccKind::SumIntNarrow => 8,
             CompactAccKind::SumFloat => 8,
             CompactAccKind::MinStr | CompactAccKind::MaxStr => 4,
+            CompactAccKind::MinInt | CompactAccKind::MaxInt => 8,
         }
     }
 }
 
 /// Layout of compact accumulator slots for one group.
-struct CompactAccLayout {
+pub(super) struct CompactAccLayout {
     /// (byte_offset, kind) per aggregate
-    slots: Vec<(usize, CompactAccKind)>,
+    pub(super) slots: Vec<(usize, CompactAccKind)>,
     /// Total bytes per group (aligned to 16)
-    group_stride: usize,
+    pub(super) group_stride: usize,
 }
 
 impl CompactAccLayout {
-    fn new(specs: &[AggExecSpec]) -> Self {
+    pub(super) fn new(specs: &[AggExecSpec]) -> Self {
         let mut offset: usize = 0;
 
         // Sort by alignment (descending) to minimize padding.
@@ -6991,16 +8662,26 @@ fn compact_acc_kind(spec: &AggExecSpec) -> CompactAccKind {
             let t = spec.col_type_oid;
             if t == pg_sys::TEXTOID || t == pg_sys::VARCHAROID || t == pg_sys::BPCHAROID {
                 CompactAccKind::MinStr
+            } else if t == pg_sys::INT2OID || t == pg_sys::INT4OID || t == pg_sys::INT8OID
+                || t == pg_sys::DATEOID
+                || t == pg_sys::TIMESTAMPOID || t == pg_sys::TIMESTAMPTZOID
+            {
+                CompactAccKind::MinInt
             } else {
-                unreachable!("compact_acc_kind: MIN on non-text not supported in compact path")
+                unreachable!("compact_acc_kind: MIN on type {:?} not supported in compact path", t)
             }
         }
         AggType::Max => {
             let t = spec.col_type_oid;
             if t == pg_sys::TEXTOID || t == pg_sys::VARCHAROID || t == pg_sys::BPCHAROID {
                 CompactAccKind::MaxStr
+            } else if t == pg_sys::INT2OID || t == pg_sys::INT4OID || t == pg_sys::INT8OID
+                || t == pg_sys::DATEOID
+                || t == pg_sys::TIMESTAMPOID || t == pg_sys::TIMESTAMPTZOID
+            {
+                CompactAccKind::MaxInt
             } else {
-                unreachable!("compact_acc_kind: MAX on non-text not supported in compact path")
+                unreachable!("compact_acc_kind: MAX on type {:?} not supported in compact path", t)
             }
         }
         AggType::CountDistinct => {
@@ -7014,46 +8695,429 @@ fn compact_acc_kind(spec: &AggExecSpec) -> CompactAccKind {
     }
 }
 
+/// Phase D bitset: a bare `Vec<u64>` with set/or/popcount. Used for
+/// COUNT(DISTINCT text) when the column is dictionary-encoded across every
+/// participating segment — workers set bits indexed by leader-precomputed
+/// global string IDs, the merge step OR's two bitsets, and finalisation
+/// returns `count_ones`. Avoids a `bitvec` dep — `count_ones` on `u64`
+/// lowers to POPCNT on x86_64 and CNT on aarch64.
+#[derive(Clone)]
+pub(super) struct Bitset {
+    words: Vec<u64>,
+    nbits: u32,
+}
+
+impl Bitset {
+    pub(super) fn with_size(nbits: u32) -> Self {
+        let nwords = nbits.div_ceil(64) as usize;
+        Bitset { words: vec![0u64; nwords], nbits }
+    }
+    #[inline]
+    pub(super) fn set(&mut self, idx: u32) {
+        debug_assert!(idx < self.nbits, "Bitset::set out of range");
+        let w = (idx >> 6) as usize;
+        let b = idx & 63;
+        self.words[w] |= 1u64 << b;
+    }
+    #[inline]
+    pub(super) fn or_with(&mut self, other: &Bitset) {
+        debug_assert_eq!(self.words.len(), other.words.len());
+        for (a, b) in self.words.iter_mut().zip(other.words.iter()) {
+            *a |= *b;
+        }
+    }
+    pub(super) fn count_ones(&self) -> u64 {
+        self.words.iter().map(|w| w.count_ones() as u64).sum()
+    }
+}
+
+/// Phase D dict-eligible CountDistinct(text) global remap. Built once at the
+/// leader after segments are loaded — see `build_dict_distinct_remaps`.
+///
+/// `per_segment[seg_idx][local_dict_id] = global_id`. `seg_idx` is the
+/// position in the leader's `all_segments` Vec; `local_dict_id` is the entry
+/// position in that segment's per-column dictionary; `global_id` is a unique
+/// integer in `[0, global_count)` shared across every segment. Workers set
+/// bit `global_id` in their per-(spec,group) `Bitset` instead of hashing the
+/// raw string.
+pub(super) struct DictDistinctRemap {
+    pub(super) global_count: u32,
+    pub(super) per_segment: Vec<Vec<u32>>,
+}
+
+/// Skip Phase D's bitset path when the per-column **post-dedup global
+/// string count** exceeds this. Bitset size is `global_count` bits per
+/// (spec, group, worker); at 10M × 16 groups × 16 workers ≈ 320 MB —
+/// tolerable on bench-class boxes (m6i.8xlarge has 128 GB) but starts
+/// mattering on small ones. Tighten if real workloads push past this.
+///
+/// Checked AFTER the parallel pre-pass — at that point we know the
+/// actual deduplicated count, not the looser per-segment-dict-size sum.
+pub(super) const PHASE_D_MAX_GLOBAL_FOR_BITSET: u32 = 10_000_000;
+
+/// Skip Phase D entirely when the **sum of per-segment dict sizes**
+/// exceeds this. Sum is a loose upper bound on global cardinality
+/// (post-dedup `global_count` ≤ sum). A high sum implies expensive
+/// pre-pass: LZ4-decompressing dicts, hashing entries, allocating
+/// per-thread String keys. JSONBench Q1's `x_did` (~10K entries per
+/// segment × 2700 segs ≈ 27M sum, ~3.6M unique post-dedup) sits in the
+/// sweet spot — well under this gate, comfortably under
+/// `PHASE_D_MAX_GLOBAL_FOR_BITSET` after dedup. UUID-style columns
+/// where every row is unique blow past the sum gate without the
+/// pre-pass even running.
+///
+/// Tuned 4× looser than the global cap to leave room for typical 4-10×
+/// dedup ratios while still bounding worst-case pre-pass memory.
+pub(super) const PHASE_D_MAX_DICT_SIZE_SUM: u64 = 50_000_000;
+
+/// Phase D leader pre-pass: walk each `CountDistinct(text)` spec's
+/// per-segment dictionary blob, build a global string-ID interner, and
+/// emit per-segment local→global remap tables. Returns one
+/// `DictDistinctRemap` per eligible spec (keyed by its index in
+/// `agg_specs`). Specs whose columns aren't dict-encoded across every
+/// segment, or whose global cardinality exceeds
+/// `PHASE_D_MAX_GLOBAL_FOR_BITSET`, are absent from the result and stay
+/// on the `HashSet<u128>` path.
+///
+/// Parallelised via `std::thread::scope`:
+///
+///   1. **Phase 1 (parallel)** — each worker takes a chunk of segments,
+///      parses every dict (LZ4-decompressing as needed), and builds two
+///      things: a per-thread `local_entries: Vec<String>` recording
+///      strings in insertion order, and `seg_local_remaps: Vec<Vec<u32>>`
+///      mapping `(seg_in_chunk, local_dict_id) → local_thread_id` (the
+///      string's index in `local_entries`).
+///   2. **Phase 2 (sequential)** — merge each thread's `local_entries`
+///      into the global interner. For each thread `t` we end up with
+///      `thread_to_global[t][local_thread_id] = global_id`. This is the
+///      only sequential bottleneck and is dominated by HashMap probes
+///      against the global interner; LZ4 decompression and per-string
+///      hashing already happened in parallel.
+///   3. **Phase 3 (parallel)** — each worker rewrites its
+///      `seg_local_remaps` into the final `per_segment[seg_idx][local_dict_id]
+///      = global_id` slabs by indexing into `thread_to_global[my_thread]`.
+///      Pure array lookup; runs in well under 100ms even on Q1-scale data.
+pub(super) fn build_dict_distinct_remaps(
+    all_segments: &[super::segments::SegmentData],
+    agg_specs: &[AggExecSpec],
+) -> std::collections::HashMap<usize, DictDistinctRemap> {
+    use crate::compression::{CompressedColumnRef, CompressionType, dictionary};
+
+    let mut remaps = std::collections::HashMap::new();
+    let n_workers = crate::get_parallel_workers().max(1);
+
+    for (spec_idx, spec) in agg_specs.iter().enumerate() {
+        if spec.agg_type != AggType::CountDistinct {
+            continue;
+        }
+        if !matches!(
+            spec.col_type_oid,
+            pg_sys::TEXTOID | pg_sys::VARCHAROID | pg_sys::BPCHAROID
+        ) {
+            continue;
+        }
+        if spec.col_idx < 0 {
+            continue;
+        }
+        let col_idx = spec.col_idx as usize;
+
+        // Eligibility: every segment whose blob is non-empty must be
+        // dict-encoded for this column AND the sum of per-segment dict
+        // sizes must fit under PHASE_D_MAX_GLOBAL_FOR_BITSET. The sum is
+        // an upper bound on global cardinality (after dedup it can only
+        // shrink) and lives in the first 4 bytes of `cc_ref.data` — no
+        // LZ4 decompression on bail. Segment-by columns store values in
+        // `segment_values` (outside `compressed_blobs`); for those the
+        // spec stays on the HashSet path even if every other segment is
+        // dict-encoded — too narrow to bother with a separate code path.
+        let mut eligible = true;
+        let mut dict_size_sum: u64 = 0;
+        for seg in all_segments {
+            if col_idx >= seg.compressed_blobs.len() {
+                eligible = false;
+                break;
+            }
+            let blob = &seg.compressed_blobs[col_idx];
+            if blob.is_empty() {
+                continue;
+            }
+            let comp = CompressionType::from_u8(blob[0]);
+            if !matches!(
+                comp,
+                CompressionType::Dictionary | CompressionType::DictionaryLz4
+            ) {
+                eligible = false;
+                break;
+            }
+            let cc_ref = CompressedColumnRef::from_bytes(blob);
+            if cc_ref.data.len() < 4 {
+                eligible = false;
+                break;
+            }
+            let dict_size =
+                u32::from_le_bytes(cc_ref.data[0..4].try_into().unwrap()) as u64;
+            dict_size_sum = dict_size_sum.saturating_add(dict_size);
+            if dict_size_sum > PHASE_D_MAX_DICT_SIZE_SUM {
+                eligible = false;
+                break;
+            }
+        }
+        if !eligible {
+            continue;
+        }
+
+        // ---------- Phase 1 (parallel): per-thread local interners ----------
+        struct LocalPrePass {
+            /// `local_entries[local_thread_id]` = entry string. Insertion
+            /// order — preserved so Phase 2's sequential merge is a clean
+            /// linear walk and `thread_to_global[t]` is indexable directly
+            /// by `local_thread_id`.
+            local_entries: Vec<String>,
+            /// `seg_local_remaps[seg_in_chunk][local_dict_id] = local_thread_id`.
+            seg_local_remaps: Vec<Vec<u32>>,
+        }
+
+        let chunk_size = all_segments.len().div_ceil(n_workers).max(1);
+        let local_results: Vec<LocalPrePass> = std::thread::scope(|s| {
+            all_segments
+                .chunks(chunk_size)
+                .map(|chunk| {
+                    s.spawn(move || {
+                        let mut lookup: hashbrown::HashMap<
+                            String,
+                            u32,
+                            BuildHasherDefault<ahash::AHasher>,
+                        > = hashbrown::HashMap::with_hasher(BuildHasherDefault::default());
+                        let mut local_entries: Vec<String> = Vec::new();
+                        let mut seg_local_remaps: Vec<Vec<u32>> =
+                            Vec::with_capacity(chunk.len());
+                        for seg in chunk {
+                            let blob = &seg.compressed_blobs[col_idx];
+                            if blob.is_empty() {
+                                seg_local_remaps.push(Vec::new());
+                                continue;
+                            }
+                            let cc_ref = CompressedColumnRef::from_bytes(blob);
+                            let norm_buf;
+                            let dict_data: &[u8] = if cc_ref.type_tag
+                                == CompressionType::DictionaryLz4
+                            {
+                                norm_buf = dictionary::normalize_lz4(cc_ref.data);
+                                &norm_buf[..]
+                            } else {
+                                cc_ref.data
+                            };
+                            let header = dictionary::parse_header(dict_data);
+                            let mut seg_remap: Vec<u32> =
+                                Vec::with_capacity(header.dict.len());
+                            for &entry in &header.dict {
+                                let local_id = match lookup.get(entry) {
+                                    Some(&id) => id,
+                                    None => {
+                                        let id = local_entries.len() as u32;
+                                        local_entries.push(entry.to_string());
+                                        lookup.insert(entry.to_string(), id);
+                                        id
+                                    }
+                                };
+                                seg_remap.push(local_id);
+                            }
+                            seg_local_remaps.push(seg_remap);
+                        }
+                        LocalPrePass { local_entries, seg_local_remaps }
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .collect()
+        });
+
+        // ---------- Phase 2 (sequential): merge into global interner -------
+        // `thread_to_global[t][local_thread_id] = global_id`.
+        let mut global_interner: hashbrown::HashMap<
+            String,
+            u32,
+            BuildHasherDefault<ahash::AHasher>,
+        > = hashbrown::HashMap::with_hasher(BuildHasherDefault::default());
+        let mut thread_to_global: Vec<Vec<u32>> =
+            Vec::with_capacity(local_results.len());
+        for local in &local_results {
+            let mut t_remap: Vec<u32> = Vec::with_capacity(local.local_entries.len());
+            for entry in &local.local_entries {
+                let global_id = match global_interner.get(entry) {
+                    Some(&id) => id,
+                    None => {
+                        let id = global_interner.len() as u32;
+                        global_interner.insert(entry.clone(), id);
+                        id
+                    }
+                };
+                t_remap.push(global_id);
+            }
+            thread_to_global.push(t_remap);
+        }
+
+        let global_count = global_interner.len() as u32;
+        if global_count == 0 {
+            continue;
+        }
+        if global_count > PHASE_D_MAX_GLOBAL_FOR_BITSET {
+            // Post-dedup the column has more unique strings than the
+            // bitset memory budget allows. Drop the pre-pass work and let
+            // workers fall back to HashSet<u128>. Pre-pass effort wasted
+            // for this query, but the sum gate above keeps the wasted
+            // work bounded; in practice this branch only fires on truly
+            // pathological cardinality (>10M unique).
+            continue;
+        }
+
+        // ---------- Phase 3 (parallel): rewrite local IDs to global IDs ----
+        // Each worker takes its slice of `local_results` + its slot in
+        // `thread_to_global`, rewrites `seg_local_remaps` in place. The
+        // resulting `Vec<Vec<u32>>` per chunk is concatenated below into
+        // `per_segment` in the original `all_segments` order — chunks were
+        // contiguous slices in Phase 1, so the order is preserved.
+        let global_chunks: Vec<Vec<Vec<u32>>> = std::thread::scope(|s| {
+            local_results
+                .into_iter()
+                .zip(thread_to_global.iter())
+                .map(|(mut local, t_remap)| {
+                    s.spawn(move || {
+                        for seg_remap in &mut local.seg_local_remaps {
+                            for slot in seg_remap.iter_mut() {
+                                *slot = t_remap[*slot as usize];
+                            }
+                        }
+                        local.seg_local_remaps
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .collect()
+        });
+
+        let mut per_segment: Vec<Vec<u32>> = Vec::with_capacity(all_segments.len());
+        for chunk in global_chunks {
+            per_segment.extend(chunk);
+        }
+        debug_assert_eq!(per_segment.len(), all_segments.len());
+
+        remaps.insert(
+            spec_idx,
+            DictDistinctRemap {
+                global_count,
+                per_segment,
+            },
+        );
+    }
+
+    remaps
+}
+
 /// Side-car storage for COUNT(DISTINCT) accumulators.
 /// Each CountDistinct agg spec gets a Vec of HashSets indexed by group_idx.
 /// Int columns store raw i64 values; text columns store 128-bit hash digests.
-struct CountDistinctSideCar {
-    /// (agg_spec_index, is_str, sets_int, sets_str) per CountDistinct spec.
-    /// Only one of sets_int/sets_str is populated based on is_str.
+/// Dict-eligible text columns (Phase D) use per-group `Bitset` indexed by
+/// leader-precomputed global string IDs.
+pub(super) struct CountDistinctSideCar {
     entries: Vec<CdEntry>,
+}
+
+#[derive(PartialEq, Eq, Clone, Copy)]
+pub(super) enum CdKind {
+    Int,
+    Str,
+    /// Dict-encoded text with leader pre-pass: per-group `Bitset` of size
+    /// `global_count` (the bitset_size below). Merge is bit-OR; finalise is
+    /// `count_ones`. Eligibility checked in `build_dict_distinct_remaps`.
+    DictBitset,
 }
 
 struct CdEntry {
     spec_idx: usize,
-    is_str: bool,
+    kind: CdKind,
+    /// `bitset_size` for `DictBitset`; otherwise unused.
+    bitset_size: u32,
     sets_int: Vec<hashbrown::HashSet<i64, BuildHasherDefault<ahash::AHasher>>>,
     sets_str: Vec<hashbrown::HashSet<u128, BuildHasherDefault<ahash::AHasher>>>,
+    bitsets: Vec<Bitset>,
+}
+
+impl CdEntry {
+    /// Count of distinct values seen for `group_idx`. The output of every
+    /// CountDistinct accumulator finalisation, regardless of representation.
+    #[inline]
+    fn count(&self, group_idx: u32) -> i64 {
+        let i = group_idx as usize;
+        match self.kind {
+            CdKind::Str => self.sets_str[i].len() as i64,
+            CdKind::Int => self.sets_int[i].len() as i64,
+            CdKind::DictBitset => self.bitsets[i].count_ones() as i64,
+        }
+    }
 }
 
 impl CountDistinctSideCar {
-    fn new(agg_specs: &[AggExecSpec]) -> Self {
+    /// Default constructor: every text CountDistinct uses the HashSet<u128>
+    /// path. Phase D's bitset path is opted in via `new_with_dict_remaps`,
+    /// which classifies eligible text specs as `DictBitset` instead.
+    pub(super) fn new(agg_specs: &[AggExecSpec]) -> Self {
+        Self::new_inner(agg_specs, &Default::default())
+    }
+
+    /// Phase D entry point. `dict_remap_sizes` maps spec_idx → bitset size
+    /// (the global string-ID count) for every CountDistinct(text) spec the
+    /// leader has confirmed is dict-encoded across all relevant segments.
+    /// Specs absent from the map keep the HashSet<u128> behaviour.
+    pub(super) fn new_with_dict_remaps(
+        agg_specs: &[AggExecSpec],
+        dict_remap_sizes: &std::collections::HashMap<usize, u32>,
+    ) -> Self {
+        Self::new_inner(agg_specs, dict_remap_sizes)
+    }
+
+    fn new_inner(
+        agg_specs: &[AggExecSpec],
+        dict_remap_sizes: &std::collections::HashMap<usize, u32>,
+    ) -> Self {
         let mut entries = Vec::new();
         for (i, spec) in agg_specs.iter().enumerate() {
             if spec.agg_type == AggType::CountDistinct {
                 let is_str = matches!(spec.col_type_oid,
                     pg_sys::TEXTOID | pg_sys::VARCHAROID | pg_sys::BPCHAROID);
+                let bitset_size = if is_str {
+                    dict_remap_sizes.get(&i).copied().unwrap_or(0)
+                } else { 0 };
+                let kind = if is_str && bitset_size > 0 {
+                    CdKind::DictBitset
+                } else if is_str {
+                    CdKind::Str
+                } else {
+                    CdKind::Int
+                };
                 entries.push(CdEntry {
                     spec_idx: i,
-                    is_str,
+                    kind,
+                    bitset_size,
                     sets_int: Vec::new(),
                     sets_str: Vec::new(),
+                    bitsets: Vec::new(),
                 });
             }
         }
         CountDistinctSideCar { entries }
     }
 
-    fn alloc_group(&mut self) {
+    pub(super) fn alloc_group(&mut self) {
         for e in &mut self.entries {
-            if e.is_str {
-                e.sets_str.push(hashbrown::HashSet::with_hasher(BuildHasherDefault::default()));
-            } else {
-                e.sets_int.push(hashbrown::HashSet::with_hasher(BuildHasherDefault::default()));
+            match e.kind {
+                CdKind::Str => e.sets_str.push(
+                    hashbrown::HashSet::with_hasher(BuildHasherDefault::default())),
+                CdKind::Int => e.sets_int.push(
+                    hashbrown::HashSet::with_hasher(BuildHasherDefault::default())),
+                CdKind::DictBitset => e.bitsets.push(Bitset::with_size(e.bitset_size)),
             }
         }
     }
@@ -7076,14 +9140,26 @@ impl CountDistinctSideCar {
         }
     }
 
+    /// Phase D: set the bit for `global_id` in the per-group bitset of the
+    /// (dict-eligible) CountDistinct(text) spec at `spec_idx`. `global_id`
+    /// must be `< bitset_size` (`< DictDistinctRemap::global_count`).
+    fn insert_dict_global(&mut self, spec_idx: usize, group_idx: u32, global_id: u32) {
+        for e in &mut self.entries {
+            if e.spec_idx == spec_idx {
+                e.bitsets[group_idx as usize].set(global_id);
+                return;
+            }
+        }
+    }
+
     #[allow(dead_code)]
     fn len(&self, spec_idx: usize, group_idx: u32) -> i64 {
         for e in &self.entries {
             if e.spec_idx == spec_idx {
-                return if e.is_str {
-                    e.sets_str[group_idx as usize].len() as i64
-                } else {
-                    e.sets_int[group_idx as usize].len() as i64
+                return match e.kind {
+                    CdKind::Str => e.sets_str[group_idx as usize].len() as i64,
+                    CdKind::Int => e.sets_int[group_idx as usize].len() as i64,
+                    CdKind::DictBitset => e.bitsets[group_idx as usize].count_ones() as i64,
                 };
             }
         }
@@ -7093,12 +9169,19 @@ impl CountDistinctSideCar {
     fn union_from(&mut self, spec_idx: usize, dst_group: u32, other: &Self, src_group: u32) {
         for (e, oe) in self.entries.iter_mut().zip(other.entries.iter()) {
             if e.spec_idx == spec_idx {
-                if e.is_str {
-                    let src = &oe.sets_str[src_group as usize];
-                    e.sets_str[dst_group as usize].extend(src.iter().copied());
-                } else {
-                    let src = &oe.sets_int[src_group as usize];
-                    e.sets_int[dst_group as usize].extend(src.iter().copied());
+                match e.kind {
+                    CdKind::Str => {
+                        let src = &oe.sets_str[src_group as usize];
+                        e.sets_str[dst_group as usize].extend(src.iter().copied());
+                    }
+                    CdKind::Int => {
+                        let src = &oe.sets_int[src_group as usize];
+                        e.sets_int[dst_group as usize].extend(src.iter().copied());
+                    }
+                    CdKind::DictBitset => {
+                        let src = &oe.bitsets[src_group as usize];
+                        e.bitsets[dst_group as usize].or_with(src);
+                    }
                 }
                 return;
             }
@@ -7109,10 +9192,10 @@ impl CountDistinctSideCar {
     fn write_counts_to_storage(&self, storage: &mut CompactAccStorage, map: &CompactGroupMap) {
         for e in &self.entries {
             for (_, &gidx) in map.iter() {
-                let count = if e.is_str {
-                    e.sets_str[gidx as usize].len() as i64
-                } else {
-                    e.sets_int[gidx as usize].len() as i64
+                let count = match e.kind {
+                    CdKind::Str => e.sets_str[gidx as usize].len() as i64,
+                    CdKind::Int => e.sets_int[gidx as usize].len() as i64,
+                    CdKind::DictBitset => e.bitsets[gidx as usize].count_ones() as i64,
                 };
                 unsafe { *storage.count_mut(gidx, e.spec_idx) = count; }
             }
@@ -7125,18 +9208,30 @@ impl CountDistinctSideCar {
 }
 
 /// Flat byte buffer holding compact accumulators for all groups.
-struct CompactAccStorage {
-    buf: Vec<u8>,
-    layout: CompactAccLayout,
-    str_arena: StringArena,
+pub(super) struct CompactAccStorage {
+    pub(super) buf: Vec<u8>,
+    pub(super) layout: CompactAccLayout,
+    pub(super) str_arena: StringArena,
 }
 
 impl CompactAccStorage {
-    fn new(layout: CompactAccLayout) -> Self {
+    pub(super) fn new(layout: CompactAccLayout) -> Self {
         CompactAccStorage {
             buf: Vec::new(),
             layout,
             str_arena: StringArena::new(),
+        }
+    }
+
+    /// Reconstruct from a layout + raw `buf` bytes + raw string arena bytes.
+    /// Used by parallel-agg DSM deserialise path; keeps byte interpretation
+    /// behind a single constructor so tests cover a stable contract.
+    #[allow(dead_code)] // wired by C.2.b's deserialiser
+    pub(super) fn from_parts(layout: CompactAccLayout, buf: Vec<u8>, str_arena_buf: Vec<u8>) -> Self {
+        CompactAccStorage {
+            buf,
+            layout,
+            str_arena: StringArena { buf: str_arena_buf },
         }
     }
 
@@ -7146,7 +9241,7 @@ impl CompactAccStorage {
     /// Growth strategy: below 1GB, let Vec double normally. Above 1GB,
     /// grow by 2GB increments to cap peak waste at ~2GB instead of 100%.
     #[inline]
-    fn alloc_group(&mut self) -> u32 {
+    pub(super) fn alloc_group(&mut self) -> u32 {
         let new_len = self.buf.len() + self.layout.group_stride;
         if new_len > self.buf.capacity() {
             const GB: usize = 1 << 30;
@@ -7171,7 +9266,7 @@ impl CompactAccStorage {
 
     /// Get a mutable i64 reference (for Count).
     #[inline]
-    unsafe fn count_mut(&mut self, group_idx: u32, slot: usize) -> &mut i64 {
+    pub(super) unsafe fn count_mut(&mut self, group_idx: u32, slot: usize) -> &mut i64 {
         unsafe {
             let (offset, _) = self.layout.slots[slot];
             let ptr = self.buf.as_mut_ptr()
@@ -7221,7 +9316,7 @@ impl CompactAccStorage {
 
     /// Read count value for finalization.
     #[inline]
-    unsafe fn read_count(&self, group_idx: u32, slot: usize) -> i64 {
+    pub(super) unsafe fn read_count(&self, group_idx: u32, slot: usize) -> i64 {
         unsafe {
             let (offset, _) = self.layout.slots[slot];
             let ptr = self.buf.as_ptr()
@@ -7271,7 +9366,7 @@ impl CompactAccStorage {
 
     /// Read MinStr/MaxStr: returns (arena_offset, length). Sentinel is (u32::MAX, 0) = no value.
     #[inline]
-    unsafe fn read_min_max_str(&self, group_idx: u32, slot: usize) -> (u32, u32) {
+    pub(super) unsafe fn read_min_max_str(&self, group_idx: u32, slot: usize) -> (u32, u32) {
         unsafe {
             let (offset, _) = self.layout.slots[slot];
             let base = self.buf.as_ptr()
@@ -7284,7 +9379,7 @@ impl CompactAccStorage {
 
     /// Write MinStr/MaxStr arena offset and length.
     #[inline]
-    unsafe fn write_min_max_str(&mut self, group_idx: u32, slot: usize, off: u32, len: u32) {
+    pub(super) unsafe fn write_min_max_str(&mut self, group_idx: u32, slot: usize, off: u32, len: u32) {
         unsafe {
             let (offset, _) = self.layout.slots[slot];
             let base = self.buf.as_mut_ptr()
@@ -7294,6 +9389,53 @@ impl CompactAccStorage {
         }
     }
 
+    /// Read MinInt/MaxInt: returns (value, has_value). `has_value=false` means
+    /// no value has been observed yet (zero-init from `alloc_group`).
+    #[inline]
+    pub(super) unsafe fn read_min_max_int(&self, group_idx: u32, slot: usize) -> (i64, bool) {
+        unsafe {
+            let (offset, _) = self.layout.slots[slot];
+            let base = self.buf.as_ptr()
+                .add(group_idx as usize * self.layout.group_stride + offset);
+            let val = *(base as *const i64);
+            let has = *(base.add(8) as *const i64);
+            (val, has != 0)
+        }
+    }
+
+    /// Write MinInt/MaxInt value + has_value flag.
+    #[inline]
+    pub(super) unsafe fn write_min_max_int(&mut self, group_idx: u32, slot: usize, val: i64, has: bool) {
+        unsafe {
+            let (offset, _) = self.layout.slots[slot];
+            let base = self.buf.as_mut_ptr()
+                .add(group_idx as usize * self.layout.group_stride + offset);
+            *(base as *mut i64) = val;
+            *(base.add(8) as *mut i64) = if has { 1 } else { 0 };
+        }
+    }
+
+    /// Update MinInt: replace stored value if `candidate < stored` or no value yet.
+    #[inline]
+    pub(super) unsafe fn update_min_int(&mut self, group_idx: u32, slot: usize, candidate: i64) {
+        unsafe {
+            let (val, has) = self.read_min_max_int(group_idx, slot);
+            if !has || candidate < val {
+                self.write_min_max_int(group_idx, slot, candidate, true);
+            }
+        }
+    }
+
+    /// Update MaxInt: replace stored value if `candidate > stored` or no value yet.
+    #[inline]
+    pub(super) unsafe fn update_max_int(&mut self, group_idx: u32, slot: usize, candidate: i64) {
+        unsafe {
+            let (val, has) = self.read_min_max_int(group_idx, slot);
+            if !has || candidate > val {
+                self.write_min_max_int(group_idx, slot, candidate, true);
+            }
+        }
+    }
 }
 
 /// Check if all aggregates can use the compact accumulator path.
@@ -7312,6 +9454,9 @@ fn can_use_compact_accs(agg_specs: &[AggExecSpec]) -> bool {
             AggType::Min | AggType::Max => {
                 let t = spec.col_type_oid;
                 t == pg_sys::TEXTOID || t == pg_sys::VARCHAROID || t == pg_sys::BPCHAROID
+                    || t == pg_sys::INT2OID || t == pg_sys::INT4OID || t == pg_sys::INT8OID
+                    || t == pg_sys::DATEOID
+                    || t == pg_sys::TIMESTAMPOID || t == pg_sys::TIMESTAMPTZOID
             }
             AggType::CountDistinct => {
                 let t = spec.col_type_oid;
@@ -7494,6 +9639,20 @@ unsafe fn compact_finalize(
                     (datum, false)
                 }
             }
+            CompactAccKind::MinInt | CompactAccKind::MaxInt => {
+                let (val, has) = storage.read_min_max_int(group_idx, slot);
+                if !has {
+                    (pg_sys::Datum::from(0usize), true) // NULL
+                } else {
+                    // H.2: monotonic post-shift for the timestamptz_pl_interval
+                    // recognizer. `OutputTransform::None` is the no-op identity.
+                    let out = match spec.output_transform {
+                        OutputTransform::None => val,
+                        OutputTransform::PgUsShift { delta } => val.wrapping_add(delta),
+                    };
+                    (pg_sys::Datum::from(out as usize), false)
+                }
+            }
             CompactAccKind::CountDistinctInt | CompactAccKind::CountDistinctStr => {
                 // Count was pre-written into the compact slot by write_counts_to_storage
                 let count = storage.read_count(group_idx, slot);
@@ -7503,9 +9662,141 @@ unsafe fn compact_finalize(
     }
 }
 
+/// Phase C.2 activation — emit a partial-aggregate transition state into a
+/// `(Datum, is_null)` pair for the Final Aggregate node above us to combine
+/// via `aggcombinefn`. Mirrors `compact_finalize` but stops one step earlier:
+/// returns the value at PG's `aggtranstype` rather than the user-visible
+/// final type.
+///
+/// Coverage:
+/// - `Count` → `int8` count (combinefn `int8pl`). Same as finalize for this slot.
+/// - `SumIntNarrow` (SUM only) → `int8` sum (combinefn `int8pl`).
+/// - `SumFloat` (SUM only) → `float8` sum (combinefn `float8_combine` —
+///   actually pl, since float8 sum has no count component).
+/// - `MinStr` / `MaxStr` → `text` directly (combinefn `text_smaller` /
+///   `text_larger`).
+/// - `SumInt` (SUM(int8) / AVG / SumIntNarrow AVG / SumFloat AVG) — NOT yet
+///   implemented because the `aggtranstype = internal` path needs
+///   `int8_avg_serialize` to produce a `bytea` partial state. Add eligibility
+///   gate in `add_agg_path` so we don't reach this with an unsupported shape.
+/// - `Count` for COUNT(DISTINCT) — has no `aggcombinefn` in PG core; must be
+///   excluded by gating.
+///
+/// `unreachable!` in the unsupported branches is the bug-catcher: if planner
+/// gating drifts and we land here at runtime, we'd produce silently-wrong
+/// results otherwise.
+#[allow(dead_code)] // wired by the C.2 activation planner code in path.rs
+unsafe fn compact_emit_partial(
+    storage: &CompactAccStorage,
+    group_idx: u32,
+    slot: usize,
+    spec: &AggExecSpec,
+) -> (pg_sys::Datum, bool) {
+    unsafe {
+        let (_, kind) = storage.layout.slots[slot];
+        match kind {
+            CompactAccKind::Count => {
+                // partial state for `count` and `count(*)` is `int8`.
+                let count = storage.read_count(group_idx, slot);
+                (pg_sys::Datum::from(count as usize), false)
+            }
+            CompactAccKind::SumIntNarrow => {
+                // SUM(int2/int4): partial state is `int8` (the running sum).
+                // count is unused at the partial level for SUM. AVG path
+                // not supported here yet — gating must reject it.
+                if spec.agg_type != AggType::Sum {
+                    unreachable!(
+                        "compact_emit_partial: SumIntNarrow only supports Sum (got {:?}); \
+                         planner gating drift",
+                        spec.agg_type,
+                    );
+                }
+                let (sum, _count) = storage.read_sum_int_narrow(group_idx, slot);
+                (pg_sys::Datum::from(sum as usize), false)
+            }
+            CompactAccKind::SumFloat => {
+                // SUM(float4/float8): partial state is `float8` (the running
+                // sum). count is unused at the partial level. combinefn is
+                // `float8pl`.
+                if spec.agg_type != AggType::Sum {
+                    unreachable!(
+                        "compact_emit_partial: SumFloat only supports Sum (got {:?}); \
+                         planner gating drift",
+                        spec.agg_type,
+                    );
+                }
+                let (sum, count) = storage.read_sum_float(group_idx, slot);
+                if count == 0 {
+                    return (pg_sys::Datum::from(0usize), true);
+                }
+                (pg_sys::Datum::from(sum.to_bits() as usize), false)
+            }
+            CompactAccKind::MinStr | CompactAccKind::MaxStr => {
+                // partial state for MIN/MAX is the value itself; combinefn
+                // is `text_smaller` / `text_larger`. Same emit as finalize.
+                let (off, len) = storage.read_min_max_str(group_idx, slot);
+                if off == u32::MAX {
+                    (pg_sys::Datum::from(0usize), true)
+                } else {
+                    let s = storage.str_arena.get(off, len);
+                    let datum = string_to_datum(s, spec.col_type_oid);
+                    (datum, false)
+                }
+            }
+            CompactAccKind::MinInt | CompactAccKind::MaxInt => {
+                // partial state for MIN/MAX(int|timestamp) is the value itself;
+                // combinefn is `int*smaller`/`int*larger` (or `timestamp*_smaller`
+                // / `timestamp*_larger`). Same emit as finalize — apply the
+                // monotonic OutputTransform here too so the post-shift value
+                // is what flows up to PG's combinefn.
+                let (val, has) = storage.read_min_max_int(group_idx, slot);
+                if !has {
+                    (pg_sys::Datum::from(0usize), true)
+                } else {
+                    let out = match spec.output_transform {
+                        OutputTransform::None => val,
+                        OutputTransform::PgUsShift { delta } => val.wrapping_add(delta),
+                    };
+                    (pg_sys::Datum::from(out as usize), false)
+                }
+            }
+            CompactAccKind::SumInt => {
+                // SUM(int8) partial state is `internal` via int8_avg_serialize
+                // → `bytea`. Not implemented yet; gating must reject SUM(int8)
+                // / AVG until we wire int8_avg_serialize.
+                unreachable!(
+                    "compact_emit_partial: SumInt (transtype=internal) not yet supported \
+                     for partial emit; planner gating drift",
+                );
+            }
+            CompactAccKind::CountDistinctInt | CompactAccKind::CountDistinctStr => {
+                unreachable!(
+                    "compact_emit_partial: COUNT(DISTINCT) has no PG aggcombinefn; \
+                     planner gating drift",
+                );
+            }
+        }
+    }
+}
+
 // ============================================================================
 // Packed Integer Keys (Phase 2)
 // ============================================================================
+
+/// Phase C.2.f — public re-export for `path.rs::add_agg_path`. Diverging the
+/// path-level and exec-level eligibility checks would silently mismatch
+/// leader and worker, so add_agg_path calls into the canonical predicate.
+///
+/// Callers in the planner don't have segment metadata loaded, so they pass
+/// `&[]` for `col_not_null`. The canonical predicate then rejects every
+/// `Column` / `DateTrunc` / `Extract` / `AddConst` group key — leaving only
+/// `group_specs.is_empty()` as a viable parallel-agg shape at plan time.
+pub(crate) fn can_use_compact_keys_path(
+    group_specs: &[GroupByColSpec],
+    col_not_null: &[bool],
+) -> bool {
+    can_use_compact_keys(group_specs, col_not_null)
+}
 
 /// Check if all GROUP BY columns produce integer values and can be packed into u128.
 fn can_use_compact_keys(group_specs: &[GroupByColSpec], col_not_null: &[bool]) -> bool {
@@ -7552,7 +9843,7 @@ fn unpack_int_keys(packed: u128, num_keys: usize) -> [i64; 2] {
 }
 
 /// Type alias for compact group map with u128 keys.
-type CompactGroupMap = hashbrown::HashMap<u128, u32, BuildHasherDefault<ahash::AHasher>>;
+pub(super) type CompactGroupMap = hashbrown::HashMap<u128, u32, BuildHasherDefault<ahash::AHasher>>;
 
 // ============================================================================
 // Parallel Compact Aggregation
@@ -7853,16 +10144,33 @@ struct ParallelCompactConfig<'a> {
 }
 
 /// Result of parallel compact aggregation from one worker thread.
-struct ParallelCompactResult {
-    compact_map: CompactGroupMap,
-    compact_storage: CompactAccStorage,
-    cd_sidecar: CountDistinctSideCar,
-    segments_processed: u64,
-    rows_processed: u64,
-    decompress_us: u64,
+pub(super) struct ParallelCompactResult {
+    pub(super) compact_map: CompactGroupMap,
+    pub(super) compact_storage: CompactAccStorage,
+    pub(super) cd_sidecar: CountDistinctSideCar,
+    pub(super) segments_processed: u64,
+    pub(super) rows_processed: u64,
+    pub(super) decompress_us: u64,
     /// Pre-computed top-K candidates: (keys, floor_value).
     /// Present when `config.topn_spec` is set.
-    topk: Option<(Vec<u128>, i64)>,
+    pub(super) topk: Option<(Vec<u128>, i64)>,
+}
+
+impl ParallelCompactResult {
+    /// Construct an empty result for the given agg specs. Used by parallel
+    /// workers as the per-process accumulator before serialising to DSM.
+    #[allow(dead_code)] // wired by C.2.d
+    pub(super) fn empty(agg_specs: &[AggExecSpec]) -> Self {
+        Self {
+            compact_map: CompactGroupMap::with_hasher(BuildHasherDefault::default()),
+            compact_storage: CompactAccStorage::new(CompactAccLayout::new(agg_specs)),
+            cd_sidecar: CountDistinctSideCar::new(agg_specs),
+            segments_processed: 0,
+            rows_processed: 0,
+            decompress_us: 0,
+            topk: None,
+        }
+    }
 }
 
 /// Process a chunk of segments on a worker thread using the compact path.
@@ -7911,6 +10219,24 @@ fn process_segments_compact(
             continue;
         }
 
+        // C.3 per-segment fast path: classify the segment vs batch_quals
+        // using col_minmax / nonzero_count metadata BEFORE any decompression.
+        // The partial path's eligibility predicate ensures every batch_qual
+        // is numeric (`is_batch_comparable_type`), so classify_segment_quals
+        // always has the metadata it needs — no Ambiguous-from-mixed-types
+        // edge case here (that's only relevant in `process_segments_mixed`).
+        let seg_qual_result = if config.batch_quals.is_empty() {
+            SegmentQualResult::AllPass
+        } else {
+            classify_segment_quals(seg, config.batch_quals, config.col_names)
+        };
+        if matches!(seg_qual_result, SegmentQualResult::NonePass) {
+            // No row in this segment passes the quals — skip entirely.
+            // Saves the full decompression cost for the segment.
+            continue;
+        }
+        let quals_all_pass = matches!(seg_qual_result, SegmentQualResult::AllPass);
+
         segments_processed += 1;
 
         // Decompress needed columns (pure Rust, no PG calls)
@@ -7956,8 +10282,14 @@ fn process_segments_compact(
 
         let row_count = seg.row_count as usize;
 
-        // Evaluate batch quals (pure Rust for numeric types)
-        let selection = evaluate_batch_quals(&decompressed, row_count, config.batch_quals, Vec::new());
+        // Evaluate batch quals — but only if metadata couldn't already
+        // prove all rows pass. AllPass means we can use an empty selection
+        // (every row included) and skip the per-row qual evaluation loop.
+        let selection = if quals_all_pass {
+            Vec::new()
+        } else {
+            evaluate_batch_quals(&decompressed, row_count, config.batch_quals, Vec::new())
+        };
 
         // Compact aggregation loop (identical to single-threaded path)
         for row in 0..row_count {
@@ -7980,9 +10312,8 @@ fn process_segments_compact(
                         let pg_usec = col[row].0.value() as i64;
                         pg_usec.div_euclid(*unit_usecs) * *unit_usecs
                     }
-                    GroupByExpr::Extract { unit, .. } => {
-                        let pg_usec = col[row].0.value() as i64;
-                        extract_field_from_usecs(pg_usec, unit)
+                    GroupByExpr::Extract { unit, divisor, .. } => {
+                        eval_extract(col[row].0.value() as i64, *divisor, unit)
                     }
                     GroupByExpr::AddConst { offset, .. } => {
                         col[row].0.value() as i64 + offset
@@ -8080,6 +10411,20 @@ fn process_segments_compact(
                         // compact parallel path requires all_needed_cols_numeric,
                         // so MinStr/MaxStr cannot appear here
                         unreachable!("MinStr/MaxStr in compact parallel worker")
+                    }
+                    CompactAccKind::MinInt => {
+                        let col = &decompressed[spec.col_idx as usize];
+                        if !col.is_empty() && !col[row].1 {
+                            let v = col[row].0.value() as i64;
+                            unsafe { compact_storage.update_min_int(group_idx, spec_idx, v); }
+                        }
+                    }
+                    CompactAccKind::MaxInt => {
+                        let col = &decompressed[spec.col_idx as usize];
+                        if !col.is_empty() && !col[row].1 {
+                            let v = col[row].0.value() as i64;
+                            unsafe { compact_storage.update_max_int(group_idx, spec_idx, v); }
+                        }
                     }
                     CompactAccKind::CountDistinctInt => {
                         let col = &decompressed[spec.col_idx as usize];
@@ -8255,6 +10600,18 @@ fn merge_compact_results(
                             let (new_off, new_len) = global_storage.str_arena.alloc(w_str);
                             global_storage.write_min_max_str(global_group_idx, slot_idx, new_off, new_len);
                         }
+                    }
+                },
+                CompactAccKind::MinInt => unsafe {
+                    let (w_val, w_has) = worker_storage.read_min_max_int(worker_group_idx, slot_idx);
+                    if w_has {
+                        global_storage.update_min_int(global_group_idx, slot_idx, w_val);
+                    }
+                },
+                CompactAccKind::MaxInt => unsafe {
+                    let (w_val, w_has) = worker_storage.read_min_max_int(worker_group_idx, slot_idx);
+                    if w_has {
+                        global_storage.update_max_int(global_group_idx, slot_idx, w_val);
                     }
                 },
                 CompactAccKind::CountDistinctInt | CompactAccKind::CountDistinctStr => {
@@ -8629,6 +10986,16 @@ struct ParallelMixedConfig<'a> {
     /// (no ORDER BY, no HAVING, no WHERE) and the Phase-0 probe
     /// succeeded in finding `bare_limit` distinct keys.
     preselected_keys: Option<&'a hashbrown::HashSet<u128>>,
+    /// Phase D: leader-precomputed dict-distinct remaps. Keyed by spec_idx
+    /// for every CountDistinct(text) spec where every segment is dict-encoded
+    /// for the col AND the global-string count is below the bitset threshold.
+    /// Workers consult this to set bits in per-(spec, group) `Bitset`s
+    /// (`CdKind::DictBitset`) instead of hashing strings into `HashSet<u128>`.
+    /// Specs absent from the map keep the existing HashSet path. The
+    /// chunk-offset arg to `process_segments_mixed` indexes into
+    /// `per_segment` so each worker resolves `(seg_idx, local_dict_id)` →
+    /// `global_id` without further coordination.
+    dict_distinct_remaps: &'a std::collections::HashMap<usize, DictDistinctRemap>,
 }
 
 // TextQualInfo is now in text_col.rs
@@ -8654,6 +11021,7 @@ fn can_parallel_mixed(
     group_specs: &[GroupByColSpec],
     needed_cols: &[bool],
     col_types: &[pg_sys::Oid],
+    col_not_null: &[bool],
     batch_quals: &[BatchQual],
     agg_specs: &[AggExecSpec],
 ) -> bool {
@@ -8684,7 +11052,12 @@ fn can_parallel_mixed(
         if is_text_group_col(gs) {
             continue; // text column (or RegexpReplace with Rust regex) — OK
         }
-        // Must be an integer-producing expression
+        // Must be an integer-producing expression.
+        // The mixed per-row loop bails on NULL int keys (see has_null check
+        // in process_segments_mixed): hash_mixed_key / MixedKeyStorage have
+        // no NULL slot for the int side, so NULL groups would collapse into
+        // Int(0). Require attnotnull for any numeric column we'd read, same
+        // gate as can_use_compact_keys.
         match &gs.expr {
             GroupByExpr::Column => {
                 let t = gs.type_oid;
@@ -8693,8 +11066,15 @@ fn can_parallel_mixed(
                 {
                     return false;
                 }
+                if !col_not_null.get(gs.col_idx as usize).copied().unwrap_or(false) {
+                    return false;
+                }
             }
-            GroupByExpr::DateTrunc { .. } | GroupByExpr::Extract { .. } | GroupByExpr::AddConst { .. } => {}
+            GroupByExpr::DateTrunc { .. } | GroupByExpr::Extract { .. } | GroupByExpr::AddConst { .. } => {
+                if !col_not_null.get(gs.col_idx as usize).copied().unwrap_or(false) {
+                    return false;
+                }
+            }
             GroupByExpr::RegexpReplace { .. } | GroupByExpr::CaseWhen(_) => return false, // non-text RegexpReplace/CaseWhen not supported
         }
     }
@@ -8750,7 +11130,8 @@ fn can_parallel_mixed(
         }
     }
 
-    // Text batch quals must be EQ/NE with text_const or LIKE/NotLike with like_strategy
+    // Text batch quals must be EQ/NE with text_const, LIKE/NotLike with
+    // like_strategy, or InList with in_list_text.
     for bq in batch_quals {
         let t = bq.type_oid;
         if t == pg_sys::TEXTOID || t == pg_sys::VARCHAROID || t == pg_sys::BPCHAROID {
@@ -8760,6 +11141,9 @@ fn can_parallel_mixed(
                 }
                 BatchCompareOp::Like | BatchCompareOp::NotLike => {
                     if bq.like_strategy.is_none() { return false; }
+                }
+                BatchCompareOp::InList => {
+                    if bq.in_list_text.is_none() { return false; }
                 }
                 _ => return false, // unsupported text comparison
             }
@@ -8902,9 +11286,8 @@ fn try_build_preselected(
                             let pg_usec = col[row].0.value() as i64;
                             pg_usec.div_euclid(*unit_usecs) * *unit_usecs
                         }
-                        GroupByExpr::Extract { unit, .. } => {
-                            let pg_usec = col[row].0.value() as i64;
-                            extract_field_from_usecs(pg_usec, unit)
+                        GroupByExpr::Extract { unit, divisor, .. } => {
+                            eval_extract(col[row].0.value() as i64, *divisor, unit)
                         }
                         GroupByExpr::AddConst { offset, .. } => {
                             col[row].0.value() as i64 + offset
@@ -8936,13 +11319,26 @@ fn try_build_preselected(
 
 fn process_segments_mixed(
     segments: &[SegmentData],
+    chunk_offset: usize,
     config: &ParallelMixedConfig,
 ) -> ParallelMixedResult {
     let mut compact_map = CompactGroupMap::with_hasher(BuildHasherDefault::default());
     let mut compact_storage = CompactAccStorage::new(CompactAccLayout::new(config.agg_specs));
     let num_group_keys = config.group_specs.len();
     let mut mixed_keys = MixedKeyStorage::new(num_group_keys);
-    let mut cd_sidecar = CountDistinctSideCar::new(config.agg_specs);
+    // Phase D: classify each CountDistinct(text) spec as DictBitset when the
+    // leader pre-pass produced a remap for it. Bitset size = global string
+    // count for the column. Sized lookup map kept on the stack — at most a
+    // handful of CountDistinct specs per query.
+    let dict_remap_sizes: std::collections::HashMap<usize, u32> = config
+        .dict_distinct_remaps
+        .iter()
+        .map(|(&spec_idx, remap)| (spec_idx, remap.global_count))
+        .collect();
+    let mut cd_sidecar = CountDistinctSideCar::new_with_dict_remaps(
+        config.agg_specs,
+        &dict_remap_sizes,
+    );
     let mut segments_processed: u64 = 0;
     let mut rows_processed: u64 = 0;
     let mut decompress_us: u64 = 0;
@@ -8951,7 +11347,13 @@ fn process_segments_mixed(
     let n_int_keys = config.group_specs.iter().filter(|gs| !is_text_group_col(gs)).count();
     let n_str_keys = config.group_specs.iter().filter(|gs| is_text_group_col(gs)).count();
 
-    for seg in segments {
+    for (rel_idx, seg) in segments.iter().enumerate() {
+        // Phase D: absolute seg_idx into all_segments (and into each
+        // dict_distinct_remaps.per_segment). The chunk-mode `for seg in segments`
+        // doesn't expose this; we shadow it via `(rel_idx, seg)` so the bitset
+        // lookup at the per-row insert site can resolve `(spec_idx, seg_idx,
+        // local_id) → global_id` without further coordination.
+        let seg_idx_in_all = chunk_offset + rel_idx;
         if seg.row_count == 0 {
             continue;
         }
@@ -8980,6 +11382,23 @@ fn process_segments_mixed(
         ) {
             continue;
         }
+
+        // C.3 per-segment fast path: classify against the **numeric subset**
+        // of batch_quals using col_minmax / nonzero_count. NonePass on any
+        // numeric qual rules out the segment (text quals can only narrow
+        // further); AllPass lets us skip the per-row numeric eval below
+        // while still applying text quals on top of an empty selection.
+        // No-op when batch_quals has no numeric entries (helper returns
+        // Ambiguous in that case).
+        let numeric_quals_all_pass = if config.batch_quals.is_empty() {
+            true
+        } else {
+            match classify_segment_quals_numeric(seg, config.batch_quals, config.col_names) {
+                SegmentQualResult::NonePass => continue,
+                SegmentQualResult::AllPass => true,
+                SegmentQualResult::Ambiguous => false,
+            }
+        };
 
         segments_processed += 1;
 
@@ -9067,8 +11486,14 @@ fn process_segments_mixed(
         let row_count = seg.row_count as usize;
 
         // Build selection vector from quals
-        // First: numeric batch quals
-        let mut selection = evaluate_batch_quals(&numeric_cols, row_count, config.batch_quals, Vec::new());
+        // First: numeric batch quals — skip the per-row eval when C.3
+        // metadata classification already proved every row passes the
+        // numeric subset.
+        let mut selection = if numeric_quals_all_pass {
+            Vec::new()
+        } else {
+            evaluate_batch_quals(&numeric_cols, row_count, config.batch_quals, Vec::new())
+        };
 
         // Then: text quals (applied on SegTextColumn, short-circuiting via selection)
         for tqi in config.text_qual_infos {
@@ -9081,6 +11506,11 @@ fn process_segments_mixed(
                 TextQualInfo::Like { col_idx, strategy, negate } => {
                     if let Some(ref seg_col) = text_seg_cols[*col_idx] {
                         apply_text_like_filter(seg_col, strategy, *negate, row_count, &mut selection);
+                    }
+                }
+                TextQualInfo::InList { col_idx, values } => {
+                    if let Some(ref seg_col) = text_seg_cols[*col_idx] {
+                        apply_text_in_filter(seg_col, values, row_count, &mut selection);
                     }
                 }
             }
@@ -9158,9 +11588,8 @@ fn process_segments_mixed(
                             let pg_usec = col[row].0.value() as i64;
                             pg_usec.div_euclid(*unit_usecs) * *unit_usecs
                         }
-                        GroupByExpr::Extract { unit, .. } => {
-                            let pg_usec = col[row].0.value() as i64;
-                            extract_field_from_usecs(pg_usec, unit)
+                        GroupByExpr::Extract { unit, divisor, .. } => {
+                            eval_extract(col[row].0.value() as i64, *divisor, unit)
                         }
                         GroupByExpr::AddConst { offset, .. } => {
                             col[row].0.value() as i64 + offset
@@ -9313,6 +11742,20 @@ fn process_segments_mixed(
                                 }
                         }
                     }
+                    CompactAccKind::MinInt => {
+                        let col = &numeric_cols[spec.col_idx as usize];
+                        if !col.is_empty() && !col[row].1 {
+                            let v = col[row].0.value() as i64;
+                            unsafe { compact_storage.update_min_int(group_idx, spec_idx, v); }
+                        }
+                    }
+                    CompactAccKind::MaxInt => {
+                        let col = &numeric_cols[spec.col_idx as usize];
+                        if !col.is_empty() && !col[row].1 {
+                            let v = col[row].0.value() as i64;
+                            unsafe { compact_storage.update_max_int(group_idx, spec_idx, v); }
+                        }
+                    }
                     CompactAccKind::CountDistinctInt => {
                         let col = &numeric_cols[spec.col_idx as usize];
                         if !col.is_empty() && !col[row].1 {
@@ -9321,8 +11764,21 @@ fn process_segments_mixed(
                     }
                     CompactAccKind::CountDistinctStr => {
                         let col_idx = spec.col_idx as usize;
-                        if let Some(ref seg_col) = text_seg_cols[col_idx]
-                            && let Some(s) = seg_col.get_str(row) {
+                        let Some(ref seg_col) = text_seg_cols[col_idx] else { continue };
+                        if let Some(remap) = config.dict_distinct_remaps.get(&spec_idx) {
+                            // Phase D bitset path: per-row work is local
+                            // dict_id → global_id → set bit. No hashing or
+                            // string materialisation. Eligibility is gated
+                            // at the leader pre-pass — this branch only
+                            // fires when every segment is dict-encoded for
+                            // `col_idx` and the column's global cardinality
+                            // fit under PHASE_D_MAX_GLOBAL_FOR_BITSET.
+                            if let Some(local_id) = seg_col.dict_local_id(row) {
+                                let seg_remap = &remap.per_segment[seg_idx_in_all];
+                                let global_id = seg_remap[local_id as usize];
+                                cd_sidecar.insert_dict_global(spec_idx, group_idx, global_id);
+                            }
+                        } else if let Some(s) = seg_col.get_str(row) {
                             cd_sidecar.insert_str(spec_idx, group_idx, hash128_str(s.as_bytes()));
                         }
                     }
@@ -9468,8 +11924,8 @@ mod tests {
                 2, -1, 0, 0, 0,  // CountStar
                 3, 2, 0, 701, 0, // Avg, col=2, FLOAT8OID=701
                 4, 3, 0, 25, 0,  // CountDistinct, col=3, TEXTOID=25
-                5, 0, 0, 23, 0,  // Min, col=0
-                6, 0, 0, 23, 0,  // Max, col=0
+                5, 0, 0, 23, 0, 0,  // Min, col=0, OutputTransform=None
+                6, 0, 0, 23, 0, 0,  // Max, col=0, OutputTransform=None
             ]);
 
             let plan = parse_agg_private(list);
@@ -9557,7 +12013,7 @@ mod tests {
 
     #[pg_test]
     fn test_parse_group_by_extract() {
-        // GROUP BY extract(minute FROM ts): expr_tag=3
+        // GROUP BY extract(minute FROM ts): expr_tag=3, divisor=0
         unsafe {
             let unit = b"minute";
             let mut vals = vec![
@@ -9566,6 +12022,7 @@ mod tests {
                 1,                  // num_groups
                 0, 1184, 3,        // col_idx=0, TIMESTAMPTZOID, expr_tag=3(Extract)
                 200,               // func_oid
+                0, 0,              // divisor (i64 hi/lo): 0 = pg_usec input
                 unit.len() as i32,
             ];
             for &b in unit.iter() {
@@ -9575,13 +12032,75 @@ mod tests {
 
             let plan = parse_agg_private(list);
             match &plan.group_specs[0].expr {
-                GroupByExpr::Extract { unit, func_oid } => {
+                GroupByExpr::Extract { unit, func_oid, divisor } => {
                     assert_eq!(unit, "minute");
                     assert_eq!(*func_oid, 200);
+                    assert_eq!(*divisor, 0);
                 }
                 other => panic!("expected Extract, got {:?}", other),
             }
         }
+    }
+
+    #[pg_test]
+    fn test_parse_group_by_extract_with_divisor() {
+        // GROUP BY extract(hour FROM to_timestamp(bigint_col / 1_000_000)):
+        // expr_tag=3 with non-zero divisor.
+        unsafe {
+            let unit = b"hour";
+            let divisor: i64 = 1_000_000;
+            let mut vals = vec![
+                42i32, -1,
+                0,                  // num_aggs
+                1,                  // num_groups
+                0, 20, 3,          // col_idx=0, INT8OID, expr_tag=3(Extract)
+                200,               // func_oid
+                (divisor >> 32) as i32,
+                divisor as i32,
+                unit.len() as i32,
+            ];
+            for &b in unit.iter() {
+                vals.push(b as i32);
+            }
+            let list = build_int_list(&vals);
+
+            let plan = parse_agg_private(list);
+            match &plan.group_specs[0].expr {
+                GroupByExpr::Extract { unit, func_oid, divisor } => {
+                    assert_eq!(unit, "hour");
+                    assert_eq!(*func_oid, 200);
+                    assert_eq!(*divisor, 1_000_000);
+                }
+                other => panic!("expected Extract, got {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn test_extract_subday_from_bigint_scaled_hour() {
+        // 2024-05-09 12:34:56 UTC = unix epoch seconds 1715258096
+        // hour-of-day at that point is 12.
+        let unix_us: i64 = 1_715_258_096_000_000;
+        assert_eq!(
+            extract_subday_from_bigint_scaled(unix_us, 1_000_000, "hour"),
+            12,
+        );
+        // minute = 34, second = 56
+        assert_eq!(
+            extract_subday_from_bigint_scaled(unix_us, 1_000_000, "minute"),
+            34,
+        );
+        assert_eq!(
+            extract_subday_from_bigint_scaled(unix_us, 1_000_000, "second"),
+            56,
+        );
+        // Pre-unix-epoch (negative) — div_euclid handles the sign correctly,
+        // so hour-of-day is still positive within [0, 24).
+        let pre_epoch: i64 = -1; // -1us before 1970 → 23:59:59 prev day
+        assert_eq!(
+            extract_subday_from_bigint_scaled(pre_epoch, 1_000_000, "hour"),
+            23,
+        );
     }
 
     #[pg_test]
@@ -9804,7 +12323,9 @@ mod tests {
             topn_limit: 0,
             topn_sort_col: 0,
             topn_ascending: true,
+            derived_minmax_topn: None,
             bare_limit: 0,
+            is_partial: false,
         }
     }
 
@@ -9815,6 +12336,9 @@ mod tests {
             col_type_oid: pg_sys::Oid::from(col_type_oid),
             expr_kind: AggExpr::Column,
             const_offset: 0,
+            is_partial: false,
+            transtype_oid: pg_sys::InvalidOid,
+            output_transform: OutputTransform::None,
         }
     }
 

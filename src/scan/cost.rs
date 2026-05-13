@@ -166,6 +166,7 @@ pub(super) fn estimate_agg_cost(
     num_agg_exprs: usize,
     estimated_groups: f64,
     num_having_filters: usize,
+    workers: usize,
 ) -> (f64, f64) {
     // Calibrated against RTABench suite (Apr 2026). Adjusting any of these
     // risks regressing planner selection on a subset of queries; re-run
@@ -184,15 +185,56 @@ pub(super) fn estimate_agg_cost(
     let num_aggs = num_agg_exprs.max(1) as f64;
     let groups = estimated_groups.max(1.0);
 
-    let scan_work = num_partitions * PER_PARTITION + total_rows * PER_ROW;
-    let agg_work = total_rows * num_aggs * PER_AGG_EXPR;
+    let mut scan_work = num_partitions * PER_PARTITION + total_rows * PER_ROW;
+    let mut agg_work = total_rows * num_aggs * PER_AGG_EXPR;
     let having_work = groups * num_having_filters as f64 * PER_HAVING;
     let group_emit = groups * PER_GROUP;
+
+    // Phase C.2.f — when workers > 0, the parallel-aware DeltaXAgg path
+    // splits scan + per-row aggregate work across leader + workers via
+    // `next_segment.fetch_add`; group emit and HAVING stay leader-side.
+    if workers > 0 {
+        let div = parallel_divisor(workers);
+        scan_work /= div;
+        agg_work /= div;
+    }
 
     let startup = 10.0 + scan_work + agg_work + having_work;
     let total = startup + group_emit;
 
     (startup, total)
+}
+
+/// Phase C.2.f — recommend a worker count for the parallel-aware DeltaXAgg
+/// path. Returns 0 when the table is too small to amortise parallel setup.
+///
+/// Heuristic: workers ≈ total_segments / 8 (mirrors DeltaXAppend's
+/// MIN_SEGS_PER_WORKER), clamped to PG's `max_parallel_workers_per_gather`
+/// and to `MAX_AGG_WORKER_SLOTS - 1` (DSM region accounts for one leader +
+/// N workers). Below 16 segments we keep the path serial — overhead of
+/// DSM setup + worker fork dominates.
+pub(super) fn recommend_agg_workers(companion_oids: &[pg_sys::Oid]) -> i32 {
+    let total_segments: i64 = companion_oids
+        .iter()
+        .map(|&oid| get_segment_count(oid))
+        .sum();
+    let pg_cap = unsafe { pg_sys::max_parallel_workers_per_gather };
+    recommend_agg_workers_inner(total_segments, pg_cap)
+}
+
+/// Pure-Rust core of `recommend_agg_workers` so the threshold + clamp logic
+/// can be unit-tested without a live PG instance.
+fn recommend_agg_workers_inner(total_segments: i64, max_per_gather: i32) -> i32 {
+    if total_segments < 16 {
+        return 0;
+    }
+    const MIN_SEGS_PER_WORKER: i64 = 8;
+    const MAX_AGG_WORKER_SLOTS_MINUS_ONE: i32 =
+        (super::exec::MAX_AGG_WORKER_SLOTS as i32) - 1;
+    let seg_floor = (total_segments / MIN_SEGS_PER_WORKER) as i32;
+    seg_floor
+        .min(max_per_gather)
+        .clamp(0, MAX_AGG_WORKER_SLOTS_MINUS_ONE)
 }
 
 /// Get the estimated segment count for a companion OID (0 if unknown).
@@ -417,5 +459,35 @@ pub(super) unsafe fn get_reltuples(rel_oid: pg_sys::Oid) -> f64 {
         let tuples = (*rel_form).reltuples;
         pg_sys::ReleaseSysCache(tuple);
         tuples as f64
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recommend_below_threshold_returns_zero() {
+        for segs in [0i64, 1, 8, 15] {
+            assert_eq!(recommend_agg_workers_inner(segs, 8), 0, "segs={}", segs);
+        }
+    }
+
+    #[test]
+    fn recommend_clamps_to_max_per_gather() {
+        // 1000 segs / 8 = 125 worker-slots, but PG caps at 4.
+        assert_eq!(recommend_agg_workers_inner(1000, 4), 4);
+        // Exactly at the floor: 16 segs / 8 = 2 workers, PG cap=4 → 2.
+        assert_eq!(recommend_agg_workers_inner(16, 4), 2);
+        // 64 / 8 = 8, PG cap=2 → 2.
+        assert_eq!(recommend_agg_workers_inner(64, 2), 2);
+    }
+
+    #[test]
+    fn recommend_negative_pg_cap_clamps_to_zero() {
+        // Defensive: if max_parallel_workers_per_gather is somehow negative
+        // (PG default is 2, but some configs disable parallelism by setting
+        // 0), clamp to 0.
+        assert_eq!(recommend_agg_workers_inner(1000, 0), 0);
     }
 }

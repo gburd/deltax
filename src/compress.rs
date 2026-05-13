@@ -12,13 +12,370 @@ pub(crate) const PG_EPOCH_OFFSET_USEC: i64 = 946_684_800_000_000;
 /// Days between Unix epoch (1970-01-01) and PG epoch (2000-01-01).
 pub(crate) const PG_EPOCH_OFFSET_DAYS: i64 = 10_957;
 
-/// Column metadata from information_schema.
+/// Column metadata from information_schema, plus any synthetic columns
+/// introduced by `json_extract` configuration. Extracted columns sit at the
+/// end of the slice and carry `extracted = Some(_)`; all other paths through
+/// this struct ignore them or special-case them based on that flag.
 #[derive(Debug, Clone)]
 pub(crate) struct ColumnMeta {
     pub(crate) name: String,
     pub(crate) data_type: String,
     pub(crate) is_segment_by: bool,
     pub(crate) is_time_column: bool,
+    /// `Some` for synthetic columns produced by JSON-path extraction at COPY
+    /// time. `None` for physical columns of the parent table.
+    pub(crate) extracted: Option<ExtractSpec>,
+}
+
+/// One JSON-path extraction directive — extract `path` from JSONB column
+/// `src_column`, store as a synthetic columnar column named `target_name` of
+/// `target_kind`. Built by `parse_extract_specs` from the user-supplied JSONB.
+#[derive(Debug, Clone)]
+pub(crate) struct ExtractSpec {
+    pub(crate) src_column: String,
+    #[allow(dead_code)] // consumed by COPY-time extraction in step 3
+    pub(crate) path: Vec<String>,
+    pub(crate) target_name: String,
+    #[allow(dead_code)] // consumed by COPY-time extraction in step 3
+    pub(crate) target_kind: ColumnKind,
+    /// User-provided PG type alias (e.g. "text", "bigint"). Kept verbatim so
+    /// it can be echoed back through the column-metadata pipeline alongside
+    /// physical columns, and so EXPLAIN can show the original type alias.
+    pub(crate) target_type: String,
+}
+
+/// Validate and parse the `json_extract` JSONB blob into a list of specs.
+/// Errors are emitted via `pgrx::error!` so they surface as PG ERRORs from
+/// `deltax_enable_compression`.
+pub(crate) fn parse_extract_specs(value: &serde_json::Value) -> Vec<ExtractSpec> {
+    let arr = value.as_array().unwrap_or_else(|| {
+        pgrx::error!(
+            "pg_deltax: json_extract must be a JSON array of {{src,path,name,type}} objects"
+        )
+    });
+
+    let mut specs: Vec<ExtractSpec> = Vec::with_capacity(arr.len());
+    let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for (i, entry) in arr.iter().enumerate() {
+        let obj = entry.as_object().unwrap_or_else(|| {
+            pgrx::error!(
+                "pg_deltax: json_extract[{}] must be an object with src/path/name/type",
+                i
+            )
+        });
+
+        let src_column = obj
+            .get("src")
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| {
+                pgrx::error!("pg_deltax: json_extract[{}].src must be a string column name", i)
+            })
+            .to_string();
+
+        let path_value = obj.get("path").unwrap_or_else(|| {
+            pgrx::error!("pg_deltax: json_extract[{}].path is required", i)
+        });
+        let path_arr = path_value.as_array().unwrap_or_else(|| {
+            pgrx::error!("pg_deltax: json_extract[{}].path must be a JSON array of strings", i)
+        });
+        if path_arr.is_empty() {
+            pgrx::error!("pg_deltax: json_extract[{}].path must not be empty", i);
+        }
+        let path: Vec<String> = path_arr
+            .iter()
+            .enumerate()
+            .map(|(j, v)| {
+                v.as_str()
+                    .unwrap_or_else(|| {
+                        pgrx::error!(
+                            "pg_deltax: json_extract[{}].path[{}] must be a string (array indices not yet supported)",
+                            i, j
+                        )
+                    })
+                    .to_string()
+            })
+            .collect();
+
+        let target_name = obj
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| {
+                pgrx::error!("pg_deltax: json_extract[{}].name must be a string", i)
+            })
+            .to_string();
+        if !is_valid_identifier(&target_name) {
+            pgrx::error!(
+                "pg_deltax: json_extract[{}].name {:?} is not a valid SQL identifier",
+                i, target_name
+            );
+        }
+        if !seen_names.insert(target_name.clone()) {
+            pgrx::error!(
+                "pg_deltax: json_extract has duplicate target name {:?}",
+                target_name
+            );
+        }
+
+        let target_type = obj
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| {
+                pgrx::error!("pg_deltax: json_extract[{}].type must be a string", i)
+            })
+            .to_string();
+        let target_kind = classify_column(&target_type, false);
+        if matches!(target_kind, ColumnKind::Jsonb) {
+            // jsonb-extracted-as-jsonb adds no value; reject for clarity.
+            pgrx::error!(
+                "pg_deltax: json_extract[{}].type=jsonb is not supported (use the source jsonb column directly)",
+                i
+            );
+        }
+        // Unknown type names fall through to `Text` in classify_column. Keep
+        // the user's spelling in `target_type` but warn on obvious typos by
+        // requiring the recognized ones explicitly.
+        if !is_recognized_extract_type(&target_type) {
+            pgrx::error!(
+                "pg_deltax: json_extract[{}].type {:?} is not recognized (expected one of: text, varchar, char, smallint, integer, bigint, real, double precision, boolean, timestamp, timestamp with time zone, date)",
+                i, target_type
+            );
+        }
+
+        specs.push(ExtractSpec {
+            src_column,
+            path,
+            target_name,
+            target_kind,
+            target_type,
+        });
+    }
+
+    specs
+}
+
+/// Per-source-column extraction targets. Built once per COPY (or compress)
+/// pass and threaded through the parser as `Option<&ColumnExtractTargets>`
+/// alongside each physical column. `targets[k] = (idx_in_typed_cols, spec)`
+/// means "after parsing this row's source jsonb column, extract spec.path
+/// and write the leaf into typed_cols[idx_in_typed_cols]".
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ColumnExtractTargets {
+    pub(crate) targets: Vec<(usize, ExtractSpec)>,
+}
+
+/// Build `Vec<Option<ColumnExtractTargets>>` indexed by physical column index
+/// (matching the physical column ordinal in the parent table). Extracted
+/// columns sit beyond the last physical column in `columns`; we look them up
+/// by name.
+pub(crate) fn build_extract_targets_per_column(
+    columns: &[ColumnMeta],
+) -> Vec<Option<ColumnExtractTargets>> {
+    let physical_count = columns
+        .iter()
+        .position(|c| c.extracted.is_some())
+        .unwrap_or(columns.len());
+
+    let mut per_col: Vec<Option<ColumnExtractTargets>> = (0..physical_count).map(|_| None).collect();
+
+    for (target_idx, col) in columns.iter().enumerate() {
+        let Some(spec) = col.extracted.as_ref() else { continue };
+        let src_idx = match columns.iter().take(physical_count).position(|c| c.name == spec.src_column) {
+            Some(idx) => idx,
+            None => {
+                pgrx::error!(
+                    "pg_deltax: json_extract spec for {:?}: src column {:?} not found in physical columns",
+                    spec.target_name, spec.src_column
+                )
+            }
+        };
+        per_col[src_idx]
+            .get_or_insert_with(ColumnExtractTargets::default)
+            .targets
+            .push((target_idx, spec.clone()));
+    }
+
+    per_col
+}
+
+/// Driven by the per-row caller: unescape the raw COPY field, run NULL check,
+/// and apply extraction targets. NULL source -> NULL for every target.
+/// Same NULL-on-error contract as `apply_extract_targets`.
+pub(crate) fn extract_from_raw_field(
+    raw: &[u8],
+    null_string: &[u8],
+    targets: &ColumnExtractTargets,
+    typed_cols: &mut [TypedColumn],
+) {
+    if raw == null_string {
+        for (idx, _) in &targets.targets {
+            push_typed_null(&mut typed_cols[*idx]);
+        }
+        return;
+    }
+    let unescaped = crate::copyparse::unescape_field_always(raw);
+    apply_extract_targets(&unescaped, targets, typed_cols);
+}
+
+/// Same as `extract_from_raw_field` but for an already-unescaped &str field
+/// (legacy/STDIN path: PG hands us decoded `Option<&str>` directly).
+pub(crate) fn extract_from_str_field(
+    field: Option<&str>,
+    targets: &ColumnExtractTargets,
+    typed_cols: &mut [TypedColumn],
+) {
+    let Some(text) = field else {
+        for (idx, _) in &targets.targets {
+            push_typed_null(&mut typed_cols[*idx]);
+        }
+        return;
+    };
+    apply_extract_targets(text, targets, typed_cols);
+}
+
+/// Apply a JSON extraction context to a row's just-parsed source-column text.
+/// `json_text` is the unescaped UTF-8 JSON for this row's source jsonb column;
+/// for each spec in `targets`, descend `spec.path` and push a coerced leaf
+/// into `typed_cols[target_idx]`. Missing paths and type mismatches yield NULL.
+/// Malformed JSON yields NULL for every target (we never abort the COPY here —
+/// the source jsonb's own conversion via `jsonb_in` will surface a real error
+/// if the row truly isn't valid JSON).
+pub(crate) fn apply_extract_targets(
+    json_text: &str,
+    targets: &ColumnExtractTargets,
+    typed_cols: &mut [TypedColumn],
+) {
+    let value: serde_json::Value = match serde_json::from_str(json_text) {
+        Ok(v) => v,
+        Err(_) => {
+            for (idx, _) in &targets.targets {
+                push_typed_null(&mut typed_cols[*idx]);
+            }
+            return;
+        }
+    };
+    for (idx, spec) in &targets.targets {
+        let leaf = descend_json_path(&value, &spec.path);
+        push_extracted_leaf(leaf, spec.target_kind, &mut typed_cols[*idx]);
+    }
+}
+
+/// Walk a JSON Value down a sequence of object-key steps. Returns `None` if
+/// any step is missing or the intermediate value isn't an object.
+fn descend_json_path<'a>(
+    root: &'a serde_json::Value,
+    path: &[String],
+) -> Option<&'a serde_json::Value> {
+    let mut cursor = root;
+    for step in path {
+        cursor = cursor.as_object()?.get(step)?;
+    }
+    Some(cursor)
+}
+
+/// Coerce a JSON leaf value to `kind` and push to the typed column. NULL on
+/// type mismatch — the user opted into a target type, so we don't try to
+/// stringify numbers etc. silently.
+fn push_extracted_leaf(
+    leaf: Option<&serde_json::Value>,
+    kind: ColumnKind,
+    typed_col: &mut TypedColumn,
+) {
+    let leaf = match leaf {
+        Some(v) if !v.is_null() => v,
+        _ => {
+            push_typed_null(typed_col);
+            return;
+        }
+    };
+    match (kind, typed_col, leaf) {
+        // Text: accept strings; numbers/bools/etc. stringify via to_string()
+        (ColumnKind::Text, TypedColumn::Text(vec), serde_json::Value::String(s)) => {
+            vec.push(Some(s.clone()));
+        }
+        (ColumnKind::Int16, TypedColumn::Int16(vec), serde_json::Value::Number(n)) => {
+            vec.push(n.as_i64().and_then(|x| i16::try_from(x).ok()));
+        }
+        (ColumnKind::Int32, TypedColumn::Int32(vec), serde_json::Value::Number(n)) => {
+            vec.push(n.as_i64().and_then(|x| i32::try_from(x).ok()));
+        }
+        (ColumnKind::Int64, TypedColumn::Int64(vec), serde_json::Value::Number(n)) => {
+            vec.push(n.as_i64());
+        }
+        (ColumnKind::Int16, TypedColumn::Int16(vec), serde_json::Value::String(s)) => {
+            vec.push(s.parse::<i16>().ok());
+        }
+        (ColumnKind::Int32, TypedColumn::Int32(vec), serde_json::Value::String(s)) => {
+            vec.push(s.parse::<i32>().ok());
+        }
+        (ColumnKind::Int64, TypedColumn::Int64(vec), serde_json::Value::String(s)) => {
+            vec.push(s.parse::<i64>().ok());
+        }
+        (ColumnKind::Float32, TypedColumn::Float32(vec), serde_json::Value::Number(n)) => {
+            vec.push(n.as_f64().map(|x| x as f32));
+        }
+        (ColumnKind::Float64, TypedColumn::Float64(vec), serde_json::Value::Number(n)) => {
+            vec.push(n.as_f64());
+        }
+        (ColumnKind::Bool, TypedColumn::Bool(vec), serde_json::Value::Bool(b)) => {
+            vec.push(Some(*b));
+        }
+        (ColumnKind::Timestamp | ColumnKind::TimestampTz, TypedColumn::Int64(vec), serde_json::Value::String(s)) => {
+            // PG-format timestamp text. Best-effort parse; NULL on miss.
+            // Wrap parse_timestamp_to_usec which currently doesn't return Result —
+            // catch panics from malformed inputs and treat as NULL.
+            let parsed = std::panic::catch_unwind(|| {
+                crate::timeparse::parse_timestamp_to_usec(s)
+            });
+            vec.push(parsed.ok());
+        }
+        (ColumnKind::Date, TypedColumn::Int64(vec), serde_json::Value::String(s)) => {
+            let parsed = std::panic::catch_unwind(|| {
+                crate::timeparse::parse_timestamp_to_usec(s)
+            });
+            vec.push(parsed.ok());
+        }
+        // Anything else: type mismatch -> NULL.
+        (_, typed_col, _) => {
+            push_typed_null(typed_col);
+        }
+    }
+}
+
+fn is_valid_identifier(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn is_recognized_extract_type(t: &str) -> bool {
+    let l = t.to_lowercase();
+    matches!(
+        l.as_str(),
+        "text"
+            | "varchar"
+            | "char"
+            | "smallint"
+            | "int2"
+            | "integer"
+            | "int4"
+            | "bigint"
+            | "int8"
+            | "real"
+            | "float4"
+            | "double precision"
+            | "float8"
+            | "boolean"
+            | "bool"
+            | "timestamp"
+            | "timestamp without time zone"
+            | "timestamp with time zone"
+            | "timestamptz"
+            | "date"
+    )
 }
 
 // ============================================================================
@@ -32,12 +389,24 @@ pub(crate) struct ColumnMeta {
 ///     segment_by => ARRAY['device_id'],
 ///     order_by => ARRAY['ts']);
 /// ```
+///
+/// `json_extract` (optional) is a JSON array of `{src, path, name, type}`
+/// objects describing JSON paths to extract from JSONB columns at COPY time
+/// into extra columnar columns. Example:
+///
+/// ```sql
+/// SELECT deltax_enable_compression('bluesky',
+///     order_by => ARRAY['ts'],
+///     json_extract => '[{"src":"data","path":["commit","collection"],
+///                        "name":"x_collection","type":"text"}]'::jsonb);
+/// ```
 #[pg_extern]
 fn deltax_enable_compression(
     relation: &str,
     segment_by: default!(Vec<String>, "ARRAY[]::text[]"),
     order_by: default!(Vec<String>, "ARRAY[]::text[]"),
     segment_size: default!(i32, "30000"),
+    json_extract: default!(Option<pgrx::datum::JsonB>, "NULL"),
 ) -> String {
     Spi::connect_mut(|client| {
         let (schema, table) = crate::partition::resolve_relation(client, relation);
@@ -71,12 +440,77 @@ fn deltax_enable_compression(
 
         let effective_segment_size = if segment_size <= 0 { 30000 } else { segment_size };
 
-        catalog::update_deltatable_compression(client, ht.id, &segment_by, &effective_order_by, effective_segment_size)
-            .expect("failed to update compression settings");
+        // Validate json_extract specs (if any) before persisting. Each spec's
+        // src column must exist in the parent table and be jsonb. The names
+        // must not collide with any physical column.
+        let extract_summary = if let Some(ref jx) = json_extract {
+            let specs = parse_extract_specs(&jx.0);
+            for spec in &specs {
+                let row = client
+                    .select(
+                        "SELECT data_type FROM information_schema.columns
+                         WHERE table_schema = $1 AND table_name = $2 AND column_name = $3",
+                        None,
+                        &[
+                            schema.as_str().into(),
+                            table.as_str().into(),
+                            spec.src_column.as_str().into(),
+                        ],
+                    )
+                    .expect("failed to check src column");
+                let dt: Option<String> = row
+                    .first()
+                    .get_one::<String>()
+                    .expect("failed to read data_type");
+                match dt {
+                    None => pgrx::error!(
+                        "pg_deltax: json_extract src column '{}' not found in {}.{}",
+                        spec.src_column, schema, table
+                    ),
+                    Some(t) if t.to_lowercase() != "jsonb" => pgrx::error!(
+                        "pg_deltax: json_extract src column '{}' must be jsonb (is {})",
+                        spec.src_column, t
+                    ),
+                    Some(_) => {}
+                }
+                // target_name must not collide with a physical column
+                let collision = client
+                    .select(
+                        "SELECT 1 FROM information_schema.columns
+                         WHERE table_schema = $1 AND table_name = $2 AND column_name = $3",
+                        None,
+                        &[
+                            schema.as_str().into(),
+                            table.as_str().into(),
+                            spec.target_name.as_str().into(),
+                        ],
+                    )
+                    .expect("failed to check name collision");
+                if !collision.is_empty() {
+                    pgrx::error!(
+                        "pg_deltax: json_extract name '{}' collides with an existing column in {}.{}",
+                        spec.target_name, schema, table
+                    );
+                }
+            }
+            format!(", json_extract: {} path(s)", specs.len())
+        } else {
+            String::new()
+        };
+
+        catalog::update_deltatable_compression(
+            client,
+            ht.id,
+            &segment_by,
+            &effective_order_by,
+            effective_segment_size,
+            json_extract,
+        )
+        .expect("failed to update compression settings");
 
         format!(
-            "Compression enabled on {}.{} (segment_by: {:?}, order_by: {:?}, segment_size: {})",
-            schema, table, segment_by, effective_order_by, effective_segment_size
+            "Compression enabled on {}.{} (segment_by: {:?}, order_by: {:?}, segment_size: {}{})",
+            schema, table, segment_by, effective_order_by, effective_segment_size, extract_summary
         )
     })
 }
@@ -270,7 +704,14 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
     }
 
     // 3. Get column metadata
-    let columns = get_column_metadata(client, &schema, &part_table, &ht.segment_by, &ht.time_column);
+    let columns = get_column_metadata(
+        client,
+        &schema,
+        &part_table,
+        &ht.segment_by,
+        &ht.time_column,
+        ht.json_extract.as_ref(),
+    );
     if columns.is_empty() {
         pgrx::error!("pg_deltax: no columns found for {}.{}", schema, part_table);
     }
@@ -448,7 +889,7 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
 // ============================================================================
 
 /// Classifies how to read a column from SPI.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum ColumnKind {
     Text,         // text, varchar, char — read as String
     Int16,        // smallint/int2
@@ -599,6 +1040,20 @@ pub(crate) fn init_typed_columns(columns: &[ColumnMeta], kinds: &[ColumnKind]) -
 
 /// Extract one SPI row into typed column accumulators using native datum access.
 /// Segment_by columns are skipped (their TypedColumn slots remain empty).
+/// Push a NULL into any TypedColumn variant.
+fn push_typed_null(col: &mut TypedColumn) {
+    match col {
+        TypedColumn::Int16(v) => v.push(None),
+        TypedColumn::Int32(v) => v.push(None),
+        TypedColumn::Int64(v) => v.push(None),
+        TypedColumn::Float32(v) => v.push(None),
+        TypedColumn::Float64(v) => v.push(None),
+        TypedColumn::Bool(v) => v.push(None),
+        TypedColumn::Text(v) => v.push(None),
+        TypedColumn::Bytes(v) => v.push(None),
+    }
+}
+
 fn append_row_to_columns(
     row: &pgrx::spi::SpiHeapTupleData,
     columns: &[ColumnMeta],
@@ -607,6 +1062,14 @@ fn append_row_to_columns(
 ) {
     for (i, (col, kind)) in columns.iter().zip(kinds.iter()).enumerate() {
         if col.is_segment_by {
+            continue;
+        }
+        // Synthetic extracted columns have no SPI ordinal — they must be
+        // populated from the source jsonb in their own pass. Until that's
+        // wired up for the SPI-fetch (post-INSERT) compression path, push
+        // NULL placeholders so per-segment row counts stay aligned.
+        if col.extracted.is_some() {
+            push_typed_null(&mut typed_cols[i]);
             continue;
         }
         let ordinal = i + 1; // SPI ordinals are 1-based
@@ -1368,7 +1831,6 @@ pub(crate) fn build_companion_ddl(
         colstats_fqn
     );
 
-    // STORAGE EXTERNAL: skip TOAST pglz compression on _data — blobs are already zstd-compressed.
     let blobs_ddl = format!(
         "CREATE TABLE {} (_col_idx SMALLINT NOT NULL, _segment_id INT NOT NULL, _data BYTEA COMPRESSION lz4, PRIMARY KEY (_col_idx, _segment_id))",
         blobs_fqn
@@ -2282,6 +2744,7 @@ pub(crate) fn get_column_metadata(
     table: &str,
     segment_by: &[String],
     time_column: &str,
+    json_extract: Option<&serde_json::Value>,
 ) -> Vec<ColumnMeta> {
     let result = client
         .select(
@@ -2305,8 +2768,30 @@ pub(crate) fn get_column_metadata(
             data_type,
             is_segment_by: is_segment,
             is_time_column: is_time,
+            extracted: None,
         });
     }
+
+    // Append synthetic columns from json_extract. The `_col_idx` slots in
+    // companion tables are assigned in iteration order over non-segment-by
+    // columns, so extracted columns naturally land after physical columns
+    // without disturbing existing partitions.
+    if let Some(jx) = json_extract {
+        let mode = crate::get_json_extract_mode();
+        if mode != crate::JsonExtractMode::None {
+            let specs = parse_extract_specs(jx);
+            for spec in specs {
+                columns.push(ColumnMeta {
+                    name: spec.target_name.clone(),
+                    data_type: spec.target_type.clone(),
+                    is_segment_by: false,
+                    is_time_column: false,
+                    extracted: Some(spec),
+                });
+            }
+        }
+    }
+
     columns
 }
 
@@ -2355,7 +2840,17 @@ fn decompress_partition_inner(client: &mut SpiClient, partition: &str) -> String
         .unwrap();
 
     // 2. Get column metadata (from the parent table, since partition is truncated)
-    let columns = get_column_metadata(client, &ht.schema_name, &ht.table_name, &ht.segment_by, &ht.time_column);
+    // Decompression repopulates the parent table's physical columns only —
+    // the synthetic json_extract columns live solely in the companion blobs
+    // and don't need to be reconstructed.
+    let columns = get_column_metadata(
+        client,
+        &ht.schema_name,
+        &ht.table_name,
+        &ht.segment_by,
+        &ht.time_column,
+        None,
+    );
 
     let companion_schema = "_deltax_compressed";
     let meta_fqn = format!("\"{}\".\"{}_meta\"", companion_schema, part_table);
@@ -3015,7 +3510,17 @@ pub(crate) fn analyze_partition_impl_split(
         }
     };
 
-    let columns = get_column_metadata(client, &schema, &part_table, &ht.segment_by, &ht.time_column);
+    // ANALYZE writes to pg_statistic, which is keyed on pg_attribute attnos —
+    // synthetic extracted columns have no pg_attribute entry, so they're
+    // omitted here.
+    let columns = get_column_metadata(
+        client,
+        &schema,
+        &part_table,
+        &ht.segment_by,
+        &ht.time_column,
+        None,
+    );
     let part_fqn = crate::partition::fqn(&schema, &part_table);
     let ddl = build_companion_ddl(&part_table, &columns);
 

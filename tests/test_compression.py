@@ -1796,13 +1796,17 @@ class TestTransparentQuery:
         assert before[1] == after[1], f"SUM(val + 10) mismatch: {before[1]} vs {after[1]}"
         assert before[2] == after[2], f"SUM(val + 100) mismatch: {before[2]} vs {after[2]}"
 
-        # Verify AggScan is used (not plain Aggregate over DecompressState)
+        # Verify a pushdown path is used (not plain Aggregate over
+        # DecompressState). Either DeltaXAgg (generic agg pushdown) or
+        # DeltaXMinMax (the metadata-only path for SUM(col+N) with no
+        # GROUP BY / WHERE — the meta path is preferred when available
+        # because it doesn't decompress any blobs).
         explain = db.execute(
             "EXPLAIN SELECT SUM(val), SUM(val + 10), SUM(val + 100) FROM sum_add_test"
         ).fetchall()
         explain_text = "\n".join(r[0] for r in explain)
-        assert "DeltaXAgg" in explain_text, (
-            f"Expected DeltaXAgg in plan:\n{explain_text}"
+        assert "DeltaXAgg" in explain_text or "DeltaXMinMax" in explain_text, (
+            f"Expected a pushdown path (DeltaXAgg or DeltaXMinMax) in plan:\n{explain_text}"
         )
 
     def test_sum_add_const_fast_path(self, db):
@@ -1854,15 +1858,18 @@ class TestTransparentQuery:
                 f"SUM(val + {i}) mismatch: before={before[i]} after={after[i]}"
             )
 
-        # Verify AggScan is used
+        # Verify a pushdown path is used (DeltaXMinMax meta path preferred,
+        # DeltaXAgg generic pushdown acceptable as fallback).
         explain = db.execute(f"EXPLAIN {select_sql}").fetchall()
         explain_text = "\n".join(r[0] for r in explain)
-        assert "DeltaXAgg" in explain_text, (
-            f"Expected DeltaXAgg in plan:\n{explain_text}"
+        assert "DeltaXAgg" in explain_text or "DeltaXMinMax" in explain_text, (
+            f"Expected a pushdown path in plan:\n{explain_text}"
         )
 
-        # Verify fast path via EXPLAIN ANALYZE: either metadata-only
-        # (decompress=0, agg=0) or algebraic fast path (agg << decompress)
+        # Verify fast path via EXPLAIN ANALYZE. The meta path emits a
+        # different timing line shape (no decompress/agg fields) — accept
+        # that as proof of metadata-only execution. Otherwise check the
+        # algebraic fast path's agg << decompress invariant.
         rows = db.execute(f"EXPLAIN ANALYZE {select_sql}").fetchall()
         for r in rows:
             line = r[0]
@@ -1880,6 +1887,9 @@ class TestTransparentQuery:
                         f"but agg={agg:.3f}ms decompress={decomp:.3f}ms\n"
                         f"Full line: {line}"
                     )
+                # Meta path's timing line ("metadata=… heap_scan=…") has no
+                # agg/decompress fields; absence is fine — meta path skips
+                # blobs entirely.
                 break
 
     def test_sum_add_const_no_fast_path_different_columns(self, db):
@@ -1921,10 +1931,12 @@ class TestTransparentQuery:
         assert before[2] == after[2], f"SUM(b) mismatch: {before[2]} vs {after[2]}"
         assert before[3] == after[3], f"SUM(b+10) mismatch: {before[3]} vs {after[3]}"
 
-        # Verify AggScan is used
+        # Verify a pushdown path is used (DeltaXAgg or DeltaXMinMax meta path).
         explain = db.execute(f"EXPLAIN {q}").fetchall()
         explain_text = "\n".join(r[0] for r in explain)
-        assert "DeltaXAgg" in explain_text
+        assert "DeltaXAgg" in explain_text or "DeltaXMinMax" in explain_text, (
+            f"Expected a pushdown path in plan:\n{explain_text}"
+        )
 
     def test_sum_add_const_no_fast_path_with_group_by(self, db):
         """SUM(col + N) with GROUP BY does NOT take the fast path.

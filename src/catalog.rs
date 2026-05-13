@@ -14,6 +14,11 @@ pub struct DeltatableInfo {
     pub compress_after: Option<pgrx::datum::Interval>,
     pub drop_after: Option<pgrx::datum::Interval>,
     pub segment_size: i32,
+    /// Raw `json_extract` JSONB from the catalog as a serde_json Value.
+    /// Parsed into `Vec<ExtractSpec>` at use sites via
+    /// `compress::parse_extract_specs`. `None` = no JSON paths configured.
+    #[allow(dead_code)] // Wired up incrementally across the json-extract feature.
+    pub json_extract: Option<serde_json::Value>,
 }
 
 /// Metadata for a single partition.
@@ -111,7 +116,8 @@ pub fn get_deltatable_by_id(
 ) -> spi::SpiResult<Option<DeltatableInfo>> {
     let mut result = client.select(
         "SELECT id, schema_name, table_name, time_column, partition_interval,
-                segment_by, order_by, compress_after, drop_after, segment_size
+                segment_by, order_by, compress_after, drop_after, segment_size,
+                json_extract
          FROM deltax_deltatable
          WHERE id = $1",
         None,
@@ -137,6 +143,10 @@ pub fn get_deltatable_by_id(
         let drop_after: Option<pgrx::datum::Interval> =
             row.get_datum_by_ordinal(9)?.value::<pgrx::datum::Interval>()?;
         let segment_size: i32 = row.get_datum_by_ordinal(10)?.value::<i32>()?.unwrap_or(30000);
+        let json_extract: Option<serde_json::Value> = row
+            .get_datum_by_ordinal(11)?
+            .value::<pgrx::datum::JsonB>()?
+            .map(|j| j.0);
         return Ok(Some(DeltatableInfo {
             id: ht_id,
             schema_name: s,
@@ -148,6 +158,7 @@ pub fn get_deltatable_by_id(
             compress_after,
             drop_after,
             segment_size,
+            json_extract,
         }));
     }
 
@@ -160,7 +171,8 @@ pub fn get_all_deltatables(
 ) -> spi::SpiResult<Vec<DeltatableInfo>> {
     let result = client.select(
         "SELECT id, schema_name, table_name, time_column, partition_interval,
-                segment_by, order_by, compress_after, drop_after, segment_size
+                segment_by, order_by, compress_after, drop_after, segment_size,
+                json_extract
          FROM deltax_deltatable",
         None,
         &[],
@@ -179,6 +191,10 @@ pub fn get_all_deltatables(
             compress_after: row.get_datum_by_ordinal(8)?.value::<pgrx::datum::Interval>()?,
             drop_after: row.get_datum_by_ordinal(9)?.value::<pgrx::datum::Interval>()?,
             segment_size: row.get_datum_by_ordinal(10)?.value::<i32>()?.unwrap_or(30000),
+            json_extract: row
+                .get_datum_by_ordinal(11)?
+                .value::<pgrx::datum::JsonB>()?
+                .map(|j| j.0),
         });
     }
     Ok(deltatables)
@@ -213,23 +229,49 @@ pub fn get_partitions(
     Ok(partitions)
 }
 
-/// Update compression settings for a deltatable.
+/// Update compression settings for a deltatable. `json_extract` is `None` to
+/// leave the existing value untouched, `Some(JsonB(Null))` to clear it, or
+/// `Some(JsonB(<array>))` to set a new path list.
 pub fn update_deltatable_compression(
     client: &mut SpiClient,
     deltatable_id: i32,
     segment_by: &[String],
     order_by: &[String],
     segment_size: i32,
+    json_extract: Option<pgrx::datum::JsonB>,
 ) -> spi::SpiResult<()> {
     let seg_vec = segment_by.to_vec();
     let ord_vec = order_by.to_vec();
-    client.update(
-        "UPDATE deltax_deltatable
-         SET segment_by = $1, order_by = $2, segment_size = $3
-         WHERE id = $4",
-        None,
-        &[seg_vec.into(), ord_vec.into(), segment_size.into(), deltatable_id.into()],
-    )?;
+    if let Some(jx) = json_extract {
+        // Stamp `json_extract_added_at` whenever json_extract is (re)set so
+        // the planner can gate the rewrite on partitions compressed before
+        // this point. Any change (add/remove a path, replace the list) bumps
+        // the timestamp; partitions whose `compressed_at < json_extract_added_at`
+        // are missing the synthetic columns and must fall through to the slow
+        // path.
+        client.update(
+            "UPDATE deltax_deltatable
+             SET segment_by = $1, order_by = $2, segment_size = $3,
+                 json_extract = $4, json_extract_added_at = now()
+             WHERE id = $5",
+            None,
+            &[
+                seg_vec.into(),
+                ord_vec.into(),
+                segment_size.into(),
+                jx.into(),
+                deltatable_id.into(),
+            ],
+        )?;
+    } else {
+        client.update(
+            "UPDATE deltax_deltatable
+             SET segment_by = $1, order_by = $2, segment_size = $3
+             WHERE id = $4",
+            None,
+            &[seg_vec.into(), ord_vec.into(), segment_size.into(), deltatable_id.into()],
+        )?;
+    }
     Ok(())
 }
 

@@ -97,7 +97,7 @@ bench:
 	@echo "=== Running JSONBench ==="
 	$(EC2_SSH) 'cd ~/jsonbench && bash run.sh | tee /tmp/bench_output.txt'
 	@echo "=== Parsing results ==="
-	$(EC2_SSH) 'cd ~/jsonbench && source load_stats.env 2>/dev/null; LOAD_TIME=$${LOAD_TIME:-0} DATA_SIZE=$${DATA_SIZE:-0} DATASET_SIZE=$${DATASET_SIZE:-unknown} bash parse-results.sh < /tmp/bench_output.txt > /tmp/pg_deltax.json'
+	$(EC2_SSH) 'cd ~/jsonbench && source load_stats.env 2>/dev/null; LOAD_TIME=$${LOAD_TIME:-0} DATA_SIZE=$${DATA_SIZE:-0} NUM_LOADED=$${NUM_LOADED:-0} DATASET_SIZE=$${DATASET_SIZE:-0} bash parse-results.sh < /tmp/bench_output.txt > /tmp/pg_deltax.json'
 	@mkdir -p $(RESULTS_DIR) $(HISTORY_DIR)
 	$(EC2_SCP) $(EC2_USER)@$(EC2):/tmp/pg_deltax.json $(RESULTS_DIR)/pg_deltax.json
 	$(eval TS := $(shell date +%Y%m%d_%H%M%S))
@@ -107,12 +107,16 @@ bench:
 	@echo "=== Results saved to $(RESULTS_DIR)/pg_deltax.json ==="
 	@echo "=== Archived to $(HISTORY_DIR)/$(TS)_$(COMMIT)/ ==="
 	@if [ -d "$(JSONBENCH_DIR)" ]; then \
-		DATASET_LABEL=$$(jq -r '.dataset_size' $(RESULTS_DIR)/pg_deltax.json); \
-		DEST=$(JSONBENCH_DIR)/postgresql/results/pg_deltax_m6i.8xlarge_$${DATASET_LABEL}.json; \
+		DATASET_NUM=$$(jq -r '.dataset_size' $(RESULTS_DIR)/pg_deltax.json); \
+		DATASET_LABEL=$$(awk -v n="$${DATASET_NUM}" 'BEGIN{ printf("%dm", n/1000000); }'); \
+		DEST=$(JSONBENCH_DIR)/pg_deltax/results/m6i.8xlarge_bluesky_$${DATASET_LABEL}.json; \
 		echo "=== Copying to upstream JSONBench dashboard inputs ==="; \
-		mkdir -p $(JSONBENCH_DIR)/postgresql/results; \
+		mkdir -p $(JSONBENCH_DIR)/pg_deltax/results; \
 		cp $(RESULTS_DIR)/pg_deltax.json $$DEST; \
 		echo "    -> $$DEST"; \
+		echo "=== Generating JSONBench HTML report ==="; \
+		cd $(JSONBENCH_DIR) && bash generate-results.sh; \
+		open $(JSONBENCH_DIR)/index.html; \
 	fi
 
 # EXPLAIN ANALYZE a single query. Usage: make query EC2=<ip> Q=2 [SET="SET pg_deltax.parallel_workers=4"]

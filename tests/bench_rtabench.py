@@ -207,6 +207,12 @@ def rtabench_db(pg_container):
     # RTABENCH_QUERY_ANALYSIS.md §3.A).
     conn.execute("SET enable_nestloop = off")
     conn.execute("SET work_mem = '1GB'")
+    # Activate the planner_hook walker so chain Exprs in queries
+    # transparently use the synthetic columns set up by
+    # `rtabench_data.py::setup_schema`. Without this the walker is a
+    # no-op and the chain-Expr eligibility infrastructure on DeltaXAgg
+    # stays dormant for RTABench.
+    conn.execute("SET pg_deltax.json_extract_mode = 'fields'")
     conn.commit()
 
     load_all(conn, RTABENCH_ORDERS)

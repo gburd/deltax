@@ -247,10 +247,16 @@ def setup_schema(conn):
         f"SELECT deltax_create_table('order_events', 'event_created', "
         f"'{PARTITION_INTERVAL}'::interval, {PARTITIONS_AHEAD})"
     )
+    # `event_payload->>'terminal'` is the only chain RTABench queries
+    # touch (Q0/Q1/Q3/Q4/Q8/Q23). Pre-extract so the planner_hook walker
+    # rewrites chains to synthetic-Var refs at query time. Mode is set
+    # per-session by the bench fixture in `bench_rtabench.py`.
     conn.execute(
-        f"SELECT deltax_enable_compression('order_events', "
+        "SELECT deltax_enable_compression('order_events', "
         f"order_by => ARRAY['order_id','event_created'], "
-        f"segment_size => {SEGMENT_SIZE})"
+        f"segment_size => {SEGMENT_SIZE}, "
+        "json_extract => '[{\"src\":\"event_payload\","
+        "\"path\":[\"terminal\"],\"name\":\"x_terminal\",\"type\":\"text\"}]'::jsonb)"
     )
     conn.commit()
 

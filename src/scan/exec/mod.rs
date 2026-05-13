@@ -3,6 +3,7 @@ pub(in crate::scan) mod datum_utils;
 pub(in crate::scan) mod segments;
 mod count_minmax;
 mod agg;
+mod agg_wire;
 mod append_wire;
 mod decompress;
 mod text_col;
@@ -18,7 +19,13 @@ pub(crate) use agg::AggScanState;
 
 // Re-exports for hook.rs
 pub(crate) use agg::{AggType, AggExpr, GroupByExpr, GroupByColSpec, HavingOp, HavingFilter,
-    CaseWhenSpec, CaseWhenClause, CaseWhenCondition, CaseWhenOp, CaseWhenValue};
+    CaseWhenSpec, CaseWhenClause, CaseWhenCondition, CaseWhenOp, CaseWhenValue, OutputTransform};
+
+// Re-export for cost.rs (parallel-agg worker recommendation needs the slot cap).
+pub(crate) use agg::MAX_AGG_WORKER_SLOTS;
+
+// Re-export for path.rs's parallel-eligibility check (C.2.f).
+pub(crate) use agg::can_use_compact_keys_path;
 
 // Re-exports for path.rs (create_*_state callbacks referenced in CustomScanMethods)
 pub(crate) use decompress::{create_custom_scan_state, create_deltax_append_state};

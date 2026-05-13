@@ -4,10 +4,14 @@
 
 set -euo pipefail
 
-MACHINE="${MACHINE:-m6i.8xlarge}"
+# Schema matches the upstream JSONBench convention so the dashboard
+# (`generate-results.sh` + `index.html`) recognizes our system. See e.g.
+# the existing ClickHouse / PostgreSQL result files in the JSONBench repo.
+MACHINE="${MACHINE:-m6i.8xlarge, 10000gib gp3}"
 LOAD_TIME="${LOAD_TIME:-0}"
 DATA_SIZE="${DATA_SIZE:-0}"
-DATASET_SIZE="${DATASET_SIZE:-unknown}"
+DATASET_SIZE="${DATASET_SIZE:-0}"   # NUMBER of target rows, not a label
+NUM_LOADED="${NUM_LOADED:-0}"
 
 # Collect timings: 3 per query, ms -> seconds
 timings=()
@@ -24,16 +28,17 @@ done
 cat <<EOF
 {
     "system": "pg_deltax",
+    "version": "0.1.0",
+    "os": "Ubuntu 24.04",
     "date": "$(date +%Y-%m-%d)",
     "machine": "${MACHINE}",
-    "dataset_size": "${DATASET_SIZE}",
-    "cluster_size": 1,
-    "proprietary": "no",
-    "hardware": "cpu",
-    "tuned": "no",
-    "tags": ["Rust", "PostgreSQL compatible", "column-oriented", "JSON", "lukewarm-cold-run"],
-    "load_time": ${LOAD_TIME},
+    "retains_structure": "yes",
+    "tags": [],
+    "dataset_size": ${DATASET_SIZE},
+    "num_loaded_documents": ${NUM_LOADED},
+    "total_size": ${DATA_SIZE},
     "data_size": ${DATA_SIZE},
+    "load_time": ${LOAD_TIME},
     "result": [
 EOF
 

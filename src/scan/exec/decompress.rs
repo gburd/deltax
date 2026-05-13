@@ -12,6 +12,7 @@ use super::batch_qual::{BatchQual, BatchCompareOp, evaluate_batch_quals, extract
 use super::datum_utils::{
     decompress_blob_to_datums, decompress_blob_to_datums_truncated,
     decompress_text_blob_with_like_filter, decompress_text_blob_with_eq_filter,
+    decompress_text_blob_with_in_filter,
     decompress_text_blob_with_selection, decompress_jsonb_blob_with_selection,
     string_to_datum, pg_type_name,
     exec_project, exec_qual,
@@ -22,7 +23,7 @@ use super::segments::{
     segment_skippable_by_dict,
     extract_segment_filters,
 };
-use super::text_col::{TextQualInfo, decompress_text_to_seg_col, apply_text_eq_filter, apply_text_like_filter, strcoll_cmp};
+use super::text_col::{TextQualInfo, decompress_text_to_seg_col, apply_text_eq_filter, apply_text_in_filter, apply_text_like_filter, strcoll_cmp};
 
 /// Decompression state stored as a raw pointer in the CustomScanState.
 pub(crate) struct DecompressState {
@@ -327,7 +328,8 @@ pub(super) unsafe extern "C-unwind" fn begin_custom_scan(
             pg_sys::Oid::from(pg_sys::list_nth_int(custom_private, 0) as u32);
 
         // Parse needed column indices from custom_private (after sentinel -1)
-        // Also parse Top-N info after sentinel -2 if present
+        // Also parse Top-N info after sentinel -2 and json-extract synthetic
+        // col_idx values after sentinel -3 if present.
         let list_len = (*custom_private).length;
         let mut needed_indices: Vec<usize> = Vec::new();
         let mut found_sentinel = false;
@@ -336,13 +338,17 @@ pub(super) unsafe extern "C-unwind" fn begin_custom_scan(
         let mut topn_nulls_first: bool = false;
         let mut topn_multi_col_sort: bool = false;
         let mut topn_sort_col_attno: i32 = 0;
-        for i in 1..list_len {
+        let mut in_synth_section = false;
+        let mut i: i32 = 1;
+        while i < list_len {
             let val = pg_sys::list_nth_int(custom_private, i);
             if val == -1 && !found_sentinel {
                 found_sentinel = true;
+                in_synth_section = false;
+                i += 1;
                 continue;
             }
-            if val == -2 && found_sentinel {
+            if val == -2 && found_sentinel && !in_synth_section {
                 // Top-N sentinel: next values are effective_limit, sort_ascending,
                 // multi_col_sort, sort_col_attno, nulls_first
                 if i + 2 < list_len {
@@ -358,11 +364,19 @@ pub(super) unsafe extern "C-unwind" fn begin_custom_scan(
                 if i + 5 < list_len {
                     topn_nulls_first = pg_sys::list_nth_int(custom_private, i + 5) != 0;
                 }
-                break;
+                // Skip past the topn block to look for a `-3` synth section.
+                i += 6;
+                continue;
             }
-            if found_sentinel && val >= 0 {
+            if val == -3 && found_sentinel {
+                in_synth_section = true;
+                i += 1;
+                continue;
+            }
+            if (found_sentinel || in_synth_section) && val >= 0 {
                 needed_indices.push(val as usize);
             }
+            i += 1;
         }
 
         // Get companion table name
@@ -1458,6 +1472,11 @@ unsafe fn exec_topn_two_pass(
                             && bq.text_const.is_some()
                             && matches!(bq.op, BatchCompareOp::Eq | BatchCompareOp::Ne)
                     });
+                    let text_in_qual = state.batch_quals.iter().find(|bq| {
+                        bq.col_idx == col_idx
+                            && bq.in_list_text.is_some()
+                            && bq.op == BatchCompareOp::InList
+                    });
                     let has_any_batch_qual = state.batch_quals.iter().any(|bq| bq.col_idx == col_idx);
 
                     if let Some(bq) = like_qual {
@@ -1485,6 +1504,19 @@ unsafe fn exec_topn_two_pass(
                         } else {
                             for (ps, es) in pre_selection.iter_mut().zip(eq_sel.iter()) {
                                 *ps = *ps && *es;
+                            }
+                        }
+                    } else if let Some(bq) = text_in_qual {
+                        let strs = bq.in_list_text.as_ref().unwrap();
+                        let (datums, in_sel) = decompress_text_blob_with_in_filter(
+                            blob, type_oid, typmod, strs, /* is_not_in */ false, cutoff_row,
+                        );
+                        decompressed.push(datums);
+                        if pre_selection.is_empty() {
+                            pre_selection = in_sel;
+                        } else {
+                            for (ps, is_) in pre_selection.iter_mut().zip(in_sel.iter()) {
+                                *ps = *ps && *is_;
                             }
                         }
                     } else if has_any_batch_qual {
@@ -1994,6 +2026,37 @@ fn process_topn_text_chunk(
                         continue;
                     };
                     apply_text_like_filter(seg_col, strategy, *negate, row_count, &mut selection);
+                }
+                TextQualInfo::InList { col_idx, values } => {
+                    let col_name = &config.col_names[*col_idx];
+                    if config.segment_by.contains(col_name) {
+                        let seg_val_idx = config.segment_by.iter()
+                            .position(|sb| sb == col_name).unwrap();
+                        let passes = match &seg.segment_values[seg_val_idx] {
+                            Some(s) => values.iter().any(|v| v == s),
+                            None => false,
+                        };
+                        if !passes {
+                            selection = vec![false; row_count];
+                            break;
+                        }
+                        continue;
+                    }
+                    let seg_col = if *col_idx == config.sort_col {
+                        &sort_seg_col
+                    } else {
+                        let blob_idx = col_to_blob_idx(config.col_names, config.segment_by, *col_idx);
+                        let blob = &seg.compressed_blobs[blob_idx];
+                        if let Some(ref sc) = decompress_text_to_seg_col(blob) {
+                            apply_text_in_filter(sc, values, row_count, &mut selection);
+                        } else if selection.is_empty() {
+                            selection = vec![false; row_count];
+                        } else {
+                            selection.iter_mut().for_each(|s| *s = false);
+                        }
+                        continue;
+                    };
+                    apply_text_in_filter(seg_col, values, row_count, &mut selection);
                 }
             }
         }
@@ -2620,6 +2683,11 @@ unsafe fn exec_topn_text_sequential(
                             && bq.text_const.is_some()
                             && matches!(bq.op, BatchCompareOp::Eq | BatchCompareOp::Ne)
                     });
+                    let text_in_qual = state.batch_quals.iter().find(|bq| {
+                        bq.col_idx == col_idx
+                            && bq.in_list_text.is_some()
+                            && bq.op == BatchCompareOp::InList
+                    });
                     let has_any_batch_qual = state.batch_quals.iter().any(|bq| bq.col_idx == col_idx);
 
                     if let Some(bq) = like_qual {
@@ -2647,6 +2715,19 @@ unsafe fn exec_topn_text_sequential(
                         } else {
                             for (ps, es) in pre_selection.iter_mut().zip(eq_sel.iter()) {
                                 *ps = *ps && *es;
+                            }
+                        }
+                    } else if let Some(bq) = text_in_qual {
+                        let strs = bq.in_list_text.as_ref().unwrap();
+                        let (datums, in_sel) = decompress_text_blob_with_in_filter(
+                            blob, type_oid, typmod, strs, /* is_not_in */ false, None,
+                        );
+                        decompressed.push(datums);
+                        if pre_selection.is_empty() {
+                            pre_selection = in_sel;
+                        } else {
+                            for (ps, is_) in pre_selection.iter_mut().zip(in_sel.iter()) {
+                                *ps = *ps && *is_;
                             }
                         }
                     } else if has_any_batch_qual || col_idx == sort_col {
@@ -3330,6 +3411,11 @@ unsafe fn load_next_segment(
                             && bq.text_const.is_some()
                             && matches!(bq.op, BatchCompareOp::Eq | BatchCompareOp::Ne)
                     });
+                    let text_in_qual = state.batch_quals.iter().find(|bq| {
+                        bq.col_idx == col_idx
+                            && bq.in_list_text.is_some()
+                            && bq.op == BatchCompareOp::InList
+                    });
                     let has_any_batch_qual = state.batch_quals.iter().any(|bq| bq.col_idx == col_idx);
 
                     if let Some(bq) = like_qual {
@@ -3358,6 +3444,19 @@ unsafe fn load_next_segment(
                         } else {
                             for (ps, es) in pre_selection.iter_mut().zip(eq_sel.iter()) {
                                 *ps = *ps && *es;
+                            }
+                        }
+                    } else if let Some(bq) = text_in_qual {
+                        let strs = bq.in_list_text.as_ref().unwrap();
+                        let (datums, in_sel) = decompress_text_blob_with_in_filter(
+                            blob, type_oid, typmod, strs, /* is_not_in */ false, None,
+                        );
+                        decompressed.push(datums);
+                        if pre_selection.is_empty() {
+                            pre_selection = in_sel;
+                        } else {
+                            for (ps, is_) in pre_selection.iter_mut().zip(in_sel.iter()) {
+                                *ps = *ps && *is_;
                             }
                         }
                     } else if has_any_batch_qual {
@@ -3806,22 +3905,35 @@ fn build_needed_cols_from_custom_private(
     unsafe {
         if !custom_private.is_null() {
             let list_len = (*custom_private).length;
-            let mut found_sentinel = false;
+            #[derive(PartialEq)]
+            enum Section { Header, Cols, Topn, Synth }
+            let mut sec = Section::Header;
             for i in 0..list_len {
                 let val = pg_sys::list_nth_int(custom_private, i);
-                if val == -1 && !found_sentinel {
-                    found_sentinel = true;
+                if val == -1 && sec == Section::Header {
+                    sec = Section::Cols;
                     continue;
                 }
-                if val == -2 && found_sentinel {
-                    break; // Top-N sentinel — Top-N disabled in parallel plans.
+                if val == -2 && sec == Section::Cols {
+                    sec = Section::Topn;
+                    continue;
                 }
-                if found_sentinel && val >= 0 {
-                    let idx = val as usize;
-                    if idx < num_cols && !needed_cols[idx] {
-                        needed_cols[idx] = true;
-                        needed_col_indices.push(idx);
+                if val == -3 {
+                    // json-extract synthetic col_idx sentinel. Subsequent
+                    // ints are 0-based col_idx values into col_names that
+                    // the executor must load from companion blobs.
+                    sec = Section::Synth;
+                    continue;
+                }
+                match sec {
+                    Section::Cols | Section::Synth if val >= 0 => {
+                        let idx = val as usize;
+                        if idx < num_cols && !needed_cols[idx] {
+                            needed_cols[idx] = true;
+                            needed_col_indices.push(idx);
+                        }
                     }
+                    _ => {}
                 }
             }
         }

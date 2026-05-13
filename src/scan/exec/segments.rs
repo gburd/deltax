@@ -366,6 +366,77 @@ pub(super) fn is_zero_const(datum: pg_sys::Datum, type_oid: pg_sys::Oid) -> bool
     }
 }
 
+/// Classify a segment by **only** the numeric subset of `batch_quals` —
+/// useful in the mixed text+numeric path where text quals have no
+/// `col_minmax` metadata to consult. Returns `Ambiguous` if no numeric
+/// quals are present (caller should fall through to per-row eval).
+///
+/// `NonePass` is sound: a numeric qual that rejects every row in the
+/// segment also rejects the same rows under any text qual, so the
+/// segment can be skipped entirely. `AllPass` here means the numeric
+/// quals pass for every row — text quals may still filter; the caller
+/// uses this to skip the per-row numeric `evaluate_batch_quals` step
+/// while keeping the text qual application.
+pub(super) fn classify_segment_quals_numeric(
+    seg: &SegmentData,
+    batch_quals: &[BatchQual],
+    col_names: &[String],
+) -> SegmentQualResult {
+    use super::batch_qual::is_batch_comparable_type;
+    let mut any_numeric = false;
+    let mut any_nonepass = false;
+    let mut any_ambiguous = false;
+    for bq in batch_quals {
+        if !is_batch_comparable_type(bq.type_oid) {
+            continue; // skip text quals — handled per-row by caller
+        }
+        any_numeric = true;
+        let col_name = &col_names[bq.col_idx];
+        let cm = match seg.col_minmax.get(col_name) {
+            Some(cm) => cm,
+            None => {
+                any_ambiguous = true;
+                continue;
+            }
+        };
+        match segment_all_rows_pass(cm, bq.op, bq.const_datum) {
+            Some(true) => {}
+            Some(false) => {
+                any_nonepass = true;
+            }
+            None => {
+                any_ambiguous = true;
+            }
+        }
+    }
+    if !any_numeric {
+        return SegmentQualResult::Ambiguous;
+    }
+    if any_nonepass {
+        return SegmentQualResult::NonePass;
+    }
+    if any_ambiguous {
+        return SegmentQualResult::Ambiguous;
+    }
+    // All numeric quals pass via minmax. Check NULLs in the numeric
+    // qual columns: minmax covers only non-NULL values.
+    for bq in batch_quals {
+        if !is_batch_comparable_type(bq.type_oid) {
+            continue;
+        }
+        let col_name = &col_names[bq.col_idx];
+        match seg.col_sums.get(col_name) {
+            Some(cs) => {
+                if cs.nonnull_count < seg.row_count as i64 {
+                    return SegmentQualResult::Ambiguous;
+                }
+            }
+            None => return SegmentQualResult::Ambiguous,
+        }
+    }
+    SegmentQualResult::AllPass
+}
+
 /// Classify a segment: can we prove all rows pass all batch quals using metadata?
 pub(super) fn classify_segment_quals(
     seg: &SegmentData,
@@ -602,7 +673,8 @@ pub(super) fn load_metadata(
     // Get the partition's deltatable info
     let mut ht_result = client
         .select(
-            "SELECT h.segment_by, h.order_by, h.time_column, h.schema_name, h.table_name
+            "SELECT h.segment_by, h.order_by, h.time_column, h.schema_name, h.table_name,
+                    h.json_extract
              FROM deltax_partition p
              JOIN deltax_deltatable h ON h.id = p.deltatable_id
              WHERE p.table_name = $1 AND p.is_compressed = true",
@@ -648,6 +720,12 @@ pub(super) fn load_metadata(
         .value::<String>()
         .unwrap()
         .unwrap();
+    let json_extract: Option<serde_json::Value> = ht_row
+        .get_datum_by_ordinal(6)
+        .unwrap()
+        .value::<pgrx::datum::JsonB>()
+        .unwrap()
+        .map(|j| j.0);
 
     // Get column info from the parent table (pg_attribute gives us atttypmod)
     let col_result = client
@@ -680,7 +758,21 @@ pub(super) fn load_metadata(
         col_not_null.push(not_null);
     }
 
-    let col_types: Vec<pg_sys::Oid> = col_type_names.iter().map(|tn| pg_type_oid(tn)).collect();
+    let mut col_types: Vec<pg_sys::Oid> = col_type_names.iter().map(|tn| pg_type_oid(tn)).collect();
+
+    // Append synthetic columns from json_extract (in spec order). These map
+    // 1-to-1 with the extracted ColumnMeta entries that were appended at
+    // compress time, so their `_col_idx` slots are physical_count + i. The
+    // executor uses col_names/col_types indexed by `_col_idx`, so they need
+    // to be visible here too.
+    if let Some(jx) = json_extract {
+        let specs = crate::compress::parse_extract_specs(&jx);
+        for spec in specs {
+            col_names.push(spec.target_name.clone());
+            col_types.push(crate::scan::json_extract::kind_to_type_oid(spec.target_kind));
+            col_typmods.push(-1);
+        }
+    }
 
     MetadataInfo {
         col_names,
