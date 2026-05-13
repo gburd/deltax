@@ -1,18 +1,74 @@
 # Blob cache — shared-memory cache for detoasted compressed blobs
 
-> **Status: lookup path working, insert crashes in `dsa_allocate_extended` (2026-05-13).**
-> Module structure, public API, GUCs, shmem registration, in-place DSA
-> creation (full `blob_cache_mb` reserved up front), per-backend
-> `dsa_attach_in_place`, inline-storage LWLocks initialised via
-> `LWLockInitialize`, sharded hashmap framework, pin counting, integration
-> in three detoast sites, and the `pg_deltax_blob_cache_stats()` SRF are
-> all in place. `get_pinned` traverses correctly and returns `None` for
-> misses without crashing. The first `insert` then segfaults inside
-> `dsa_allocate_extended` — postmaster's `dsa_create_in_place_ext`
-> returns a non-null area, backend's `dsa_attach_in_place` returns a
-> non-null area, the LWLock is acquired, but the actual DSA allocation
-> crashes. Next session: debug the DSA crash with gdb or by switching
-> to lazy DSM-backed `dsa_create` on first backend access.
+> **Status: DSA approach hit a dead end; needs replacement (2026-05-13).**
+> Full storage infrastructure (shmem hooks, ctl block, inline LWLocks,
+> sharded hashmap framework, pin counting, three detoast call sites,
+> `pg_deltax_blob_cache_stats()` SRF) is in place and `get_pinned`
+> traverses correctly on misses. Both DSA approaches we tried crash
+> on first allocation — see [DSA findings](#dsa-findings) below.
+> The recommended next step is a hand-rolled allocator that pre-carves
+> the shmem region into fixed-size slots; that bypasses DSA's
+> process-local-area machinery, which doesn't play nicely with our
+> postmaster-creates / backend-attaches pattern on Docker for Mac
+> aarch64.
+
+## DSA findings
+
+Two approaches were investigated end-to-end and both fail; the gdb
+investigation pinpointed the root cause.
+
+**Approach A: `dsa_create_in_place_ext` in postmaster + `dsa_attach_in_place` in backend.**
+Postmaster reserves the full `blob_cache_mb` of named shmem, creates
+the in-place DSA, and `dsa_pin`s it. The backend later calls
+`dsa_attach_in_place(dsa_chunk, NULL)` and gets back a non-null
+`*dsa_area`. But `area->control` (the first field) points into the
+backend's malloc heap, not at `place`. When `dsa_allocate_extended`
+then does `area->control->lwlock`, the lock address is garbage and
+`LWLockAcquire` segfaults.
+
+Diagnostic dump from a crashed backend (gdb on the core):
+
+```
+block      = 0xffff6ec0d800  (PG main shmem region, in /dev/zero mapping)
+dsa_chunk  = 0xffff6ec33850  (block + sizeof(BlobCacheCtl) — still in shmem)
+area       = 0xaaaaeca97f90  (backend's process-local dsa_area handle)
+area[0..8] = 0xaaaaec4726b0  (area->control — points to backend HEAP, not shmem!)
+```
+
+So `dsa_attach_in_place` is *not* setting `area->control = place`. The
+internal pointers it stores reference backend heap, and the DSA's
+control lock ends up at `0x8c900001650` (unmapped), so the dereference
+in `LWLockAcquire` segfaults. This may be a pgrx binding mismatch with
+PG 17 (the `_in_place_ext` 6-arg signature) or a subtle initialization
+step we're missing — multiple attempts to align the layout, switch
+between named and inline LWLock tranches, and resize the DSA chunk
+did not change the outcome.
+
+**Approach B: lazy `dsa_create_ext` from the first backend.**
+Skips the postmaster-side creation entirely; the first backend that
+calls `get_pinned`/`insert` CAS-races to call `dsa_create_ext` and
+stores the handle for others to `dsa_attach` to. This avoids the
+in-place machinery, but hits a Docker-on-Mac quirk:
+`ERROR: could not resize shared memory segment "/PostgreSQL.NNN" to 0
+bytes: Invalid argument`. The DSM segment that `dsa_create` allocates
+fails to release cleanly under Docker Desktop's tmpfs.
+
+**Conclusion: drop DSA, hand-roll an allocator.** The cache's
+allocation patterns are simple — fixed-size header (`Entry`) plus
+variable-size payload (bytes). We can pre-carve the named shmem block
+into:
+
+- The control struct + shards (already done).
+- A fixed array of `Entry` slots (size: `n_entries_max` × `sizeof(Entry)`).
+- A pool of payload chunks in a few power-of-two size classes, each
+  with an atomic free-list head.
+
+This bypasses DSA entirely while keeping cross-backend sharing through
+named shmem. Allocation/free become simple atomic pops/pushes on the
+size-class free-lists. Size classes 16K / 32K / 64K / 128K / 256K /
+512K / 1M (as the design doc already proposes) cover the JSONBench
+blob distribution; oversize blobs (>1M) just fail the cache. This is
+~1 day of work and avoids the DSA portability surface entirely.
 
 ## Implementation status
 
