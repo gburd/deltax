@@ -507,23 +507,29 @@ workload.
 
 | GUC | Type | Default | Range | Meaning |
 |---|---|---|---|---|
-| `pg_deltax.blob_cache_mb` | int | `4096` | `0..32768` | Cache size in MiB. `0` = disabled. Postmaster context. |
+| `pg_deltax.blob_cache_mb` | int | `-1` (auto) | `-1..32768` | `-1` = auto (25% of physical RAM, clamped to [256, 4096] MiB). `0` = disabled. `N > 0` = explicit MiB. Postmaster context. |
 | `pg_deltax.blob_cache_shards` | int | `64` | `1..1024` | Shard count. Powers of two recommended. Postmaster context. |
 
-The `4096` default is the largest value that:
+The auto-size default reads `MemTotal` from `/proc/meminfo` at
+postmaster start. The resolved cap is observable via the SRF
+(`SELECT bytes_max/1024/1024 AS bytes_max_mb FROM
+pg_deltax_blob_cache_stats()`). Heuristic:
 
-- Fully covers JSONBench's working set (2.3 GB measured) with
-  headroom.
-- Covers ~75-80% of ClickBench's working set (~5.5 GB extrapolated),
-  enough that most warm queries hit cache; for full coverage bump to
-  `8192`.
-- Fits on memory-constrained dev boxes (Docker Desktop default 4 GB
-  VM has it tight — drop to `1024` if PG fails to start with
-  "could not map anonymous shared memory").
+- **256 MiB floor.** On a 1 GiB Docker container, you get 256 MiB.
+  On non-Linux hosts (where `/proc/meminfo` doesn't exist) the
+  resolution silently falls back to the floor.
+- **4096 MiB cap.** On a 32+ GiB production box, you get exactly
+  4 GiB regardless of how much RAM is available — that's enough
+  for JSONBench's working set with headroom and ~75-80% of
+  ClickBench's working set. Heavy multi-column OLAP at scale
+  should explicitly bump to `8192` or more.
+- **25% in between.** A 16 GiB box gets 4 GiB. A 4 GiB box gets
+  1 GiB. A 2 GiB box gets 512 MiB.
 
-Users on big production servers (32+ GB RAM) running heavy
-multi-column OLAP workloads (ClickBench-scale) should override to
-`8192` or more. See [Sizing](#sizing) for the operational story.
+Set `pg_deltax.blob_cache_mb = 0` to disable the cache entirely
+(e.g. for a baseline measurement). Set to an explicit positive value
+to override the heuristic. See [Sizing](#sizing) for the workload
+side of the story.
 
 ## Sizing
 
@@ -563,23 +569,20 @@ at 8 GB). The neighbour-shard eviction fallback under
 [Remaining](#remaining) would only chip at the margin of this
 behaviour, not solve it.
 
-**Future work — auto-sizing.** A `pg_deltax.blob_cache_mb = 0` (or
-`auto`) mode that picks a value from physical RAM would be a UX win.
-The candidate heuristic: `min(8192, 25% × MemTotal)` MiB. Implementation
-needs a portable way to read physical RAM at postmaster start (`sysconf
-(_SC_PHYS_PAGES) × _SC_PAGE_SIZE` on Linux; the `sysinfo` crate would
-abstract this) and a clear "I overrode the default" signal in the
-extension's startup log. Mirrors `pg_deltax.parallel_workers = 0`
-which already auto-resolves via `num_cpus::get().min(16)`.
-Open questions before implementing:
+**Auto-sizing.** The `-1` default reads `MemTotal` from
+`/proc/meminfo` at postmaster start and resolves to `clamp(MemTotal /
+4, 256 MiB, 4096 MiB)`. Falls back to the 256 MiB floor on non-Linux
+hosts or anywhere `/proc/meminfo` isn't readable. The resolved value
+is observable via `pg_deltax_blob_cache_stats().bytes_max` — there's
+no separate startup log line; users querying the SRF immediately see
+what they got. Postmaster context (locked at start, can't change at
+runtime).
 
-- Should auto-size honour `huge_pages = try`/`on`? Picking 25% of RAM
-  on a box without huge pages configured may surface as a startup
-  failure instead of a working cache.
-- How should it interact with `shared_buffers`? If both auto-size to
-  25% of RAM, the box is at 50%+ shmem before `work_mem` runs.
-- How loud should the log line be? Users should be able to find the
-  number without grepping for it.
+The 4 GiB cap is deliberate: it covers JSONBench fully and most of
+ClickBench without surprising operators on memory-rich boxes (a
+128 GiB instance still gets only 4 GiB, not 32). Big-workload users
+who want more should set an explicit value; the floor and cap stay
+where they are.
 
 ## Testing matrix
 

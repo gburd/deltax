@@ -70,12 +70,10 @@ pub(crate) static JSON_EXTRACT_MODE: GucSetting<Option<CString>> =
     GucSetting::<Option<CString>>::new(Some(c"none"));
 
 /// Size of the process-shared blob cache, in MiB. `0` disables the cache.
-/// Default `4096` covers the JSONBench working set fully and most of the
-/// ClickBench working set out of the box. Memory-constrained boxes
-/// (e.g. Docker Desktop default VM, small CI runners) should lower it;
-/// multi-column heavy OLAP workloads (ClickBench at scale) benefit from
-/// bumping to 8192. See `dev/docs/BLOB_CACHE.md#sizing`.
-pub(crate) static BLOB_CACHE_MB: GucSetting<i32> = GucSetting::<i32>::new(4096);
+/// Default `-1` means auto: 25% of physical RAM, clamped to
+/// [256, 4096] MiB. Explicit positive values override; `0` disables
+/// the cache entirely. See `dev/docs/BLOB_CACHE.md#sizing`.
+pub(crate) static BLOB_CACHE_MB: GucSetting<i32> = GucSetting::<i32>::new(-1);
 
 /// Number of shards (power of two) in the blob cache. More shards reduce
 /// LWLock contention; fewer save shmem overhead. Default `64` is a good
@@ -261,10 +259,10 @@ pub extern "C-unwind" fn _PG_init() {
     );
     GucRegistry::define_int_guc(
         c"pg_deltax.blob_cache_mb",
-        c"Size of the process-shared blob cache, in MiB. 0 disables the cache.",
-        c"The blob cache stores detoasted compressed segment blobs keyed by (companion_oid, segment_id, col_idx). Repeated queries against the same segments skip the pg_detoast_datum path. See dev/docs/BLOB_CACHE.md. Restart required if the value changes the shmem reservation; the GUC can be lowered at runtime to clamp future inserts but already-allocated memory is not released until eviction.",
+        c"Size of the process-shared blob cache, in MiB. -1 = auto (25% of physical RAM, clamped to [256, 4096]); 0 = disabled; N > 0 = explicit MiB.",
+        c"The blob cache stores detoasted compressed segment blobs keyed by (companion_oid, segment_id, col_idx). Repeated queries against the same segments skip the pg_detoast_datum path. -1 (default) auto-sizes at postmaster start from /proc/meminfo, falling back to the 256 MB floor if it can't be read. Explicit values override the auto heuristic. See dev/docs/BLOB_CACHE.md. Restart required — the shmem reservation is captured at postmaster start.",
         &BLOB_CACHE_MB,
-        0,
+        -1,
         32768,
         GucContext::Postmaster,
         GucFlags::default(),

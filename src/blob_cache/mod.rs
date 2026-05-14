@@ -133,14 +133,64 @@ pub(crate) fn register_hooks() {
     ATTACH_COUNT.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Returns the configured cache size in bytes, clamped to a sane
-/// maximum. `0` means the cache is disabled.
+/// Returns the configured cache size in bytes.
+///
+/// GUC semantics:
+/// - `0`  → disabled (returns 0).
+/// - `-1` → auto: 25% of physical RAM (read from `/proc/meminfo`),
+///   clamped to `[AUTO_FLOOR_MB, AUTO_CAP_MB]`. If `/proc/meminfo`
+///   can't be parsed (non-Linux, restricted container), falls back
+///   to `AUTO_FLOOR_MB`.
+/// - `N > 0` → explicit MiB.
+///
+/// Cached per-process via `OnceLock` because the GUC is
+/// Postmaster-context — value is fixed for the life of the process
+/// and reading `/proc/meminfo` on every call would be wasteful.
 pub(crate) fn configured_bytes() -> usize {
+    static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(resolve_configured_bytes)
+}
+
+/// Floor and cap for the auto-size heuristic, in MiB.
+const AUTO_FLOOR_MB: i32 = 256;
+const AUTO_CAP_MB: i32 = 4096;
+
+fn resolve_configured_bytes() -> usize {
     let mb = crate::BLOB_CACHE_MB.get();
-    if mb <= 0 {
+    if mb == 0 {
         return 0;
     }
-    (mb as usize).saturating_mul(1024 * 1024)
+    let effective_mb = if mb < 0 {
+        auto_size_mb()
+    } else {
+        mb
+    };
+    (effective_mb as usize).saturating_mul(1024 * 1024)
+}
+
+/// 25% of physical RAM, clamped to `[AUTO_FLOOR_MB, AUTO_CAP_MB]`.
+/// Returns `AUTO_FLOOR_MB` when /proc/meminfo isn't readable.
+fn auto_size_mb() -> i32 {
+    let phys_mb = read_phys_mem_mb().unwrap_or(0);
+    if phys_mb <= 0 {
+        return AUTO_FLOOR_MB;
+    }
+    (phys_mb / 4).clamp(AUTO_FLOOR_MB, AUTO_CAP_MB)
+}
+
+/// Reads `MemTotal:` from `/proc/meminfo` and returns it in MiB.
+/// Returns `None` if the file doesn't exist (non-Linux) or can't be
+/// parsed.
+fn read_phys_mem_mb() -> Option<i32> {
+    let s = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in s.lines() {
+        if let Some(rest) = line.strip_prefix("MemTotal:") {
+            // Format: "MemTotal:       12345678 kB"
+            let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
+            return Some((kb / 1024) as i32);
+        }
+    }
+    None
 }
 
 /// Returns the configured shard count, rounded up to the next power of two.
@@ -197,5 +247,5 @@ fn pg_deltax_blob_cache_shard_stats() -> TableIterator<
         name!(lru_tail_dp, i64),
     ),
 > {
-    TableIterator::new(storage::shard_diag().into_iter())
+    TableIterator::new(storage::shard_diag())
 }
