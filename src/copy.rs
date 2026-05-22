@@ -229,6 +229,121 @@ unsafe fn chain_to_prev(
     }
 }
 
+/// Like `chain_to_prev`, but invokes the previous hook (or
+/// `standard_ProcessUtility`) WITHOUT wrapping it in
+/// `pg_guard_ffi_boundary`.
+///
+/// Use this for utility statements whose execution path may call
+/// `dlopen()` — specifically `CREATE EXTENSION`, `CREATE FUNCTION ...
+/// LANGUAGE C`, `LOAD`, and similar.  glibc's `dlopen` mutates
+/// thread-local state during library load (TLS allocation,
+/// `_dlerror_run`'s per-thread error buffer, ELF constructors that
+/// initialize Rust runtime TLS in the loaded `.so`).  A
+/// `cee_scape::call_with_sigsetjmp` barrier (which `pg_guard_ffi_boundary`
+/// uses internally) wrapped around such a path is unsafe: any
+/// `ereport(ERROR)` inside the loaded library's `_PG_init` triggers a
+/// `siglongjmp` that unwinds OVER the half-initialized TLS state,
+/// leaving glibc in an inconsistent state and causing a segfault on the
+/// next thread-local access.  Stack reproducer:
+///
+/// ```text
+/// dlopen → _dlerror_run → dlopen → internal_load_library →
+/// load_external_function → fmgr_c_validator → ProcedureCreate →
+/// CreateFunction → ProcessUtilitySlow → standard_ProcessUtility →
+/// cee_scape::call_with_sigsetjmp (pg_deltax) →
+/// pg_deltax::copy::chain_to_prev (pg_deltax)
+/// ```
+///
+/// `deltax_process_utility` performs zero Rust-side work for these
+/// statement types — it only forwards them — so we have no Rust
+/// state that requires the cleanup the FFI boundary provides.  Letting
+/// any `ereport(ERROR)` longjmp directly to PG's handler (the way every
+/// other PG extension does for these statements) is correct.
+#[allow(clippy::too_many_arguments)]
+unsafe fn chain_to_prev_unguarded(
+    pstmt: *mut pg_sys::PlannedStmt,
+    query_string: *const c_char,
+    read_only_tree: bool,
+    context: pg_sys::ProcessUtilityContext::Type,
+    params: pg_sys::ParamListInfo,
+    query_env: *mut pg_sys::QueryEnvironment,
+    dest: *mut pg_sys::DestReceiver,
+    qc: *mut pg_sys::QueryCompletion,
+) {
+    unsafe {
+        let prev_ptr = PREV_PROCESS_UTILITY_HOOK.load(Ordering::SeqCst);
+        if !prev_ptr.is_null() {
+            let prev_fn: pg_sys::ProcessUtility_hook_type = Some(std::mem::transmute::<
+                *mut (),
+                unsafe extern "C-unwind" fn(
+                    *mut pg_sys::PlannedStmt,
+                    *const c_char,
+                    bool,
+                    pg_sys::ProcessUtilityContext::Type,
+                    pg_sys::ParamListInfo,
+                    *mut pg_sys::QueryEnvironment,
+                    *mut pg_sys::DestReceiver,
+                    *mut pg_sys::QueryCompletion,
+                ),
+            >(prev_ptr));
+            if let Some(f) = prev_fn {
+                f(
+                    pstmt,
+                    query_string,
+                    read_only_tree,
+                    context,
+                    params,
+                    query_env,
+                    dest,
+                    qc,
+                );
+            }
+        } else {
+            pg_sys::standard_ProcessUtility(
+                pstmt,
+                query_string,
+                read_only_tree,
+                context,
+                params,
+                query_env,
+                dest,
+                qc,
+            );
+        }
+    }
+}
+
+/// Returns true if `utility_stmt` is a node tag whose execution path
+/// may call `dlopen()` on a PostgreSQL extension `.so`.  See
+/// `chain_to_prev_unguarded` for why we route these around the FFI
+/// boundary.
+unsafe fn stmt_may_dlopen(utility_stmt: *mut pg_sys::Node) -> bool {
+    if utility_stmt.is_null() {
+        return false;
+    }
+    unsafe {
+        // CREATE EXTENSION x — dlopens x.so during _PG_init.
+        if pgrx::is_a(utility_stmt, pg_sys::NodeTag::T_CreateExtensionStmt) {
+            return true;
+        }
+        // CREATE FUNCTION ... LANGUAGE C — fmgr_c_validator dlopens
+        // the target .so to resolve the entry point.
+        if pgrx::is_a(utility_stmt, pg_sys::NodeTag::T_CreateFunctionStmt) {
+            return true;
+        }
+        // LOAD '...' — explicit dlopen.
+        if pgrx::is_a(utility_stmt, pg_sys::NodeTag::T_LoadStmt) {
+            return true;
+        }
+        // ALTER FUNCTION may re-resolve the entry point (and thus dlopen)
+        // when changing the language or library.
+        if pgrx::is_a(utility_stmt, pg_sys::NodeTag::T_AlterFunctionStmt) {
+            return true;
+        }
+        false
+    }
+}
+
 #[pg_guard]
 #[allow(clippy::too_many_arguments)]
 unsafe extern "C-unwind" fn deltax_process_utility(
@@ -242,6 +357,33 @@ unsafe extern "C-unwind" fn deltax_process_utility(
     qc: *mut pg_sys::QueryCompletion,
 ) {
     let utility_stmt = unsafe { (*pstmt).utilityStmt };
+
+    // ----------------------------------------------------------------
+    // Bypass our hook entirely (no FFI/longjmp guard) for utility
+    // statements whose execution path may call dlopen().  Wrapping such
+    // a path in cee_scape::call_with_sigsetjmp (which is what
+    // pg_guard_ffi_boundary uses) corrupts glibc's TLS state if any PG
+    // ereport(ERROR) longjmps out of the dlopen()-internal code.  See
+    // chain_to_prev_unguarded for the full rationale and a stack trace.
+    //
+    // Statements covered: T_CreateExtensionStmt, T_CreateFunctionStmt
+    // (LANGUAGE C), T_LoadStmt, T_AlterFunctionStmt.  None of these have
+    // any deltax-specific behavior — we only forward them.
+    if unsafe { stmt_may_dlopen(utility_stmt) } {
+        unsafe {
+            chain_to_prev_unguarded(
+                pstmt,
+                query_string,
+                read_only_tree,
+                context,
+                params,
+                query_env,
+                dest,
+                qc,
+            );
+        }
+        return;
+    }
 
     // Intercept `ANALYZE <compressed_partition>` (and `VACUUM ANALYZE`)
     // before the standard executor samples our empty heap and overwrites
