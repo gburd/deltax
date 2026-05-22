@@ -259,6 +259,14 @@ unsafe fn chain_to_prev(
 /// state that requires the cleanup the FFI boundary provides.  Letting
 /// any `ereport(ERROR)` longjmp directly to PG's handler (the way every
 /// other PG extension does for these statements) is correct.
+///
+/// IMPORTANT: this function deliberately does NOT call
+/// `pg_sys::standard_ProcessUtility(...)`.  pgrx-pg-sys decorates its
+/// entire `extern "C-unwind" { ... }` block with `#[pg_guard]`, which
+/// wraps every C call through `cee_scape::call_with_sigsetjmp` —
+/// reintroducing exactly the longjmp barrier we are trying to avoid.
+/// We declare the raw symbol locally without that decoration and call
+/// it directly.
 #[allow(clippy::too_many_arguments)]
 unsafe fn chain_to_prev_unguarded(
     pstmt: *mut pg_sys::PlannedStmt,
@@ -270,6 +278,23 @@ unsafe fn chain_to_prev_unguarded(
     dest: *mut pg_sys::DestReceiver,
     qc: *mut pg_sys::QueryCompletion,
 ) {
+    // Locally-declared raw extern, NOT wrapped by pgrx's #[pg_guard].
+    // Calls the C symbol `standard_ProcessUtility` directly, with no
+    // sigsetjmp barrier between us and the dlopen path.
+    unsafe extern "C-unwind" {
+        #[link_name = "standard_ProcessUtility"]
+        fn standard_ProcessUtility_raw(
+            pstmt: *mut pg_sys::PlannedStmt,
+            query_string: *const c_char,
+            read_only_tree: bool,
+            context: pg_sys::ProcessUtilityContext::Type,
+            params: pg_sys::ParamListInfo,
+            query_env: *mut pg_sys::QueryEnvironment,
+            dest: *mut pg_sys::DestReceiver,
+            qc: *mut pg_sys::QueryCompletion,
+        );
+    }
+
     unsafe {
         let prev_ptr = PREV_PROCESS_UTILITY_HOOK.load(Ordering::SeqCst);
         if !prev_ptr.is_null() {
@@ -299,7 +324,7 @@ unsafe fn chain_to_prev_unguarded(
                 );
             }
         } else {
-            pg_sys::standard_ProcessUtility(
+            standard_ProcessUtility_raw(
                 pstmt,
                 query_string,
                 read_only_tree,
